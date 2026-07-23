@@ -1,0 +1,20 @@
+import { z } from "zod";
+
+export const AssistantStatusSchema = z.enum([
+  "PASS",
+  "BLOCKED_HOST_READINESS",
+  "BLOCKED_APP_PUBLISH",
+  "BLOCKED_SCOPE",
+  "BLOCKED_USER_AUTH",
+  "BLOCKED_SECRET_STORAGE",
+  "BLOCKED_VISIBILITY",
+  "BLOCKED_RESOURCE_PERMISSION",
+  "BLOCKED_CAPABILITY",
+  "UNVERIFIED_NO_FIXTURE",
+  "INTERRUPTED_REQUIRES_CONFIRMATION",
+  "BLOCKED_RUNTIME_STATE",
+  "FAILED_DEPENDENCY",
+  "BLOCKED_REPO_BOUNDARY",
+]);
+
+export type AssistantStatus = z.infer<typeof AssistantStatusSchema>;

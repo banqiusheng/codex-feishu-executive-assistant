@@ -1,0 +1,200 @@
+diff --git a/PATCHES.md b/PATCHES.md
+index aeb3d06b9ab7ff9769845f140905d3c65df1e5c2..f6d1a49493622a2414e65d92c9307e0e77534ca5 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -128,5 +128,34 @@
+   does not prove SQLite durability, restart/lease recovery, real Feishu or Codex
+   E2E, deployment, or 24-hour availability.
+ 
++## `0005-static-dynamic-access-boundary.patch`
++
++- Purpose: remove every runtime-computed element access from the four supported
++  Stage A entry graphs so the repository security analyzer can reject that
++  syntax without contextual, primitive-use, assignment-target, or source-path
++  exceptions.
++- Runtime or business logic: key-set comparisons use equal length plus static
++  `includes`; raw ingress metadata is copied through explicit named fields;
++  runner snapshots preserve ordinary assignment descriptors through
++  `Object.defineProperty`; version components use static `Array.at`; usage
++  fields are read once through named properties; fixed system replies use
++  exhaustive switches. These changes preserve supported outputs while removing
++  identifier-shadow, coercion, callable-assignment, and repeated-read ambiguity.
++- Applies after `0001-workspace-adapter.patch` through
++  `0004-ledger-first-assistant-channel.patch` to upstream commit
++  `e8b0dc0cdfe2fb378bef7081618138a20d934aa9`.
++- Exact paths: `PATCHES.md`, `src/agent/codex-runner.ts`,
++  `src/bot/channel.ts`, `src/runtime/assistant-channel.ts`,
++  `src/runtime/progress-reporter.ts`, and `src/runtime/system-reply.ts`.
++- Verification: bridge unit/type tests; exact supported dependency graphs;
++  fail-closed regressions for nested dynamic calls/constructors, coercion,
++  `instanceof`, local `Number` shadowing, const-key lexical shadowing, consumed
++  assignment results, source-path lookalikes, and direct `Reflect.get`
++  destructuring aliases; exact per-patch path allowlists; deterministic reverse
++  and forward offline replay; strict manifest; and repository gates.
++- Evidence boundary: this is a conservative source regression gate. It does not
++  claim arbitrary interprocedural JavaScript data-flow analysis or replace
++  runtime sandbox and network-denial evidence.
++
+ Every future upstream modification must use a separately named patch file and
+ record its reason and verification here.
+diff --git a/src/agent/codex-runner.ts b/src/agent/codex-runner.ts
+index 8c69de7e410e5b20783afa2c42173f6490747809..350d92c9b72532e990ddba7f8f7e7191ef31d77e 100644
+--- a/src/agent/codex-runner.ts
++++ b/src/agent/codex-runner.ts
+@@ -288,7 +288,12 @@ function snapshotOwnDataRecord(
+       ) {
+         return null;
+       }
+-      snapshot[key] = descriptor.value;
++      Object.defineProperty(snapshot, key, {
++        configurable: true,
++        enumerable: true,
++        value: descriptor.value,
++        writable: true,
++      });
+     }
+     return Object.freeze(snapshot);
+   } catch {
+@@ -606,7 +611,7 @@ function isCompatibleCodexVersion(value: unknown): value is string {
+   const current = value.split(".").map(Number);
+   const minimum = REQUIRED_CODEX_VERSION.split(".").map(Number);
+   for (let index = 0; index < minimum.length; index += 1) {
+-    const difference = (current[index] ?? 0) - (minimum[index] ?? 0);
++    const difference = (current.at(index) ?? 0) - (minimum.at(index) ?? 0);
+     if (difference !== 0) return difference > 0;
+   }
+   return true;
+@@ -820,12 +825,18 @@ function isBoundedString(
+ 
+ function isUsage(value: unknown): boolean {
+   if (!isRecord(value)) return false;
++  const inputTokens = value.input_tokens;
++  const cachedInputTokens = value.cached_input_tokens;
++  const outputTokens = value.output_tokens;
++  const reasoningOutputTokens = value.reasoning_output_tokens;
+   return [
+-    "input_tokens",
+-    "cached_input_tokens",
+-    "output_tokens",
+-    "reasoning_output_tokens",
+-  ].every((key) => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0);
++    inputTokens,
++    cachedInputTokens,
++    outputTokens,
++    reasoningOutputTokens,
++  ].every(
++    (tokenCount) => Number.isSafeInteger(tokenCount) && Number(tokenCount) >= 0,
++  );
+ }
+ 
+ function isKnownItem(value: unknown): boolean {
+diff --git a/src/bot/channel.ts b/src/bot/channel.ts
+index 7ab5ec28291422e90cea66350768653726dd0924..b05182266e36d9a4a8e1e8f579b110ed91c44cf0 100644
+--- a/src/bot/channel.ts
++++ b/src/bot/channel.ts
+@@ -209,7 +209,7 @@ function hasExactKeys(value: object, expected: readonly string[]): boolean {
+   const sortedExpected = [...expected].sort();
+   return (
+     actual.length === sortedExpected.length &&
+-    actual.every((key, index) => key === sortedExpected[index])
++    actual.every((key) => sortedExpected.includes(key))
+   );
+ }
+ 
+diff --git a/src/runtime/assistant-channel.ts b/src/runtime/assistant-channel.ts
+index acdd4212d5324643b0cc612f6a325ba49bceab6a..ff4b54e38735b81b7a2eaf2275e848800e2ff375 100644
+--- a/src/runtime/assistant-channel.ts
++++ b/src/runtime/assistant-channel.ts
+@@ -99,7 +99,7 @@ function exactKeys(value: object, expected: readonly string[]): boolean {
+   const sortedExpected = [...expected].sort();
+   return (
+     actual.length === expected.length &&
+-    actual.every((key, index) => key === sortedExpected[index])
++    actual.every((key) => sortedExpected.includes(key))
+   );
+ }
+ 
+@@ -143,16 +143,22 @@ function snapshotRawMetadata(
+     }
+ 
+     const record = value as Record<string, unknown>;
+-    const snapshot: Record<string, unknown> = {};
+-    for (const key of RAW_METADATA_REQUIRED_KEYS) snapshot[key] = record[key];
+-    for (const key of [
+-      "signatureVerified",
+-      "callbackNonce",
+-      "callbackPayloadHash",
+-    ] as const) {
+-      if (Object.prototype.hasOwnProperty.call(value, key)) {
+-        snapshot[key] = record[key];
+-      }
++    const snapshot: Record<string, unknown> = {
++      appId: record.appId,
++      tenantKey: record.tenantKey,
++      eventType: record.eventType,
++      chatType: record.chatType,
++      senderOpenId: record.senderOpenId,
++      chatId: record.chatId,
++    };
++    if (Object.prototype.hasOwnProperty.call(value, "signatureVerified")) {
++      snapshot.signatureVerified = record.signatureVerified;
++    }
++    if (Object.prototype.hasOwnProperty.call(value, "callbackNonce")) {
++      snapshot.callbackNonce = record.callbackNonce;
++    }
++    if (Object.prototype.hasOwnProperty.call(value, "callbackPayloadHash")) {
++      snapshot.callbackPayloadHash = record.callbackPayloadHash;
+     }
+     if (Object.prototype.hasOwnProperty.call(value, "text")) {
+       Object.defineProperty(snapshot, "text", {
+diff --git a/src/runtime/progress-reporter.ts b/src/runtime/progress-reporter.ts
+index 467d6533af80a80b936a08b8ea345158b35d6fea..ca61a1d3fe21afe6a9037e59c7a0c0ddb9401271 100644
+--- a/src/runtime/progress-reporter.ts
++++ b/src/runtime/progress-reporter.ts
+@@ -66,7 +66,7 @@ function hasExactKeys(value: object, expected: readonly string[]): boolean {
+   const sortedExpected = [...expected].sort();
+   return (
+     actual.length === sortedExpected.length &&
+-    actual.every((key, index) => key === sortedExpected[index])
++    actual.every((key) => sortedExpected.includes(key))
+   );
+ }
+ 
+diff --git a/src/runtime/system-reply.ts b/src/runtime/system-reply.ts
+index 8c9ad4f4a6bd7156df30af3ef3ef016ee09bc712..25ced6b2abfadc4b1f732fee10076c9ed9576b3a 100644
+--- a/src/runtime/system-reply.ts
++++ b/src/runtime/system-reply.ts
+@@ -95,11 +95,31 @@ export function taskAcceptedText(): SystemText {
+ }
+ 
+ export function cancellationText(kind: CancellationReplyKind): SystemText {
+-  return CANCELLATION_TEXT[kind];
++  switch (kind) {
++    case "NOT_RUNNING":
++      return CANCELLATION_TEXT.NOT_RUNNING;
++    case "CANCELLED_NO_EXTERNAL_EFFECTS":
++      return CANCELLATION_TEXT.CANCELLED_NO_EXTERNAL_EFFECTS;
++    case "CANCELLED_RECONCILING_EXTERNAL_EFFECTS":
++      return CANCELLATION_TEXT.CANCELLED_RECONCILING_EXTERNAL_EFFECTS;
++  }
+ }
+ 
+ export function progressText(stage: ProgressStage): SystemText {
+-  return PROGRESS_TEXT[stage];
++  switch (stage) {
++    case "QUEUED":
++      return PROGRESS_TEXT.QUEUED;
++    case "PREPARING":
++      return PROGRESS_TEXT.PREPARING;
++    case "RUNNING":
++      return PROGRESS_TEXT.RUNNING;
++    case "VERIFYING":
++      return PROGRESS_TEXT.VERIFYING;
++    case "AWAITING_CONFIRMATION":
++      return PROGRESS_TEXT.AWAITING_CONFIRMATION;
++    case "FINALIZING":
++      return PROGRESS_TEXT.FINALIZING;
++  }
+ }
+ 
+ async function requireSuccessfulReply(

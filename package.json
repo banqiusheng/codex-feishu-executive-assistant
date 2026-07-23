@@ -1,0 +1,52 @@
+{
+  "name": "codex-feishu-executive-assistant",
+  "version": "0.1.0-rc.1",
+  "description": "面向一位总裁和一台专用 Mac mini 的飞书 Codex AI 助理",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/banqiusheng/codex-feishu-executive-assistant.git"
+  },
+  "homepage": "https://github.com/banqiusheng/codex-feishu-executive-assistant#readme",
+  "bugs": {
+    "url": "https://github.com/banqiusheng/codex-feishu-executive-assistant/issues"
+  },
+  "keywords": [
+    "codex",
+    "feishu",
+    "lark",
+    "executive-assistant",
+    "macos"
+  ],
+  "type": "module",
+  "packageManager": "pnpm@10.0.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  },
+  "engines": {
+    "node": ">=20.0.0 <21.0.0 || >=22.0.0 <23.0.0 || >=24.0.0 <25.0.0 || >=26.0.0 <27.0.0"
+  },
+  "scripts": {
+    "prebuild": "pnpm --filter @executive-assistant/contracts build",
+    "build": "pnpm -r build",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings 0",
+    "pretypecheck": "pnpm --filter @executive-assistant/contracts build",
+    "typecheck": "pnpm -r typecheck",
+    "pretest": "pnpm --filter @executive-assistant/contracts build",
+    "test": "vitest run --workspace vitest.workspace.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.31.0",
+    "@types/node": "22.10.0",
+    "eslint": "9.31.0",
+    "prettier": "3.6.2",
+    "tsup": "8.3.5",
+    "typescript": "5.6.3",
+    "typescript-eslint": "8.38.0",
+    "vitest": "2.1.8"
+  }
+}

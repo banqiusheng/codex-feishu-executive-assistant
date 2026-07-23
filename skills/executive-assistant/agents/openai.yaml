@@ -1,0 +1,4 @@
+interface:
+  display_name: "总裁飞书助理"
+  short_description: "处理总裁私聊任务，并安全委托飞书动作和PPT制作"
+  default_prompt: "Use $executive-assistant to handle this paired president Feishu task safely."

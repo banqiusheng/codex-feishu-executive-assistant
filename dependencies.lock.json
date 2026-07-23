@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "larkCodexBridge": {
+    "repository": "https://github.com/VicLuoV5/lark-codex-bridge.git",
+    "tag": "v0.1.34",
+    "tagObjectSha": "fcc8b1f4cb6ef45ba598cda2f057bb2798e479a1",
+    "commitSha": "e8b0dc0cdfe2fb378bef7081618138a20d934aa9",
+    "treeSha": "9abc1413bf4f44ab048985cbbcebe1e4fc099d8f",
+    "patchedTreeSha": "3be456b1bfbe9b01dba9b1b410518a731400247a",
+    "strictManifestSha256": "23309c3ef1ffee7c9e179b7cbb7204e1e2ecfab954b2453041ede898598cf151",
+    "licenseSha256": "4d0cfede2f5089f10c0caf8f270c27797286a27be594da28ef441bfa83a3c782",
+    "vendorScriptSha256": "0c3c1c6f81e86d5e0e7635320a6a5b8bccf5fd29b8576c43e811096a786d4e7f",
+    "manifestToolSha256": "e23a2d4256b6a99fb59a6ef6529b9dfb26c52c0f58c8a666dfb0a3c695241cf4",
+    "patches": [
+      {
+        "path": "vendor/patches/lark-codex-bridge/0001-workspace-adapter.patch",
+        "sha256": "9a7a2ff6db2705234857492eb3a5c8c8309bb02c81da6cf73819375a86e7e381"
+      },
+      {
+        "path": "vendor/patches/lark-codex-bridge/0002-fail-closed-ingress.patch",
+        "sha256": "77d7f3974d6f98579b79ad9705f4b965304b456c2b25204a01c5d938e3311b0a"
+      },
+      {
+        "path": "vendor/patches/lark-codex-bridge/0003-constrained-codex-runner.patch",
+        "sha256": "9df09fdb2dbbd5d9d4647834b500c5d59c33f837d344613bcc01762db439e89c"
+      },
+      {
+        "path": "vendor/patches/lark-codex-bridge/0004-ledger-first-assistant-channel.patch",
+        "sha256": "ef8af2badc40f7c2a51e8b5f7d340e9b7bf4caf52222e2631b6934e9906d2d5d"
+      },
+      {
+        "path": "vendor/patches/lark-codex-bridge/0005-static-dynamic-access-boundary.patch",
+        "sha256": "2bf899fe4e8b7040545591ec9eb0133f1f0a85864b6420397ebccf9f94f1fae3"
+      },
+      {
+        "path": "vendor/patches/lark-codex-bridge/0006-task-scoped-unix-socket-permission.patch",
+        "sha256": "e3c9497b67fbc35f6cb443b9d61d3678e6a3097af85bc5ee59370d2ccc7ed934"
+      }
+    ],
+    "npmIntegrity": "sha512-+4GztTJXLmqPOsmyd4IFSKkYqpw46QeHiAjtlLH9FANn5+HdcoobCZWSlFfRj306aQUk5xn4AWT8em9v2Krhjg==",
+    "license": "MIT"
+  },
+  "larkCli": {
+    "package": "@larksuite/cli",
+    "version": "1.0.72",
+    "npmIntegrity": "sha512-BgK1hmLLMuJNM/Jx5vBQF7pgxwSzREyvQYV2WkkDlBw7fKyJbEZ/baMKq2YZnMFTm+yfmTNEYCsHOf1k2P9S4w==",
+    "darwinArm64ArchiveSha256": "b27942b83e8821934ebd34fbb02e0b00bbca949255866b5010795d625442eae2",
+    "darwinAmd64ArchiveSha256": "b5dd56d64f9cc1cb7bab80b8eb1dda3c34e76f2a751115a897d0261985b82745"
+  },
+  "visualFirstPpt": {
+    "repository": "https://github.com/banqiusheng/visual-first-ppt.git",
+    "tag": "v0.3.0",
+    "tagObjectSha": "4962eb9bd5c55e8384b5228993c241b2220fcabb",
+    "commitSha": "bb775f68f951c3e444d00623bc88976b20c13e7d",
+    "treeSha": "5ad18d178e8191105dcc68717e4639d3a68f0c73",
+    "license": "MIT",
+    "licenseSha256": "947212107746594a12e5a1b5b3cab1a0c2f5d46b0a1ab5d438c4938adaf5d04e"
+  },
+  "codex": {
+    "minimumVersion": "0.142.0",
+    "requiredFeatures": [
+      "exec-json",
+      "exec-resume-stdin",
+      "approval-never",
+      "permission-profiles",
+      "network-proxy-unix-socket-allowlist"
+    ]
+  },
+  "node": {
+    "supportedRange": ">=20.0.0 <21.0.0 || >=22.0.0 <23.0.0 || >=24.0.0 <25.0.0 || >=26.0.0 <27.0.0"
+  },
+  "pnpm": {
+    "version": "10.0.0"
+  }
+}

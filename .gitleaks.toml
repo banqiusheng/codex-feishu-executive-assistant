@@ -1,0 +1,12 @@
+title = "Codex Feishu Executive Assistant gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic UUIDv7 idempotency key used only by the fixed route test"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^packages/action-gateway/test/mvp-lark-routes\.test\.ts$''']
+regexes = ['''idempotencyKey:\s*"018f7d72-7a2b-7f45-8a12-8e20b8426a22"''']

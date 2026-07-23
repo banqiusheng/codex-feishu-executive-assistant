@@ -1,0 +1,514 @@
+#!/bin/zsh -f
+set -euo pipefail
+
+readonly upstream="https://github.com/VicLuoV5/lark-codex-bridge.git"
+readonly tag="v0.1.34"
+readonly tag_object="fcc8b1f4cb6ef45ba598cda2f057bb2798e479a1"
+readonly commit="e8b0dc0cdfe2fb378bef7081618138a20d934aa9"
+readonly tree="9abc1413bf4f44ab048985cbbcebe1e4fc099d8f"
+readonly script_dir="${0:A:h}"
+readonly repo_root="${script_dir:h}"
+readonly target="$repo_root/packages/bridge"
+readonly manifest_tool="$repo_root/scripts/bridge-vendor-manifest.mjs"
+
+usage() {
+  print -u2 -- "usage: scripts/vendor-bridge [--offline-replay]"
+}
+
+resolve_fixed_executable() {
+  local label="$1"
+  shift
+  local candidate
+  local resolved
+
+  for candidate in "$@"; do
+    if [[ ! -x "$candidate" ]]; then
+      continue
+    fi
+    resolved="${candidate:A}"
+    if [[ -f "$resolved" && ! -L "$resolved" && -x "$resolved" ]]; then
+      print -r -- "$resolved"
+      return 0
+    fi
+  done
+
+  print -u2 -- "trusted $label executable is unavailable"
+  return 73
+}
+
+require_equal() {
+  local label="$1"
+  local actual="$2"
+  local expected="$3"
+
+  if [[ "$actual" != "$expected" ]]; then
+    print -u2 -- "$label mismatch: expected $expected, got $actual"
+    exit 1
+  fi
+}
+
+offline_replay() {
+  local node_binary
+  local git_binary
+  local tar_binary
+  node_binary="$(resolve_fixed_executable node /usr/local/bin/node /usr/bin/node /opt/homebrew/bin/node)" || return $?
+  git_binary="$(resolve_fixed_executable git /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git)" || return $?
+  tar_binary="$(resolve_fixed_executable tar /usr/bin/bsdtar /usr/bin/tar /bin/tar)" || return $?
+
+  /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    "$node_binary" --input-type=module - \
+    "$repo_root" "$git_binary" "$tar_binary" <<'NODE'
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  cpSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
+import process from "node:process";
+
+const FAIL_CLOSED_EXIT = 73;
+const SHA256 = /^[0-9a-f]{64}$/u;
+const PATCH_NAME = /^\d{4}-[a-z0-9-]+\.patch$/u;
+const MAX_BUFFER = 64 * 1024 * 1024;
+
+class IntegrityError extends Error {}
+
+function fail(message) {
+  throw new IntegrityError(message);
+}
+
+function sha256(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function requirePlainFile(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    fail(`${label} is missing`);
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+}
+
+function requirePlainDirectory(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    fail(`${label} is missing`);
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    fail(`${label} must be a non-symlink directory`);
+  }
+}
+
+function requireSha(value, label) {
+  if (typeof value !== "string" || !SHA256.test(value)) {
+    fail(`${label} must be a lowercase SHA-256 digest`);
+  }
+  return value;
+}
+
+function requireTree(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
+    fail(`${label} must be a lowercase Git SHA-1 tree id`);
+  }
+  return value;
+}
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: options.cwd,
+    encoding: options.binary ? undefined : "utf8",
+    env: options.env,
+    input: options.input,
+    maxBuffer: MAX_BUFFER,
+  });
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message ?? String(result.stderr ?? "").trim();
+    fail(
+      `${basename(command)} ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return result.stdout;
+}
+
+function parseSummary(output, label) {
+  let summary;
+  try {
+    summary = JSON.parse(String(output).trim());
+  } catch {
+    fail(`${label} returned malformed JSON`);
+  }
+  if (
+    summary === null ||
+    typeof summary !== "object" ||
+    Array.isArray(summary) ||
+    typeof summary.gitTreeSha !== "string" ||
+    typeof summary.strictManifestSha256 !== "string"
+  ) {
+    fail(`${label} returned an invalid summary`);
+  }
+  return summary;
+}
+
+function requireEqual(label, actual, expected) {
+  if (actual !== expected) {
+    fail(`${label} mismatch: expected ${expected}, got ${actual}`);
+  }
+}
+
+function readLock(lockPath) {
+  let lock;
+  try {
+    lock = JSON.parse(readFileSync(lockPath, "utf8"));
+  } catch {
+    fail("dependencies.lock.json is malformed");
+  }
+  if (
+    lock === null ||
+    typeof lock !== "object" ||
+    Array.isArray(lock) ||
+    lock.schemaVersion !== 1 ||
+    lock.larkCodexBridge === null ||
+    typeof lock.larkCodexBridge !== "object" ||
+    Array.isArray(lock.larkCodexBridge)
+  ) {
+    fail("dependencies.lock.json has an unsupported bridge schema");
+  }
+  return lock.larkCodexBridge;
+}
+
+function verifyPatchLock(repoRoot, bridgeLock) {
+  if (!Array.isArray(bridgeLock.patches) || bridgeLock.patches.length === 0) {
+    fail("the locked bridge patch list must be non-empty");
+  }
+
+  const patchDirectory = join(
+    repoRoot,
+    "vendor",
+    "patches",
+    "lark-codex-bridge",
+  );
+  requirePlainDirectory(patchDirectory, "bridge patch directory");
+
+  const diskNames = readdirSync(patchDirectory)
+    .filter((name) => name.endsWith(".patch"))
+    .sort();
+  const expectedPaths = diskNames.map(
+    (name) => `vendor/patches/lark-codex-bridge/${name}`,
+  );
+  if (expectedPaths.length !== bridgeLock.patches.length) {
+    fail("the locked bridge patch list does not match the patch directory");
+  }
+
+  return bridgeLock.patches.map((entry, index) => {
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      Object.keys(entry).sort().join(",") !== "path,sha256" ||
+      typeof entry.path !== "string" ||
+      entry.path !== expectedPaths[index]
+    ) {
+      fail(`locked bridge patch ${index + 1} is missing, extra, or out of order`);
+    }
+    const name = basename(entry.path);
+    if (!PATCH_NAME.test(name)) {
+      fail(`locked bridge patch ${index + 1} has an invalid name`);
+    }
+    const absolutePath = join(repoRoot, ...entry.path.split("/"));
+    requirePlainFile(absolutePath, `locked bridge patch ${entry.path}`);
+    const lockedHash = requireSha(
+      entry.sha256,
+      `locked bridge patch ${entry.path}`,
+    );
+    requireEqual(`bridge patch ${entry.path} SHA-256`, sha256(absolutePath), lockedHash);
+    return absolutePath;
+  });
+}
+
+function copyReplayTree(target, worktree) {
+  const generatedDirectories = new Set([
+    resolve(target, "dist"),
+    resolve(target, "node_modules"),
+  ]);
+  cpSync(target, worktree, {
+    recursive: true,
+    dereference: false,
+    filter: (source) => !generatedDirectories.has(resolve(source)),
+  });
+}
+
+function main() {
+  const repoRoot = resolve(process.argv[2] ?? "");
+  const gitBinary = resolve(process.argv[3] ?? "");
+  const tarBinary = resolve(process.argv[4] ?? "");
+  const lockPath = join(repoRoot, "dependencies.lock.json");
+  const scriptPath = join(repoRoot, "scripts", "vendor-bridge");
+  const manifestTool = join(repoRoot, "scripts", "bridge-vendor-manifest.mjs");
+  const target = join(repoRoot, "packages", "bridge");
+
+  requirePlainFile(lockPath, "dependencies.lock.json");
+  requirePlainFile(scriptPath, "vendor script");
+  requirePlainFile(manifestTool, "bridge manifest tool");
+  requirePlainDirectory(target, "vendored bridge target");
+  requirePlainFile(process.execPath, "Node executable");
+  requirePlainFile(gitBinary, "Git executable");
+  requirePlainFile(tarBinary, "tar executable");
+
+  const bridgeLock = readLock(lockPath);
+  const originalTree = requireTree(bridgeLock.treeSha, "locked original tree");
+  const patchedTree = requireTree(
+    bridgeLock.patchedTreeSha,
+    "locked patched tree",
+  );
+  const strictManifest = requireSha(
+    bridgeLock.strictManifestSha256,
+    "locked strict manifest",
+  );
+  const scriptHash = requireSha(
+    bridgeLock.vendorScriptSha256,
+    "locked vendor script",
+  );
+  const manifestToolHash = requireSha(
+    bridgeLock.manifestToolSha256,
+    "locked manifest tool",
+  );
+  const licenseHash = requireSha(
+    bridgeLock.licenseSha256,
+    "locked bridge license",
+  );
+
+  requireEqual("vendor script SHA-256", sha256(scriptPath), scriptHash);
+  requireEqual(
+    "bridge manifest tool SHA-256",
+    sha256(manifestTool),
+    manifestToolHash,
+  );
+  requirePlainFile(join(target, "LICENSE"), "vendored bridge license");
+  requireEqual(
+    "vendored bridge license SHA-256",
+    sha256(join(target, "LICENSE")),
+    licenseHash,
+  );
+  const patches = verifyPatchLock(repoRoot, bridgeLock);
+
+  const tempRoot = mkdtempSync(join(tmpdir(), "bridge-vendor-replay-"));
+  const worktree = join(tempRoot, "worktree");
+  const archive = join(tempRoot, "archive");
+  const toolEnvironment = Object.freeze({
+    PATH: "/usr/bin:/bin",
+    LANG: "C",
+    LC_ALL: "C",
+    TMPDIR: tempRoot,
+    HOME: tempRoot,
+    XDG_CONFIG_HOME: tempRoot,
+  });
+  const gitEnvironment = Object.freeze({
+    ...toolEnvironment,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ALLOW_PROTOCOL: "file",
+  });
+
+  try {
+    const targetSummary = parseSummary(
+      run(process.execPath, [manifestTool, "summary", target], {
+        env: toolEnvironment,
+      }),
+      "target strict manifest",
+    );
+    requireEqual("target patched tree", targetSummary.gitTreeSha, patchedTree);
+    requireEqual(
+      "target strict manifest SHA-256",
+      targetSummary.strictManifestSha256,
+      strictManifest,
+    );
+
+    copyReplayTree(target, worktree);
+    run(gitBinary, ["init", "--quiet", worktree], { env: gitEnvironment });
+    run(gitBinary, ["-C", worktree, "add", "--all"], {
+      env: gitEnvironment,
+    });
+    requireEqual(
+      "copied target tree",
+      String(
+        run(gitBinary, ["-C", worktree, "write-tree"], {
+          env: gitEnvironment,
+        }),
+      ).trim(),
+      patchedTree,
+    );
+
+    for (const patch of [...patches].reverse()) {
+      run(gitBinary, ["-C", worktree, "apply", "--reverse", "--check", patch], {
+        env: gitEnvironment,
+      });
+      run(
+        gitBinary,
+        ["-C", worktree, "apply", "--reverse", "--index", patch],
+        { env: gitEnvironment },
+      );
+    }
+    const restoredOriginalTree = String(
+      run(gitBinary, ["-C", worktree, "write-tree"], {
+        env: gitEnvironment,
+      }),
+    ).trim();
+    requireEqual(
+      "offline replay original tree",
+      restoredOriginalTree,
+      originalTree,
+    );
+
+    for (const patch of patches) {
+      run(gitBinary, ["-C", worktree, "apply", "--check", patch], {
+        env: gitEnvironment,
+      });
+      run(gitBinary, ["-C", worktree, "apply", "--index", patch], {
+        env: gitEnvironment,
+      });
+    }
+    const restoredPatchedTree = String(
+      run(gitBinary, ["-C", worktree, "write-tree"], {
+        env: gitEnvironment,
+      }),
+    ).trim();
+    requireEqual(
+      "offline replay patched tree",
+      restoredPatchedTree,
+      patchedTree,
+    );
+
+    mkdirSync(archive);
+    const archiveBytes = run(
+      gitBinary,
+      ["-C", worktree, "archive", restoredPatchedTree],
+      { binary: true, env: gitEnvironment },
+    );
+    run(tarBinary, ["-x", "-C", archive], {
+      binary: true,
+      env: gitEnvironment,
+      input: archiveBytes,
+    });
+    const archiveSummary = parseSummary(
+      run(process.execPath, [manifestTool, "compare", archive, target], {
+        env: toolEnvironment,
+      }),
+      "archived strict manifest",
+    );
+    requireEqual("archived patched tree", archiveSummary.gitTreeSha, patchedTree);
+    requireEqual(
+      "archived strict manifest SHA-256",
+      archiveSummary.strictManifestSha256,
+      strictManifest,
+    );
+
+    process.stdout.write(
+      `offline replay restored original tree: ${restoredOriginalTree}\n`,
+    );
+    process.stdout.write(
+      `offline replay restored patched tree: ${restoredPatchedTree}\n`,
+    );
+    process.stdout.write(
+      `offline replay verified strict manifest: ${strictManifest}\n`,
+    );
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+try {
+  main();
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`offline replay integrity failure: ${message}\n`);
+  process.exitCode = FAIL_CLOSED_EXIT;
+}
+NODE
+}
+
+online_refresh() {
+  local -r temp_dir="$(mktemp -d)"
+  local -r clone="$temp_dir/repo"
+  local -r stage="$temp_dir/stage"
+  local -a patches=("$repo_root"/vendor/patches/lark-codex-bridge/*.patch(N))
+
+  git clone --filter=blob:none "$upstream" "$clone"
+  git -C "$clone" checkout --detach "$commit"
+
+  require_equal "upstream HEAD" "$(git -C "$clone" rev-parse HEAD)" "$commit"
+  require_equal "tag object" "$(git -C "$clone" rev-parse "refs/tags/$tag")" "$tag_object"
+  require_equal "peeled tag commit" "$(git -C "$clone" rev-parse "refs/tags/$tag^{}")" "$commit"
+  require_equal "upstream tree" "$(git -C "$clone" rev-parse 'HEAD^{tree}')" "$tree"
+
+  if ! grep -Fq "MIT License" "$clone/LICENSE"; then
+    print -u2 -- "verified upstream source is missing the expected MIT license"
+    exit 1
+  fi
+
+  if (( ${#patches[@]} == 0 )); then
+    print -u2 -- "no audited bridge patches found"
+    exit 1
+  fi
+
+  for patch in "${(@on)patches}"; do
+    print -r -- "applying audited patch: ${patch:t}"
+    git -C "$clone" apply --check "$patch"
+    git -C "$clone" apply --index "$patch"
+  done
+
+  local -r export_tree="$(git -C "$clone" write-tree)"
+  mkdir -p "$stage"
+  git -C "$clone" archive "$export_tree" | tar -x -C "$stage"
+
+  local manifest_summary
+  if [[ -e "$target" || -L "$target" ]]; then
+    if manifest_summary="$(node "$manifest_tool" compare "$stage" "$target")"; then
+      readonly manifest_summary
+    else
+      local -r manifest_status=$?
+      print -u2 -- "refusing to overlay a non-identical bridge tree: $target"
+      exit "$manifest_status"
+    fi
+  else
+    mv "$stage" "$target"
+    manifest_summary="$(node "$manifest_tool" summary "$target")"
+    readonly manifest_summary
+  fi
+
+  mkdir -p "$repo_root/LICENSES"
+  cp "$target/LICENSE" "$repo_root/LICENSES/lark-codex-bridge-MIT.txt"
+
+  print -r -- "verified tag object: $tag_object"
+  print -r -- "verified upstream commit: $commit"
+  print -r -- "verified upstream tree: $tree"
+  print -r -- "exported patched tree: $export_tree"
+  print -r -- "verified strict manifest: $manifest_summary"
+  print -r -- "verified temporary source retained for OS cleanup: $temp_dir"
+}
+
+if (( $# == 1 )) && [[ "$1" == "--offline-replay" ]]; then
+  offline_replay
+  exit $?
+fi
+
+if (( $# != 0 )); then
+  usage
+  exit 2
+fi
+
+online_refresh

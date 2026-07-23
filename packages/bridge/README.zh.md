@@ -1,0 +1,199 @@
+# lark-codex-bridge
+
+把飞书 / Lark 聊天消息转发给本机 Codex CLI 的本地 bot。适合已经在本机登录并使用 Codex CLI，希望从飞书聊天里触发同一套本地 Codex 能力的个人或小团队。
+
+[English README](./README.md)
+
+本项目参考了 `zarazhangrui/feishu-claude-code-bridge` 的架构，agent 层改为 Codex CLI，本地状态目录改为 `~/.feishu-codex-bridge`。
+
+## 当前状态
+
+这是从个人自用部署整理出的开源 alpha。个人使用和小团队使用已经比较顺手，但邀请进大群或长期无人值守前，请先检查安全边界和访问控制。
+
+本项目不需要 OpenAI API key，也不需要 Claude API key。Codex 通过本机 Codex CLI 登录态运行。
+
+## 功能
+
+- 把飞书 / Lark 消息发送给本机 `codex exec`。
+- 每个 chat 或话题维护独立 Codex session。
+- 支持轻量流式 markdown 卡片，也支持跑完后一次性发文本。
+- `/new [name]` 创建新群、新会话，并继承当前工作目录。
+- `/reset` 清空当前 chat 会话。
+- `/cd` 和 `/ws` 切换、保存工作空间。
+- 下载聊天里的图片和文件，把本地路径交给 Codex。
+- `/config` 配置访问控制、回复模式、并发、run 探活和 Codex reasoning effort。
+- 支持前台运行，也支持 OS 托管后台运行。
+
+## 前置条件
+
+- Node.js 20 或更新版本。
+- 本机 Codex CLI 可用且已登录。先在普通终端运行 `codex login`。
+- 一个飞书 / Lark PersonalAgent 应用。
+- 能访问 OpenAI/Codex 以及飞书 / Lark 开放平台网络。
+
+首次运行可以通过二维码向导创建或绑定应用。`lark-cli` 不是普通聊天的硬依赖，但建议安装；Codex 需要操作飞书文档、消息、日历等 API 时会用到它。
+
+Windows 上如果用户名包含中文或空格，Codex 沙箱可能无法稳定解析全局 npm 路径。bridge 会在工作区根目录生成 `.feishu-codex-bridge-tools/` 作为运行时 shim，并根据全局 `@larksuite/cli` 的版本和二进制元数据自动同步。
+
+## 安装
+
+从 npm 安装：
+
+```bash
+npm i -g @vicluo/lark-codex-bridge
+lark-codex-bridge --version
+```
+
+从源码运行：
+
+```bash
+corepack enable
+corepack pnpm install
+corepack pnpm build
+node bin/lark-codex-bridge.mjs --help
+```
+
+## 首次运行
+
+前台启动：
+
+```bash
+lark-codex-bridge run
+```
+
+源码目录里也可以这样跑：
+
+```bash
+node bin/lark-codex-bridge.mjs run
+```
+
+首次运行会创建 `~/.feishu-codex-bridge/config.json`。如果没有应用凭据，会进入二维码注册向导。新的 App Secret 会立即迁移到本地加密 keystore：`~/.feishu-codex-bridge/secrets.enc`。
+
+终端提示开始监听后，私聊 bot：
+
+```text
+/status
+Reply exactly OK
+```
+
+## 飞书 / Lark 应用配置
+
+请在开放平台后台确认权限和事件。bridge 连接成功但 bot 不回复，最常见原因就是这里缺配置。
+
+必需权限：
+
+- `im:message`
+- `im:message:send_as_bot`
+- `im:resource`
+- `im:chat`，`/new` 创建群需要
+- `drive:drive`，云文档评论处理需要
+
+长连接事件订阅：
+
+- `im.message.receive_v1`
+- `card.action.trigger`
+- `drive.notice.comment_add_v1`，云文档评论需要
+
+可选事件：
+
+- `im.message.reaction.created_v1`
+- `im.message.reaction.deleted_v1`
+- `im.chat.member.bot.added_v1`
+
+## 宿主 CLI
+
+前台进程命令：
+
+```bash
+lark-codex-bridge run [-c <config>]
+lark-codex-bridge ps
+lark-codex-bridge kill <id|#>
+```
+
+后台服务命令：
+
+```bash
+lark-codex-bridge start
+lark-codex-bridge stop
+lark-codex-bridge restart
+lark-codex-bridge status
+lark-codex-bridge unregister
+```
+
+服务后端：
+
+- macOS：用户级 `launchd`，带 `KeepAlive`。
+- Linux：用户级 `systemd`，带 `Restart=always`。
+- Windows：Task Scheduler 任务，加 `.cmd` launcher；bridge 异常退出后 60 秒重启，正常退出不重启。
+
+不要用同一个飞书 / Lark 应用启动多个 bridge。开放平台长连接事件可能随机投递给其中一个进程。
+
+## 飞书斜杠命令
+
+| 命令 | 作用 |
+|---|---|
+| `/new [name]` | 创建新群和新会话，继承当前 cwd，并邀请发送者 |
+| `/reset` | 清空当前 chat 会话 |
+| `/resume [N]` | 列出当前 cwd 下最近的 Codex sessions |
+| `/cd <path>` | 在 `FEISHU_CODEX_WORKSPACE_ROOT` 内切换 cwd，并重置 session |
+| `/ws list/save/use/remove` | 管理命名工作空间 |
+| `/status` | 查看 scope、cwd、session、agent 和 reasoning 设置 |
+| `/config` | 配置回复方式、工具显示、并发、timeout、reasoning effort 和访问控制 |
+| `/timeout [N\|off\|default]` | 覆盖当前 session 的 idle timeout |
+| `/stop` | 停止当前 Codex run |
+| `/ps` | 列出本机 bridge 进程 |
+| `/exit <id\|#>` | 停止一个 bridge 进程 |
+| `/reconnect` | 强制重连飞书 / Lark WebSocket |
+| `/doctor [描述]` | 让 Codex 根据近期 bridge 日志自助诊断 |
+| `/account` | 查看或更换应用凭据 |
+| `/help` | 帮助卡片 |
+
+私聊里普通消息都会响应。群和话题群默认只有 @ bot 才响应。
+
+## 本地配置
+
+本地状态放在仓库外：
+
+| 路径 | 用途 |
+|---|---|
+| `~/.feishu-codex-bridge/config.json` | 应用配置和偏好 |
+| `~/.feishu-codex-bridge/secrets.enc` | 加密 App Secret |
+| `~/.feishu-codex-bridge/sessions.json` | chat/topic 到 Codex session 的映射 |
+| `~/.feishu-codex-bridge/workspaces.json` | 命名工作空间 |
+| `~/.feishu-codex-bridge/processes.json` | 运行中进程注册表 |
+| `~/.feishu-codex-bridge/media/<chatId>/` | 附件下载缓存 |
+| `~/.feishu-codex-bridge/logs/YYYY-MM-DD.log` | JSONL 结构化日志 |
+| `<workspace-root>/.feishu-codex-bridge-tools/` | Windows 下给 Codex 使用的 `lark-cli` 运行时 shim；由全局 `@larksuite/cli` 自动同步，不要手工编辑或提交 |
+
+重要环境变量：
+
+| 变量 | 含义 |
+|---|---|
+| `CODEX_HOME` | Codex 配置目录。不设置时由 Codex CLI 使用自己的默认值。 |
+| `CODEX_BIN` | 自定义 Codex 可执行文件路径。 |
+| `FEISHU_CODEX_WORKSPACE_ROOT` | bot 允许 `/cd` 的最大文件系统根目录，默认是 bridge 进程 cwd。 |
+| `FEISHU_CODEX_BRIDGE_PROXY` | Windows helper 脚本使用的可选代理。 |
+| `HTTP_PROXY` / `HTTPS_PROXY` | Node 和 Codex 子进程继承的可选网络代理。 |
+
+## 安全提示
+
+- 不要提交 App Secret、Codex 登录态、cookie 或 `~/.feishu-codex-bridge`。
+- 把 `FEISHU_CODEX_WORKSPACE_ROOT` 设成 bot 真正需要访问的最小目录。
+- 邀请 bot 进共享群前，先在 `/config` 里设置管理员。
+- 群聊默认要求 @ bot，除非明确需要，否则不要关闭。
+- `/doctor` 会先清洗日志再交给 Codex，但日志仍可能包含运行元数据；只在可信会话里使用。
+
+## 开发
+
+```bash
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+git diff --check
+```
+
+GitHub Actions 会在 pull request 上运行同样的 typecheck、test 和 build。
+
+## 许可
+
+[MIT](./LICENSE)

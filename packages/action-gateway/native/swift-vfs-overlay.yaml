@@ -1,0 +1,12 @@
+{
+  "version": 0,
+  "case-sensitive": "true",
+  "roots":
+    [
+      {
+        "type": "file",
+        "name": "/Library/Developer/CommandLineTools/usr/include/swift/bridging.modulemap",
+        "external-contents": "/dev/null",
+      },
+    ],
+}

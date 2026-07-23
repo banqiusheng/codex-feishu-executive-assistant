@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@executive-assistant/action-gateway": [
+        "../action-gateway/dist/index.d.ts"
+      ],
+      "@executive-assistant/bridge": ["../bridge/dist/index.d.ts"],
+      "@executive-assistant/contracts": ["../contracts/dist/index.d.ts"],
+      "@executive-assistant/job-store": ["../job-store/dist/index.d.ts"],
+      "@larksuiteoapi/node-sdk": [
+        "../bridge/node_modules/@larksuiteoapi/node-sdk/types/index.d.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "tsup.config.ts",
+    "vitest.config.ts"
+  ]
+}

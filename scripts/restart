@@ -1,0 +1,72 @@
+#!/bin/zsh
+
+emulate -LR zsh
+set -euo pipefail
+
+readonly LABEL="com.codex-feishu.executive-assistant"
+typeset mode="auto"
+
+usage() {
+  print -r -- "用法："
+  print -r -- "  ./scripts/restart --plan"
+  print -r -- "  ./scripts/restart --apply"
+  print -r -- ""
+  print -r -- "默认在交互终端询问确认；非交互环境只展示计划。"
+}
+
+die() {
+  print -u2 -r -- "重启停止：$1"
+  exit "${2:-1}"
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --plan)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="plan"
+      shift
+      ;;
+    --apply)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="apply"
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "未知参数：$1" 64
+      ;;
+  esac
+done
+
+print -r -- "计划：让 launchd 重新启动 ${LABEL}；不修改配置、Keychain 或客户文件。"
+
+if [[ "${mode}" == "plan" ]]; then
+  exit 0
+fi
+
+if [[ "${mode}" == "auto" ]]; then
+  if [[ "${ASSISTANT_TEST_MODE:-0}" == "1" || ! -t 0 || ! -t 1 ]]; then
+    print -r -- "当前不是交互终端，仅展示计划；实际重启请运行 ./scripts/restart --apply。"
+    exit 0
+  fi
+  print -n -r -- "输入“重启”继续，其他输入取消："
+  IFS= read -r answer
+  [[ "${answer}" == "重启" ]] || {
+    print -r -- "已取消。"
+    exit 0
+  }
+  mode="apply"
+fi
+
+[[ "${ASSISTANT_TEST_MODE:-0}" != "1" ]] ||
+  die "测试模式禁止 --apply；没有调用 launchctl。" 64
+[[ "$(/usr/bin/uname -s)" == "Darwin" ]] || die "只支持 macOS。"
+
+readonly launch_domain="gui/$(/usr/bin/id -u)"
+/bin/launchctl print "${launch_domain}/${LABEL}" >/dev/null 2>&1 ||
+  die "LaunchAgent 尚未加载，请先运行 ./scripts/install --apply。"
+/bin/launchctl kickstart -k "${launch_domain}/${LABEL}"
+print -r -- "已请求 launchd 重启总裁助理。请运行 ./scripts/doctor 查看实际状态。"

@@ -1,0 +1,942 @@
+#!/bin/zsh
+
+emulate -LR zsh
+set -euo pipefail
+setopt pipefail
+umask 077
+
+readonly SCRIPT_DIR="${0:A:h}"
+readonly REPOSITORY_ROOT="${SCRIPT_DIR:h}"
+readonly DEPENDENCY_LOCK="${REPOSITORY_ROOT}/dependencies.lock.json"
+readonly CONFIG_TEMPLATE="${REPOSITORY_ROOT}/config/assistant.example.json"
+readonly PLIST_TEMPLATE="${REPOSITORY_ROOT}/launchd/com.codex-feishu.executive-assistant.plist.template"
+readonly EXECUTIVE_SKILL_SOURCE="${REPOSITORY_ROOT}/skills/executive-assistant"
+readonly PPT_LICENSE_NOTICE="${REPOSITORY_ROOT}/LICENSES/visual-first-ppt-MIT.txt"
+readonly LAUNCHD_LABEL="com.codex-feishu.executive-assistant"
+readonly KEYCHAIN_SERVICE="com.codex-feishu-executive-assistant.bot"
+
+typeset mode="auto"
+typeset app_id=""
+typeset tenant_key=""
+typeset pairing_code=""
+typeset pairing_hash=""
+typeset pairing_expires_at=""
+typeset -a cleanup_paths=()
+
+usage() {
+  print -r -- "用法："
+  print -r -- "  ./scripts/install --plan"
+  print -r -- "  ./scripts/install --verify-only"
+  print -r -- "  ./scripts/install --apply [--app-id cli_xxx] [--tenant-key TENANT_KEY]"
+  print -r -- ""
+  print -r -- "说明："
+  print -r -- "  --plan         只显示计划，不修改电脑。"
+  print -r -- "  --verify-only  只校验仓库锁和交付文件，不修改电脑。"
+  print -r -- "  --apply        执行安装；Keychain 和 LaunchAgent 只在此模式变更。"
+  print -r -- "  --app-id       可提前给出非秘密 App ID；App Secret 永远不能作为参数。"
+  print -r -- "  --tenant-key   可提前给出非秘密 Tenant Key；也可在安装时输入。"
+}
+
+die() {
+  print -u2 -r -- "安装停止：$1"
+  exit "${2:-1}"
+}
+
+note() {
+  print -r -- "• $1"
+}
+
+cleanup() {
+  local candidate
+  for candidate in "${cleanup_paths[@]}"; do
+    [[ -n "${candidate}" && -d "${candidate}" && ! -L "${candidate}" ]] || continue
+    case "${candidate:t}" in
+      ea-ppt-repo.*|ea-visual-first-ppt.*|ea-executive-assistant.*|ea-lark-cli.*)
+        /bin/rm -rf "${candidate}"
+        ;;
+    esac
+  done
+}
+trap cleanup EXIT HUP INT TERM
+
+while (( $# > 0 )); do
+  case "$1" in
+    --plan)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="plan"
+      shift
+      ;;
+    --verify-only)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="verify"
+      shift
+      ;;
+    --apply)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="apply"
+      shift
+      ;;
+    --app-id)
+      (( $# >= 2 )) || die "--app-id 缺少值。" 64
+      app_id="$2"
+      shift 2
+      ;;
+    --tenant-key)
+      (( $# >= 2 )) || die "--tenant-key 缺少值。" 64
+      tenant_key="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --secret|--app-secret|--token)
+      die "秘密不能通过命令行参数传入；请只在 macOS Keychain 安全提示中输入。" 64
+      ;;
+    *)
+      die "未知参数：$1" 64
+      ;;
+  esac
+done
+
+[[ -f "${DEPENDENCY_LOCK}" && ! -L "${DEPENDENCY_LOCK}" ]] ||
+  die "dependencies.lock.json 缺失或不是可信普通文件。"
+[[ -f "${CONFIG_TEMPLATE}" && ! -L "${CONFIG_TEMPLATE}" ]] ||
+  die "配置模板缺失或不是可信普通文件。"
+[[ -f "${PLIST_TEMPLATE}" && ! -L "${PLIST_TEMPLATE}" ]] ||
+  die "LaunchAgent 模板缺失或不是可信普通文件。"
+[[ -f "${EXECUTIVE_SKILL_SOURCE}/SKILL.md" && ! -L "${EXECUTIVE_SKILL_SOURCE}/SKILL.md" ]] ||
+  die "executive-assistant Skill 缺失。"
+[[ -f "${PPT_LICENSE_NOTICE}" && ! -L "${PPT_LICENSE_NOTICE}" ]] ||
+  die "visual-first-ppt 许可证声明缺失或不是可信普通文件。"
+
+typeset node_executable="${commands[node]:-}"
+[[ -n "${node_executable}" ]] || die "未找到 Node.js 20 或更高版本。"
+node_executable="${node_executable:A}"
+
+verify_repository_contract() {
+  local output
+  output="$(
+    "${node_executable}" --input-type=module - \
+      "${DEPENDENCY_LOCK}" "${CONFIG_TEMPLATE}" "${PPT_LICENSE_NOTICE}" <<'NODE'
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+
+const [lockPath, templatePath, pptLicensePath] = process.argv.slice(2);
+const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+const expected = {
+  bridgeRepository: "https://github.com/VicLuoV5/lark-codex-bridge.git",
+  bridgeTag: "v0.1.34",
+  bridgeTagObject: "fcc8b1f4cb6ef45ba598cda2f057bb2798e479a1",
+  bridgeCommit: "e8b0dc0cdfe2fb378bef7081618138a20d934aa9",
+  larkCliVersion: "1.0.72",
+  larkCliDarwinArm64Sha256: "b27942b83e8821934ebd34fbb02e0b00bbca949255866b5010795d625442eae2",
+  larkCliDarwinAmd64Sha256: "b5dd56d64f9cc1cb7bab80b8eb1dda3c34e76f2a751115a897d0261985b82745",
+  pptRepository: "https://github.com/banqiusheng/visual-first-ppt.git",
+  pptTag: "v0.3.0",
+  pptTagObject: "4962eb9bd5c55e8384b5228993c241b2220fcabb",
+  pptCommit: "bb775f68f951c3e444d00623bc88976b20c13e7d",
+  pptTree: "5ad18d178e8191105dcc68717e4639d3a68f0c73",
+  pptLicense: "MIT",
+  pptLicenseSha256: "947212107746594a12e5a1b5b3cab1a0c2f5d46b0a1ab5d438c4938adaf5d04e",
+  codexMinimum: "0.142.0",
+  pnpmVersion: "10.0.0",
+};
+const actual = {
+  bridgeRepository: lock.larkCodexBridge?.repository,
+  bridgeTag: lock.larkCodexBridge?.tag,
+  bridgeTagObject: lock.larkCodexBridge?.tagObjectSha,
+  bridgeCommit: lock.larkCodexBridge?.commitSha,
+  larkCliVersion: lock.larkCli?.version,
+  larkCliDarwinArm64Sha256: lock.larkCli?.darwinArm64ArchiveSha256,
+  larkCliDarwinAmd64Sha256: lock.larkCli?.darwinAmd64ArchiveSha256,
+  pptRepository: lock.visualFirstPpt?.repository,
+  pptTag: lock.visualFirstPpt?.tag,
+  pptTagObject: lock.visualFirstPpt?.tagObjectSha,
+  pptCommit: lock.visualFirstPpt?.commitSha,
+  pptTree: lock.visualFirstPpt?.treeSha,
+  pptLicense: lock.visualFirstPpt?.license,
+  pptLicenseSha256: lock.visualFirstPpt?.licenseSha256,
+  codexMinimum: lock.codex?.minimumVersion,
+  pnpmVersion: lock.pnpm?.version,
+};
+for (const [key, value] of Object.entries(expected)) {
+  if (actual[key] !== value) {
+    throw new Error(`dependency_lock_mismatch:${key}`);
+  }
+}
+const pptLicense = fs.readFileSync(pptLicensePath);
+if (
+  createHash("sha256").update(pptLicense).digest("hex") !==
+  expected.pptLicenseSha256
+) {
+  throw new Error("ppt_license_notice_mismatch");
+}
+const template = JSON.parse(fs.readFileSync(templatePath, "utf8"));
+if (
+  template.schemaVersion !== 1 ||
+  template.secretRef?.type !== "macos-keychain" ||
+  template.paths?.larkHome !== "__LARK_HOME__"
+) {
+  throw new Error("assistant_config_template_invalid");
+}
+const serialized = JSON.stringify(template);
+if (/"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/.test(serialized)) {
+  throw new Error("assistant_config_template_contains_secret_field");
+}
+for (const value of [
+  expected.larkCliVersion,
+  expected.larkCliDarwinArm64Sha256,
+  expected.larkCliDarwinAmd64Sha256,
+  expected.pptRepository,
+  expected.pptTag,
+  expected.pptTagObject,
+  expected.pptCommit,
+  expected.pptTree,
+]) {
+  process.stdout.write(`${value}\n`);
+}
+NODE
+  )" || die "依赖锁或配置模板不符合本仓库固定合同。"
+
+  typeset -ga ppt_contract
+  typeset -ga dependency_contract
+  dependency_contract=("${(@f)output}")
+  (( ${#dependency_contract[@]} == 8 )) || die "无法读取固定依赖版本。"
+
+  typeset -ga ppt_contract
+  ppt_contract=(
+    "${dependency_contract[4]}"
+    "${dependency_contract[5]}"
+    "${dependency_contract[6]}"
+    "${dependency_contract[7]}"
+    "${dependency_contract[8]}"
+  )
+}
+
+verify_repository_contract
+/usr/bin/plutil -lint "${PLIST_TEMPLATE}" >/dev/null ||
+  die "LaunchAgent 模板不是合法 plist。"
+
+print_plan() {
+  print -r -- ""
+  print -r -- "将执行以下安装："
+  note "使用 dependencies.lock.json 的固定版本，不跟随 latest。"
+  note "在当前仓库完成冻结依赖安装、构建和 native run client 构建。"
+  note "创建 ~/PresidentAssistant 与专用 CODEX_HOME。"
+  note "从飞书官方 release 安装并核验私有 lark-cli 1.0.72，不加入 Codex PATH。"
+  note "从当前 Codex 可见的官方 primary-runtime marketplace 安装 Presentations。"
+  note "安装 executive-assistant 和精确核验的 visual-first-ppt v0.3.0。"
+  note "imagegen 只做真实可见性判断；无法用本机证据确认时保持 WARN。"
+  note "App Secret 由 /usr/bin/security 自己安全提示，不进入 argv、环境或配置文件。"
+  note "初始化独立飞书 CLI 配置，并引导总裁完成日历、通讯录和妙记用户授权。"
+  note "生成一个用户级 RunAtLoad + KeepAlive LaunchAgent。"
+  note "最后运行只读 doctor；真实飞书连接、配对和能力仍以 doctor/运行时结果为准。"
+  print -r -- ""
+}
+
+if [[ "${mode}" == "verify" ]]; then
+  print -r -- "仓库交付面校验通过：依赖锁、配置模板、Skill 和 LaunchAgent 模板可解析。"
+  exit 0
+fi
+
+print_plan
+
+if [[ "${mode}" == "plan" ]]; then
+  exit 0
+fi
+
+if [[ "${mode}" == "auto" ]]; then
+  if [[ "${ASSISTANT_TEST_MODE:-0}" == "1" || ! -t 0 || ! -t 1 ]]; then
+    print -r -- "当前不是交互终端，仅展示计划；实际安装请在 Mac mini 终端运行 ./scripts/install --apply。"
+    exit 0
+  fi
+  print -n -r -- "输入“安装”继续，其他输入取消："
+  IFS= read -r answer
+  [[ "${answer}" == "安装" ]] || {
+    print -r -- "已取消，电脑未发生变化。"
+    exit 0
+  }
+  mode="apply"
+fi
+
+[[ "${mode}" == "apply" ]] || die "内部运行模式无效。"
+[[ "${ASSISTANT_TEST_MODE:-0}" != "1" ]] ||
+  die "测试模式禁止 --apply；未执行 Keychain、launchctl、构建或目录写入。" 64
+[[ -t 0 && -t 1 ]] || die "--apply 必须在交互终端运行。" 64
+[[ "$(/usr/bin/uname -s)" == "Darwin" ]] || die "只支持 macOS。"
+
+if [[ -z "${app_id}" ]]; then
+  print -n -r -- "请输入飞书 App ID（不是 App Secret）："
+  IFS= read -r app_id
+fi
+[[ "${app_id}" =~ '^cli_[A-Za-z0-9_-]{6,128}$' ]] ||
+  die "App ID 格式不正确，应以 cli_ 开头。"
+if [[ -z "${tenant_key}" ]]; then
+  print -n -r -- "请输入飞书 Tenant Key（不是 App Secret）："
+  IFS= read -r tenant_key
+fi
+[[ "${tenant_key}" =~ '^[A-Za-z0-9_-]{2,128}$' ]] ||
+  die "Tenant Key 格式不正确，只能包含字母、数字、下划线或连字符。"
+
+typeset corepack_executable="${commands[corepack]:-}"
+typeset codex_executable="${commands[codex]:-}"
+[[ -n "${corepack_executable}" ]] || die "未找到 corepack。"
+[[ -n "${codex_executable}" ]] || die "未找到 Codex CLI。"
+corepack_executable="${corepack_executable:A}"
+codex_executable="${codex_executable:A}"
+
+note "安装冻结依赖并构建仓库。"
+(
+  cd "${REPOSITORY_ROOT}"
+  "${corepack_executable}" pnpm install --frozen-lockfile
+  "${corepack_executable}" pnpm build
+  /bin/zsh packages/action-gateway/native/run-client/build.sh
+)
+
+readonly runtime_entry="${REPOSITORY_ROOT}/packages/runtime/dist/cli.js"
+readonly gateway_client="${REPOSITORY_ROOT}/dist/public-bin/assistant-gateway"
+[[ -f "${runtime_entry}" && ! -L "${runtime_entry}" ]] ||
+  die "runtime 构建产物缺失：packages/runtime/dist/cli.js。"
+[[ -f "${gateway_client}" && ! -L "${gateway_client}" && -x "${gateway_client}" ]] ||
+  die "native gateway run client 构建产物缺失或不可执行。"
+
+readonly assistant_root="${HOME}/PresidentAssistant"
+readonly runtime_root="${assistant_root}/runtime"
+readonly codex_home="${runtime_root}/codex-home"
+readonly skills_root="${codex_home}/skills"
+readonly jobs_root="${assistant_root}/jobs"
+readonly outputs_root="${assistant_root}/outputs"
+readonly ppt_projects_root="${assistant_root}/ppt-projects"
+readonly database_path="${runtime_root}/assistant.sqlite"
+readonly logs_root="${assistant_root}/logs"
+readonly config_dir="${runtime_root}/config"
+readonly config_path="${config_dir}/assistant.json"
+readonly lark_cli_version="${dependency_contract[1]}"
+readonly lark_profile="executive-assistant"
+readonly lark_home="${runtime_root}/lark-home"
+readonly lark_cli_install_root="${runtime_root}/lark-cli-${lark_cli_version}"
+readonly lark_cli_private_bin="${lark_cli_install_root}/private-bin"
+readonly lark_cli_executable="${lark_cli_private_bin}/lark-cli"
+readonly lark_cli_receipt="${lark_cli_install_root}/install-receipt.json"
+readonly ppt_skill_root="${skills_root}/visual-first-ppt"
+readonly executive_skill_root="${skills_root}/executive-assistant"
+
+typeset -a private_directories=(
+  "${assistant_root}"
+  "${assistant_root}/inbox"
+  "${jobs_root}"
+  "${outputs_root}"
+  "${ppt_projects_root}"
+  "${runtime_root}"
+  "${codex_home}"
+  "${lark_home}"
+  "${skills_root}"
+  "${config_dir}"
+  "${logs_root}"
+)
+
+local_directory=""
+for local_directory in "${private_directories[@]}"; do
+  /bin/mkdir -p "${local_directory}"
+  /bin/chmod 0700 "${local_directory}"
+done
+
+typeset lark_arch=""
+typeset lark_archive_sha=""
+case "$(/usr/bin/uname -m)" in
+  arm64)
+    lark_arch="arm64"
+    lark_archive_sha="${dependency_contract[2]}"
+    ;;
+  x86_64)
+    lark_arch="amd64"
+    lark_archive_sha="${dependency_contract[3]}"
+    ;;
+  *)
+    die "不支持当前 Mac 架构，无法安装锁定 lark-cli。"
+    ;;
+esac
+readonly lark_archive_name="lark-cli-${lark_cli_version}-darwin-${lark_arch}.tar.gz"
+readonly lark_source_url="https://github.com/larksuite/cli/releases/download/v${lark_cli_version}/${lark_archive_name}"
+
+verify_lark_cli_install() {
+  [[ -f "${lark_cli_executable}" && ! -L "${lark_cli_executable}" && -x "${lark_cli_executable}" ]] ||
+    return 1
+  [[ -f "${lark_cli_receipt}" && ! -L "${lark_cli_receipt}" ]] || return 1
+  local version_output
+  version_output="$("${lark_cli_executable}" --version 2>&1)" || return 1
+  [[ "${version_output}" == *"${lark_cli_version}"* ]] || return 1
+  "${node_executable}" --input-type=module - \
+    "${lark_cli_receipt}" "${lark_cli_executable}" "${lark_cli_version}" \
+    "${lark_archive_sha}" "${lark_source_url}" <<'NODE'
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+
+const [receiptPath, binaryPath, version, archiveSha256, sourceUrl] = process.argv.slice(2);
+const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+const binarySha256 = createHash("sha256").update(fs.readFileSync(binaryPath)).digest("hex");
+if (
+  receipt.schemaVersion !== 1 ||
+  receipt.package !== "@larksuite/cli" ||
+  receipt.version !== version ||
+  receipt.archiveSha256 !== archiveSha256 ||
+  receipt.sourceUrl !== sourceUrl ||
+  receipt.binarySha256 !== binarySha256 ||
+  typeof receipt.binarySha256 !== "string"
+) {
+  throw new Error("lark_cli_receipt_mismatch");
+}
+NODE
+}
+
+if [[ -e "${lark_cli_install_root}" ]]; then
+  [[ -d "${lark_cli_install_root}" && ! -L "${lark_cli_install_root}" ]] ||
+    die "已有 lark-cli 私有安装不是可信目录。"
+  verify_lark_cli_install ||
+    die "已有 lark-cli 私有安装与固定版本收据不匹配；安装器不会覆盖。"
+  note "私有 lark-cli ${lark_cli_version} 已核验，复用现有安装。"
+else
+  typeset lark_download_root
+  lark_download_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ea-lark-cli.XXXXXX")"
+  cleanup_paths+=("${lark_download_root}")
+  typeset lark_archive_path="${lark_download_root}/${lark_archive_name}"
+
+  note "从飞书官方 release 下载 lark-cli ${lark_cli_version} (${lark_arch})。"
+  /usr/bin/curl \
+    --fail \
+    --location \
+    --silent \
+    --show-error \
+    --proto '=https' \
+    --tlsv1.2 \
+    --connect-timeout 10 \
+    --max-time 180 \
+    --max-redirs 3 \
+    --output "${lark_archive_path}" \
+    "${lark_source_url}"
+  [[ "$(/usr/bin/shasum -a 256 "${lark_archive_path}" | /usr/bin/awk '{print $1}')" == "${lark_archive_sha}" ]] ||
+    die "lark-cli 官方 archive SHA-256 校验失败。"
+  /usr/bin/tar -xzf "${lark_archive_path}" -C "${lark_download_root}"
+  [[ -f "${lark_download_root}/lark-cli" && ! -L "${lark_download_root}/lark-cli" ]] ||
+    die "lark-cli 官方 archive 中缺少预期可执行文件。"
+
+  typeset lark_staging
+  lark_staging="$(/usr/bin/mktemp -d "${runtime_root}/ea-lark-cli.XXXXXX")"
+  cleanup_paths+=("${lark_staging}")
+  /bin/mkdir -p "${lark_staging}/private-bin"
+  /bin/chmod 0700 "${lark_staging}/private-bin"
+  /usr/bin/install -m 0500 \
+    "${lark_download_root}/lark-cli" \
+    "${lark_staging}/private-bin/lark-cli"
+  LARK_RECEIPT="${lark_staging}/install-receipt.json" \
+  LARK_BINARY="${lark_staging}/private-bin/lark-cli" \
+  LARK_VERSION="${lark_cli_version}" \
+  LARK_ARCHIVE_SHA="${lark_archive_sha}" \
+  LARK_SOURCE_URL="${lark_source_url}" \
+    "${node_executable}" --input-type=module <<'NODE'
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+
+const binarySha256 = createHash("sha256")
+  .update(fs.readFileSync(process.env.LARK_BINARY))
+  .digest("hex");
+const receipt = {
+  schemaVersion: 1,
+  package: "@larksuite/cli",
+  version: process.env.LARK_VERSION,
+  archiveSha256: process.env.LARK_ARCHIVE_SHA,
+  binarySha256,
+  sourceUrl: process.env.LARK_SOURCE_URL,
+};
+fs.writeFileSync(process.env.LARK_RECEIPT, `${JSON.stringify(receipt, null, 2)}\n`, {
+  encoding: "utf8",
+  mode: 0o600,
+  flag: "wx",
+});
+NODE
+  /bin/chmod 0700 "${lark_staging}"
+  /bin/chmod 0700 "${lark_staging}/private-bin"
+  /bin/chmod 0500 "${lark_staging}/private-bin/lark-cli"
+  /bin/chmod 0600 "${lark_staging}/install-receipt.json"
+  /bin/mv "${lark_staging}" "${lark_cli_install_root}"
+  verify_lark_cli_install || die "lark-cli 私有安装后的版本或收据校验失败。"
+  note "lark-cli ${lark_cli_version} 已安装到私有目录；未加入 Codex PATH。"
+fi
+
+install_local_skill() {
+  local source="$1"
+  local target="$2"
+  local name="$3"
+  if [[ -e "${target}" ]]; then
+    [[ -d "${target}" && ! -L "${target}" ]] || die "${name} 的已有目标不是可信目录。"
+    /usr/bin/diff -qr "${source}" "${target}" >/dev/null ||
+      die "${name} 已存在但内容与仓库不一致；安装器不会覆盖。"
+    note "${name} 已安装且内容一致，复用现有目录。"
+    return
+  fi
+  local staging
+  staging="$(/usr/bin/mktemp -d "${skills_root}/ea-${name}.XXXXXX")"
+  cleanup_paths+=("${staging}")
+  /usr/bin/ditto "${source}" "${staging}"
+  /usr/bin/find "${staging}" -type d -exec /bin/chmod 0700 {} \;
+  /usr/bin/find "${staging}" -type f -exec /bin/chmod 0600 {} \;
+  /bin/mv "${staging}" "${target}"
+  note "${name} 已安装到专用 CODEX_HOME。"
+}
+
+install_local_skill "${EXECUTIVE_SKILL_SOURCE}" "${executive_skill_root}" "executive-assistant"
+
+verify_existing_ppt_skill() {
+  "${node_executable}" --input-type=module - "${ppt_skill_root}" \
+    "${ppt_contract[1]}" "${ppt_contract[2]}" "${ppt_contract[3]}" \
+    "${ppt_contract[4]}" "${ppt_contract[5]}" <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+
+const [root, repository, tag, tagObjectSha, commitSha, treeSha] = process.argv.slice(2);
+const receiptPath = path.join(root, ".executive-assistant-install.json");
+const skillPath = path.join(root, "SKILL.md");
+const receiptStat = fs.lstatSync(receiptPath);
+const skillStat = fs.lstatSync(skillPath);
+if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || !skillStat.isFile() || skillStat.isSymbolicLink()) {
+  throw new Error("ppt_install_identity_invalid");
+}
+const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+const expected = { schemaVersion: 1, repository, tag, tagObjectSha, commitSha, treeSha };
+for (const [key, value] of Object.entries(expected)) {
+  if (receipt[key] !== value) throw new Error(`ppt_install_mismatch:${key}`);
+}
+NODE
+}
+
+if [[ -e "${ppt_skill_root}" ]]; then
+  [[ -d "${ppt_skill_root}" && ! -L "${ppt_skill_root}" ]] ||
+    die "visual-first-ppt 的已有目标不是可信目录。"
+  verify_existing_ppt_skill ||
+    die "visual-first-ppt 已存在但来源收据不匹配；安装器不会覆盖。"
+  note "visual-first-ppt 固定版本已存在，复用现有目录。"
+else
+  note "下载并精确核验 visual-first-ppt ${ppt_contract[2]}。"
+  typeset ppt_repository_tmp
+  ppt_repository_tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ea-ppt-repo.XXXXXX")"
+  cleanup_paths+=("${ppt_repository_tmp}")
+  /usr/bin/git -C "${ppt_repository_tmp}" init -q
+  /usr/bin/git -C "${ppt_repository_tmp}" remote add origin "${ppt_contract[1]}"
+  /usr/bin/git -C "${ppt_repository_tmp}" \
+    -c protocol.version=2 fetch --quiet --depth=1 origin \
+    "refs/tags/${ppt_contract[2]}:refs/tags/${ppt_contract[2]}"
+
+  [[ "$(/usr/bin/git -C "${ppt_repository_tmp}" rev-parse "refs/tags/${ppt_contract[2]}")" == "${ppt_contract[3]}" ]] ||
+    die "visual-first-ppt tag object 校验失败。"
+  [[ "$(/usr/bin/git -C "${ppt_repository_tmp}" rev-parse "refs/tags/${ppt_contract[2]}^{}")" == "${ppt_contract[4]}" ]] ||
+    die "visual-first-ppt commit 校验失败。"
+  [[ "$(/usr/bin/git -C "${ppt_repository_tmp}" rev-parse "refs/tags/${ppt_contract[2]}^{tree}")" == "${ppt_contract[5]}" ]] ||
+    die "visual-first-ppt tree 校验失败。"
+
+  typeset ppt_staging
+  ppt_staging="$(/usr/bin/mktemp -d "${skills_root}/ea-visual-first-ppt.XXXXXX")"
+  cleanup_paths+=("${ppt_staging}")
+  /usr/bin/git -C "${ppt_repository_tmp}" archive "${ppt_contract[2]}" |
+    /usr/bin/tar -x -C "${ppt_staging}"
+
+  RECEIPT_PATH="${ppt_staging}/.executive-assistant-install.json" \
+  PPT_REPOSITORY="${ppt_contract[1]}" \
+  PPT_TAG="${ppt_contract[2]}" \
+  PPT_TAG_OBJECT="${ppt_contract[3]}" \
+  PPT_COMMIT="${ppt_contract[4]}" \
+  PPT_TREE="${ppt_contract[5]}" \
+    "${node_executable}" --input-type=module <<'NODE'
+import fs from "node:fs";
+
+const receipt = {
+  schemaVersion: 1,
+  repository: process.env.PPT_REPOSITORY,
+  tag: process.env.PPT_TAG,
+  tagObjectSha: process.env.PPT_TAG_OBJECT,
+  commitSha: process.env.PPT_COMMIT,
+  treeSha: process.env.PPT_TREE,
+};
+fs.writeFileSync(process.env.RECEIPT_PATH, `${JSON.stringify(receipt, null, 2)}\n`, {
+  encoding: "utf8",
+  mode: 0o600,
+  flag: "wx",
+});
+NODE
+  /usr/bin/find "${ppt_staging}" -type d -exec /bin/chmod 0700 {} \;
+  /usr/bin/find "${ppt_staging}" -type f -exec /bin/chmod 0600 {} \;
+  /bin/mv "${ppt_staging}" "${ppt_skill_root}"
+  note "visual-first-ppt 已安装并记录固定来源。"
+fi
+
+note "从当前 Codex 定位官方 openai-primary-runtime marketplace。"
+typeset current_plugin_json
+current_plugin_json="$(
+  "${codex_executable}" plugin list \
+    --marketplace openai-primary-runtime \
+    --available \
+    --json 2>/dev/null
+)" || die "BLOCKED_CAPABILITY：当前 Codex 无法列出 openai-primary-runtime marketplace。"
+
+typeset -a presentations_contract
+presentations_contract=("${(@f)$(
+  print -rn -- "${current_plugin_json}" |
+    "${node_executable}" --input-type=module -e '
+      import path from "node:path";
+      let raw = "";
+      for await (const chunk of process.stdin) raw += chunk;
+      const result = JSON.parse(raw);
+      const entries = [...(result.installed ?? []), ...(result.available ?? [])];
+      const plugin = entries.find(
+        (entry) => entry.pluginId === "presentations@openai-primary-runtime",
+      );
+      const root = plugin?.marketplaceSource?.source;
+      if (
+        plugin?.marketplaceName !== "openai-primary-runtime" ||
+        plugin?.marketplaceSource?.sourceType !== "local" ||
+        typeof plugin?.version !== "string" ||
+        plugin.version.length === 0 ||
+        typeof root !== "string" ||
+        !path.isAbsolute(root)
+      ) {
+        process.exit(2);
+      }
+      process.stdout.write(`${root}\n${plugin.version}\n`);
+    '
+)}") || die "BLOCKED_CAPABILITY：当前 Codex 看不到官方 presentations@openai-primary-runtime。"
+(( ${#presentations_contract[@]} == 2 )) ||
+  die "BLOCKED_CAPABILITY：官方 Presentations marketplace 身份无法确定。"
+
+readonly presentations_marketplace_root="${presentations_contract[1]}"
+readonly presentations_plugin_version="${presentations_contract[2]}"
+[[ -d "${presentations_marketplace_root}" && ! -L "${presentations_marketplace_root}" ]] ||
+  die "BLOCKED_CAPABILITY：Codex 返回的 primary-runtime marketplace 根不可用。"
+[[ -f "${presentations_marketplace_root}/.agents/plugins/marketplace.json" &&
+  ! -L "${presentations_marketplace_root}/.agents/plugins/marketplace.json" ]] ||
+  die "BLOCKED_CAPABILITY：Codex 返回的 primary-runtime marketplace 缺少可信清单。"
+
+CODEX_HOME="${codex_home}" "${codex_executable}" plugin marketplace add \
+  "${presentations_marketplace_root}" >/dev/null ||
+  die "BLOCKED_CAPABILITY：无法把官方 primary-runtime marketplace 注册到专用 CODEX_HOME。"
+
+presentations_state() {
+  local plugin_json
+  plugin_json="$(
+    CODEX_HOME="${codex_home}" "${codex_executable}" plugin list \
+      --marketplace openai-primary-runtime \
+      --available \
+      --json 2>/dev/null
+  )" || return 1
+  print -rn -- "${plugin_json}" |
+    "${node_executable}" --input-type=module -e '
+      let raw = "";
+      for await (const chunk of process.stdin) raw += chunk;
+      const [expectedRoot, expectedVersion] = process.argv.slice(1);
+      const result = JSON.parse(raw);
+      const entries = [...(result.installed ?? []), ...(result.available ?? [])];
+      const plugin = entries.find(
+        (entry) => entry.pluginId === "presentations@openai-primary-runtime",
+      );
+      if (
+        !plugin ||
+        plugin.marketplaceName !== "openai-primary-runtime" ||
+        plugin.marketplaceSource?.sourceType !== "local" ||
+        plugin.marketplaceSource?.source !== expectedRoot ||
+        plugin.version !== expectedVersion
+      ) {
+        process.exit(2);
+      }
+      process.stdout.write(
+        plugin.installed === true && plugin.enabled === true ? "ready" : "install",
+      );
+    ' "${presentations_marketplace_root}" "${presentations_plugin_version}"
+}
+
+typeset presentations_install_state
+presentations_install_state="$(presentations_state)" ||
+  die "BLOCKED_CAPABILITY：专用 CODEX_HOME 中的 Presentations 来源或版本不匹配；安装器不会覆盖。"
+if [[ "${presentations_install_state}" == "install" ]]; then
+  CODEX_HOME="${codex_home}" "${codex_executable}" plugin add \
+    presentations@openai-primary-runtime --json >/dev/null ||
+    die "BLOCKED_CAPABILITY：官方 Presentations 插件安装失败。"
+fi
+[[ "$(presentations_state)" == "ready" ]] ||
+  die "BLOCKED_CAPABILITY：Presentations 未能在专用 CODEX_HOME 中启用。"
+note "Presentations ${presentations_plugin_version} 已由 Codex 官方 marketplace 安装并启用。"
+
+if [[ -f "${codex_home}/skills/.system/imagegen/SKILL.md" &&
+  ! -L "${codex_home}/skills/.system/imagegen/SKILL.md" ]]; then
+  note "WARN：专用 CODEX_HOME 存在 imagegen Skill，但系统 image_gen 工具仍需目标机新任务确认。"
+else
+  note "WARN：只读本地证据无法确认专用 CODEX_HOME 暴露 imagegen；真实 PPT 保持 BLOCKED_CAPABILITY，待目标机验收。"
+fi
+
+note "检查专用 Codex 登录。"
+if ! CODEX_HOME="${codex_home}" "${codex_executable}" login status >/dev/null 2>&1; then
+  print -r -- "接下来打开 Codex 官方登录流程，只写入专用 CODEX_HOME。"
+  CODEX_HOME="${codex_home}" "${codex_executable}" login
+fi
+CODEX_HOME="${codex_home}" "${codex_executable}" login status >/dev/null 2>&1 ||
+  die "专用 Codex 登录未完成。"
+
+if /usr/bin/security find-generic-password -a "${app_id}" -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1; then
+  note "Bot App Secret 的 Keychain item 已存在；安装器不会显示或覆盖。"
+else
+  print -r -- ""
+  print -r -- "macOS 即将安全提示输入 App Secret。输入内容不会进入脚本 argv、环境或配置文件。"
+  /usr/bin/security add-generic-password \
+    -a "${app_id}" \
+    -s "${KEYCHAIN_SERVICE}" \
+    -w
+  /usr/bin/security find-generic-password -a "${app_id}" -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1 ||
+    die "Keychain item 未能保存。"
+fi
+
+note "初始化机器人专用的飞书 CLI 配置。"
+/usr/bin/security find-generic-password \
+  -w \
+  -a "${app_id}" \
+  -s "${KEYCHAIN_SERVICE}" |
+  HOME="${lark_home}" "${lark_cli_executable}" \
+    --profile "${lark_profile}" \
+    config init \
+    --app-id "${app_id}" \
+    --app-secret-stdin \
+    --brand feishu \
+    --name "${lark_profile}" >/dev/null ||
+  die "飞书 CLI 配置初始化失败；App Secret 未写入本仓库配置。"
+HOME="${lark_home}" "${lark_cli_executable}" \
+  --profile "${lark_profile}" \
+  config strict-mode off >/dev/null ||
+  die "飞书 CLI 无法启用 Bot 与 User 双身份能力。"
+
+lark_user_auth_is_healthy() {
+  local auth_json
+  auth_json="$(
+    HOME="${lark_home}" "${lark_cli_executable}" \
+      --profile "${lark_profile}" \
+      auth status --json --verify 2>/dev/null
+  )" || return 1
+  print -rn -- "${auth_json}" |
+    "${node_executable}" --input-type=module -e '
+      let raw = "";
+      for await (const chunk of process.stdin) raw += chunk;
+      const result = JSON.parse(raw);
+      if (result?.ok !== true) process.exit(2);
+    ' >/dev/null
+}
+
+if lark_user_auth_is_healthy; then
+  note "飞书用户授权仍然有效，复用现有授权。"
+else
+  print -r -- ""
+  print -r -- "接下来会打开飞书授权页。请由总裁本人授权日历、通讯录和妙记。"
+  HOME="${lark_home}" "${lark_cli_executable}" \
+    --profile "${lark_profile}" \
+    auth login --domain calendar,contact,minutes ||
+    die "飞书用户授权未完成。"
+fi
+lark_user_auth_is_healthy ||
+  die "飞书用户授权健康检查未通过。"
+
+if [[ -e "${config_path}" ]]; then
+  [[ -f "${config_path}" && ! -L "${config_path}" ]] ||
+    die "已有运行配置不是可信普通文件。"
+  /bin/chmod 0600 "${config_path}"
+  "${node_executable}" --input-type=module - \
+    "${config_path}" "${app_id}" "${tenant_key}" "${lark_home}" \
+    "${lark_cli_executable}" \
+    "${presentations_plugin_version}" <<'NODE'
+import fs from "node:fs";
+const [
+  configPath,
+  expectedAppId,
+  expectedTenantKey,
+  expectedLarkHome,
+  expectedLarkCli,
+  expectedPresentationsVersion,
+] = process.argv.slice(2);
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+if (
+  config.schemaVersion !== 1 ||
+  config.appId !== expectedAppId ||
+  config.tenantKey !== expectedTenantKey ||
+  config.paths?.larkHome !== expectedLarkHome ||
+  config.executables?.larkCli !== expectedLarkCli ||
+  config.visualFirstPpt?.presentationsPlugin?.id !==
+    "presentations@openai-primary-runtime" ||
+  config.visualFirstPpt?.presentationsPlugin?.version !==
+    expectedPresentationsVersion
+) {
+  throw new Error("existing_config_identity_mismatch");
+}
+const serialized = JSON.stringify(config);
+if (/"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/.test(serialized)) {
+  throw new Error("existing_config_contains_secret_field");
+}
+NODE
+  note "已有同 App ID 配置保持不变，不重置配对状态。"
+else
+  typeset -a pairing_contract
+  pairing_contract=("${(@f)$(
+    "${node_executable}" --input-type=module <<'NODE'
+import { createHash, randomBytes } from "node:crypto";
+const code = randomBytes(8).toString("hex").toUpperCase();
+const hash = `sha256:${createHash("sha256").update(code, "utf8").digest("hex")}`;
+const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+process.stdout.write(`${code}\n${hash}\n${expiresAt}\n`);
+NODE
+  )}")
+  (( ${#pairing_contract[@]} == 3 )) || die "无法生成一次性配对码。"
+  pairing_code="${pairing_contract[1]}"
+  pairing_hash="${pairing_contract[2]}"
+  pairing_expires_at="${pairing_contract[3]}"
+
+  CONFIG_TEMPLATE_PATH="${CONFIG_TEMPLATE}" \
+  CONFIG_PATH="${config_path}" \
+  APP_ID="${app_id}" \
+  TENANT_KEY="${tenant_key}" \
+  PAIRING_HASH="${pairing_hash}" \
+  PAIRING_EXPIRES_AT="${pairing_expires_at}" \
+  ASSISTANT_ROOT="${assistant_root}" \
+  RUNTIME_ROOT="${runtime_root}" \
+  JOBS_ROOT="${jobs_root}" \
+  OUTPUTS_ROOT="${outputs_root}" \
+  PPT_PROJECTS_ROOT="${ppt_projects_root}" \
+  CODEX_HOME_PATH="${codex_home}" \
+  LARK_HOME_PATH="${lark_home}" \
+  DATABASE_PATH="${database_path}" \
+  LOGS_ROOT="${logs_root}" \
+  NODE_EXECUTABLE="${node_executable}" \
+  CODEX_EXECUTABLE="${codex_executable}" \
+  LARK_CLI_EXECUTABLE="${lark_cli_executable}" \
+  GATEWAY_CLIENT="${gateway_client}" \
+  RUNTIME_ENTRY="${runtime_entry}" \
+  PPT_SKILL_ROOT="${ppt_skill_root}" \
+  PRESENTATIONS_PLUGIN_VERSION="${presentations_plugin_version}" \
+    "${node_executable}" --input-type=module <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+
+const template = JSON.parse(fs.readFileSync(process.env.CONFIG_TEMPLATE_PATH, "utf8"));
+const replacements = new Map([
+  ["__APP_ID__", process.env.APP_ID],
+  ["__TENANT_KEY__", process.env.TENANT_KEY],
+  ["__PAIRING_CODE_HASH__", process.env.PAIRING_HASH],
+  ["__PAIRING_EXPIRES_AT__", process.env.PAIRING_EXPIRES_AT],
+  ["__ASSISTANT_ROOT__", process.env.ASSISTANT_ROOT],
+  ["__RUNTIME_ROOT__", process.env.RUNTIME_ROOT],
+  ["__JOBS_ROOT__", process.env.JOBS_ROOT],
+  ["__OUTPUTS_ROOT__", process.env.OUTPUTS_ROOT],
+  ["__PPT_PROJECTS_ROOT__", process.env.PPT_PROJECTS_ROOT],
+  ["__CODEX_HOME__", process.env.CODEX_HOME_PATH],
+  ["__LARK_HOME__", process.env.LARK_HOME_PATH],
+  ["__DATABASE_PATH__", process.env.DATABASE_PATH],
+  ["__LOGS_ROOT__", process.env.LOGS_ROOT],
+  ["__NODE_EXECUTABLE__", process.env.NODE_EXECUTABLE],
+  ["__CODEX_EXECUTABLE__", process.env.CODEX_EXECUTABLE],
+  ["__LARK_CLI_EXECUTABLE__", process.env.LARK_CLI_EXECUTABLE],
+  ["__GATEWAY_CLIENT__", process.env.GATEWAY_CLIENT],
+  ["__RUNTIME_ENTRY__", process.env.RUNTIME_ENTRY],
+  ["__VISUAL_FIRST_PPT_ROOT__", process.env.PPT_SKILL_ROOT],
+  ["__PRESENTATIONS_PLUGIN_VERSION__", process.env.PRESENTATIONS_PLUGIN_VERSION],
+]);
+function replace(value) {
+  if (typeof value === "string") return replacements.get(value) ?? value;
+  if (Array.isArray(value)) return value.map(replace);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replace(item)]));
+  }
+  return value;
+}
+const config = replace(template);
+const serialized = `${JSON.stringify(config, null, 2)}\n`;
+if (serialized.includes("__")) throw new Error("unresolved_config_placeholder");
+if (/"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/.test(serialized)) {
+  throw new Error("generated_config_contains_secret_field");
+}
+const target = process.env.CONFIG_PATH;
+const temp = path.join(path.dirname(target), `.assistant.json.${process.pid}.tmp`);
+const fd = fs.openSync(temp, "wx", 0o600);
+try {
+  fs.writeFileSync(fd, serialized, "utf8");
+  fs.fsyncSync(fd);
+} finally {
+  fs.closeSync(fd);
+}
+fs.renameSync(temp, target);
+NODE
+  /bin/chmod 0600 "${config_path}"
+  note "已生成不含秘密的运行配置。"
+fi
+
+readonly launch_agents_dir="${HOME}/Library/LaunchAgents"
+readonly plist_path="${launch_agents_dir}/${LAUNCHD_LABEL}.plist"
+/bin/mkdir -p "${launch_agents_dir}"
+
+typeset minimal_path="${node_executable:h}:${codex_executable:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+PLIST_TEMPLATE_PATH="${PLIST_TEMPLATE}" \
+PLIST_PATH="${plist_path}" \
+NODE_EXECUTABLE="${node_executable}" \
+RUNTIME_ENTRY="${runtime_entry}" \
+CONFIG_PATH="${config_path}" \
+REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
+CODEX_HOME_PATH="${codex_home}" \
+HOME_PATH="${HOME}" \
+MINIMAL_PATH="${minimal_path}" \
+STDOUT_PATH="${logs_root}/assistant.stdout.log" \
+STDERR_PATH="${logs_root}/assistant.stderr.log" \
+  "${node_executable}" --input-type=module <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+
+const escapeXml = (value) =>
+  value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+const replacements = {
+  "__NODE_EXECUTABLE__": process.env.NODE_EXECUTABLE,
+  "__RUNTIME_ENTRY__": process.env.RUNTIME_ENTRY,
+  "__CONFIG_PATH__": process.env.CONFIG_PATH,
+  "__REPOSITORY_ROOT__": process.env.REPOSITORY_ROOT,
+  "__CODEX_HOME__": process.env.CODEX_HOME_PATH,
+  "__HOME__": process.env.HOME_PATH,
+  "__MINIMAL_PATH__": process.env.MINIMAL_PATH,
+  "__STDOUT_PATH__": process.env.STDOUT_PATH,
+  "__STDERR_PATH__": process.env.STDERR_PATH,
+};
+let output = fs.readFileSync(process.env.PLIST_TEMPLATE_PATH, "utf8");
+for (const [token, value] of Object.entries(replacements)) {
+  output = output.replaceAll(token, escapeXml(value));
+}
+if (/__[A-Z0-9_]+__/.test(output)) throw new Error("unresolved_plist_placeholder");
+const target = process.env.PLIST_PATH;
+const temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
+const fd = fs.openSync(temp, "wx", 0o600);
+try {
+  fs.writeFileSync(fd, output, "utf8");
+  fs.fsyncSync(fd);
+} finally {
+  fs.closeSync(fd);
+}
+fs.renameSync(temp, target);
+NODE
+/bin/chmod 0644 "${plist_path}"
+/usr/bin/plutil -lint "${plist_path}" >/dev/null || die "渲染后的 LaunchAgent plist 无效。"
+
+readonly launch_domain="gui/$(/usr/bin/id -u)"
+if /bin/launchctl print "${launch_domain}/${LAUNCHD_LABEL}" >/dev/null 2>&1; then
+  /bin/launchctl bootout "${launch_domain}/${LAUNCHD_LABEL}" >/dev/null
+fi
+/bin/launchctl bootstrap "${launch_domain}" "${plist_path}"
+/bin/launchctl kickstart -k "${launch_domain}/${LAUNCHD_LABEL}"
+note "单一 LaunchAgent 已注册并请求启动。"
+
+print -r -- ""
+if [[ -n "${pairing_code}" ]]; then
+  print -r -- "一次性飞书配对码：${pairing_code}"
+  print -r -- "请在 ${pairing_expires_at} 前由总裁本人私聊机器人发送。不要发到群聊。"
+fi
+print -r -- "安装文件和 LaunchAgent 已写入；下面运行只读 doctor。imagegen 在目标机真实 PPT 验收前会保持 WARN。"
+"${SCRIPT_DIR}/doctor" --config "${config_path}" || true
+print -r -- ""
+print -r -- "以后可运行：./scripts/doctor"

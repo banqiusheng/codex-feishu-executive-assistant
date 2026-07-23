@@ -1,0 +1,345 @@
+diff --git a/PATCHES.md b/PATCHES.md
+index f6d1a49493622a2414e65d92c9307e0e77534ca5..c3f754b406a0b66f0a8a190055baa276346a969f 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -157,5 +157,45 @@
+   claim arbitrary interprocedural JavaScript data-flow analysis or replace
+   runtime sandbox and network-denial evidence.
+ 
++## `0006-task-scoped-unix-socket-permission.patch`
++
++- Purpose: replace the incompatible legacy `workspace-write` network-deny
++  invocation with the Codex 0.142 permission-profile path needed for one
++  verified task gateway Unix socket.
++- Runtime or business logic: new and resume invocations enable
++  `network_proxy`, select a fixed `assistant-task` profile extending
++  `:workspace`, enable limited network mediation, keep local binding, upstream
++  proxying, SOCKS, non-loopback proxy exposure, and broad Unix-socket access
++  disabled, and allow only the exact `<verified workspace>/gateway.sock` path.
++  The dynamic TOML key is JSON/TOML basic-string encoded from the already
++  canonical workspace result, not from caller-supplied argv or policy fields.
++  The trusted Codex-home verifier must also attest that no loaded legacy
++  `sandbox_mode` / `sandbox_workspace_write` setting can override permission
++  profiles; absent or false compatibility evidence rejects before spawn.
++  The invocation, environment, stdio, and shell boundary remain frozen and
++  exact. Codex feature evidence now requires permission-profile and scoped
++  Unix-socket proxy support instead of the incompatible legacy network-deny
++  claim.
++- Applies after `0001-workspace-adapter.patch` through
++  `0005-static-dynamic-access-boundary.patch` to upstream commit
++  `e8b0dc0cdfe2fb378bef7081618138a20d934aa9`.
++- Exact paths: `PATCHES.md`, `src/agent/codex-runner.ts`, and
++  `test/codex-runner.test.ts`.
++- Verification: exact frozen new/resume argv, updated feature evidence,
++  caller-policy override rejection, quote/backslash/newline TOML-injection
++  regression, false/missing permission-profile compatibility evidence, exact
++  task socket allowlisting with jobs-root/control/HTTP/TCP denial settings,
++  bridge unit/type tests, root Codex tool-network security test, and direct
++  Codex 0.142 strict-config parsing of both ordinary and adversarially encoded
++  final argv.
++- Repository synchronization: patch hash, final tree, strict manifest,
++  provenance tests, and offline replay are maintained by the repository owner
++  and completed for this local Task 5 working tree.
++- Evidence boundary: direct binary/config parsing and a local clean-home
++  sandbox fixture do not produce the production
++  `permissionProfileCompatible` evidence. Stage B Task 9 must bind the locked
++  binary/profile to every effective config layer and live wiring; Stage D must
++  repeat the matrix on the customer Mac mini before production startup.
++
+ Every future upstream modification must use a separately named patch file and
+ record its reason and verification here.
+diff --git a/src/agent/codex-runner.ts b/src/agent/codex-runner.ts
+index 350d92c9b72532e990ddba7f8f7e7191ef31d77e..de04e013bf11101b215893b03c81b6fb375f9a0e 100644
+--- a/src/agent/codex-runner.ts
++++ b/src/agent/codex-runner.ts
+@@ -14,7 +14,8 @@ const REQUIRED_CODEX_FEATURES = new Set([
+   "exec-json",
+   "exec-resume-stdin",
+   "approval-never",
+-  "workspace-write-network-deny",
++  "permission-profiles",
++  "network-proxy-unix-socket-allowlist",
+ ]);
+ const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+ const TERMINATION_GRACE_MS = 10 * 1000;
+@@ -151,6 +152,7 @@ export interface TrustedDirectoryEvidence {
+   directory: boolean;
+   symlinkFree: boolean;
+   mode: number;
++  permissionProfileCompatible: boolean;
+ }
+ 
+ export interface GatewayReleaseEvidence {
+@@ -501,8 +503,22 @@ function snapshotCodexHomeEvidence(
+ ): TrustedDirectoryEvidence | null {
+   const evidence = snapshotOwnDataRecord(
+     input,
+-    ["requestedPath", "realPath", "directory", "symlinkFree", "mode"],
+-    new Set(["requestedPath", "realPath", "directory", "symlinkFree", "mode"]),
++    [
++      "requestedPath",
++      "realPath",
++      "directory",
++      "symlinkFree",
++      "mode",
++      "permissionProfileCompatible",
++    ],
++    new Set([
++      "requestedPath",
++      "realPath",
++      "directory",
++      "symlinkFree",
++      "mode",
++      "permissionProfileCompatible",
++    ]),
+   );
+   if (
+     evidence === null ||
+@@ -510,7 +526,8 @@ function snapshotCodexHomeEvidence(
+     typeof evidence.realPath !== "string" ||
+     typeof evidence.directory !== "boolean" ||
+     typeof evidence.symlinkFree !== "boolean" ||
+-    typeof evidence.mode !== "number"
++    typeof evidence.mode !== "number" ||
++    typeof evidence.permissionProfileCompatible !== "boolean"
+   ) {
+     return null;
+   }
+@@ -520,6 +537,7 @@ function snapshotCodexHomeEvidence(
+     directory: evidence.directory,
+     symlinkFree: evidence.symlinkFree,
+     mode: evidence.mode,
++    permissionProfileCompatible: evidence.permissionProfileCompatible,
+   });
+ }
+ 
+@@ -628,14 +646,31 @@ async function trustedCall<T>(
+   }
+ }
+ 
+-function buildArgs(sessionId: string | undefined): readonly string[] {
++function buildArgs(
++  sessionId: string | undefined,
++  verifiedWorkspace: string,
++): readonly string[] {
++  const gatewaySocket = join(verifiedWorkspace, "gateway.sock");
++  const permissionsConfig =
++    `permissions.assistant-task={extends=":workspace",network={` +
++    "enabled=true," +
++    'mode="limited",' +
++    "allow_local_binding=false," +
++    "enable_socks5=false," +
++    "enable_socks5_udp=false," +
++    "allow_upstream_proxy=false," +
++    "dangerously_allow_non_loopback_proxy=false," +
++    "dangerously_allow_all_unix_sockets=false," +
++    `unix_sockets={${JSON.stringify(gatewaySocket)}="allow"}}}`;
+   const safetyPrefix = [
+     "--ask-for-approval",
+     "never",
+-    "--sandbox",
+-    "workspace-write",
++    "--enable",
++    "network_proxy",
++    "-c",
++    'default_permissions="assistant-task"',
+     "-c",
+-    "sandbox_workspace_write.network_access=false",
++    permissionsConfig,
+     "exec",
+   ];
+   return Object.freeze(
+@@ -705,7 +740,8 @@ async function verifyInvocation(
+     codexHomeEvidence.realPath !== dependencies.codexHome ||
+     codexHomeEvidence.directory !== true ||
+     codexHomeEvidence.symlinkFree !== true ||
+-    codexHomeEvidence.mode !== 0o700
++    codexHomeEvidence.mode !== 0o700 ||
++    codexHomeEvidence.permissionProfileCompatible !== true
+   ) {
+     throw new Error("codex home verification failed");
+   }
+@@ -780,7 +816,7 @@ async function verifyInvocation(
+   });
+   return freezeNullRecord<VerifiedInvocation>({
+     command: dependencies.codexPath,
+-    args: buildArgs(request.sessionId),
++    args: buildArgs(request.sessionId, workspace),
+     options,
+   });
+ }
+diff --git a/test/codex-runner.test.ts b/test/codex-runner.test.ts
+index 11d650038f2c612fdfdb269050ad9adc7d65e809..aca2de6d3a4ece58c669db8366d5cd7799d469eb 100644
+--- a/test/codex-runner.test.ts
++++ b/test/codex-runner.test.ts
+@@ -23,7 +23,8 @@ const REQUIRED_FEATURES = [
+   "exec-json",
+   "exec-resume-stdin",
+   "approval-never",
+-  "workspace-write-network-deny",
++  "permission-profiles",
++  "network-proxy-unix-socket-allowlist",
+ ] as const;
+ const THREAD_STARTED = { type: "thread.started", thread_id: SESSION_ID };
+ const TURN_STARTED = { type: "turn.started" };
+@@ -36,14 +37,17 @@ const TURN_COMPLETED = {
+     reasoning_output_tokens: 2,
+   },
+ };
++const PERMISSIONS_CONFIG = `permissions.assistant-task={extends=":workspace",network={enabled=true,mode="limited",allow_local_binding=false,enable_socks5=false,enable_socks5_udp=false,allow_upstream_proxy=false,dangerously_allow_non_loopback_proxy=false,dangerously_allow_all_unix_sockets=false,unix_sockets={${JSON.stringify(GATEWAY_SOCKET)}="allow"}}}`;
+ 
+ const NEW_ARGS = [
+   "--ask-for-approval",
+   "never",
+-  "--sandbox",
+-  "workspace-write",
++  "--enable",
++  "network_proxy",
+   "-c",
+-  "sandbox_workspace_write.network_access=false",
++  'default_permissions="assistant-task"',
++  "-c",
++  PERMISSIONS_CONFIG,
+   "exec",
+   "--strict-config",
+   "--json",
+@@ -54,10 +58,12 @@ const NEW_ARGS = [
+ const RESUME_ARGS = [
+   "--ask-for-approval",
+   "never",
+-  "--sandbox",
+-  "workspace-write",
++  "--enable",
++  "network_proxy",
++  "-c",
++  'default_permissions="assistant-task"',
+   "-c",
+-  "sandbox_workspace_write.network_access=false",
++  PERMISSIONS_CONFIG,
+   "exec",
+   "resume",
+   SESSION_ID,
+@@ -120,6 +126,7 @@ function validDependencies(child = new FakeChild()): CodexRunnerDependencies & {
+       directory: true as const,
+       symlinkFree: true as const,
+       mode: 0o700,
++      permissionProfileCompatible: true as const,
+     })),
+     verifyGatewayRelease: vi.fn(async (path: string) => ({
+       requestedPath: path,
+@@ -259,6 +266,48 @@ describe("codex runner invocation", () => {
+     expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+   });
+ 
++  it("derives one TOML-safe Unix socket allow rule from the verified workspace", async () => {
++    const specialWorkspace = `${WORKSPACE_ROOT}/quoted-"-backslash-\\-newline-\n[permissions.attacker]`;
++    const specialSocket = `${specialWorkspace}/gateway.sock`;
++    const deps = validDependencies();
++    deps.resolveWorkspace.mockResolvedValue(specialWorkspace);
++
++    await createCodexRunner(deps).start(
++      request({ workspace: specialWorkspace, gatewaySocket: specialSocket }),
++    );
++
++    const args = deps.spawn.mock.calls[0]?.[1] as readonly string[];
++    expect(args).toContain(
++      `permissions.assistant-task={extends=":workspace",network={enabled=true,mode="limited",allow_local_binding=false,enable_socks5=false,enable_socks5_udp=false,allow_upstream_proxy=false,dangerously_allow_non_loopback_proxy=false,dangerously_allow_all_unix_sockets=false,unix_sockets={${JSON.stringify(specialSocket)}="allow"}}}`,
++    );
++    expect(
++      args.filter((value) => value.startsWith("permissions.assistant-task=")),
++    ).toHaveLength(1);
++    expect(args.every((value) => !value.includes("\n"))).toBe(true);
++    expect(args).not.toContain('default_permissions=":danger-full-access"');
++  });
++
++  it("keeps TCP, local binding, upstream proxies and every other Unix socket denied", async () => {
++    const deps = validDependencies();
++
++    await createCodexRunner(deps).start(request());
++
++    const args = deps.spawn.mock.calls[0]?.[1] as readonly string[];
++    expect(PERMISSIONS_CONFIG).toContain("enabled=true");
++    expect(PERMISSIONS_CONFIG).toContain('mode="limited"');
++    expect(PERMISSIONS_CONFIG).toContain("allow_local_binding=false");
++    expect(PERMISSIONS_CONFIG).toContain("allow_upstream_proxy=false");
++    expect(PERMISSIONS_CONFIG).toContain(
++      "dangerously_allow_all_unix_sockets=false",
++    );
++    expect(PERMISSIONS_CONFIG).not.toContain(
++      `${JSON.stringify(WORKSPACE_ROOT)}="allow"`,
++    );
++    expect(JSON.stringify(args)).not.toContain("action-gateway.sock");
++    expect(JSON.stringify(args)).not.toContain("http://");
++    expect(JSON.stringify(args)).not.toContain("https://");
++  });
++
+   it("does not inherit an implicit resume session from Object.prototype", async () => {
+     const child = new FakeChild();
+     const deps = validDependencies(child);
+@@ -671,6 +720,7 @@ describe("codex runner invocation", () => {
+         directory: true,
+         symlinkFree: true,
+         mode: 0o700,
++        permissionProfileCompatible: true,
+       });
+     });
+     deps.lstatGatewaySocket = vi.fn(function (this: unknown) {
+@@ -774,6 +824,15 @@ describe("codex runner invocation", () => {
+     ["caller argv", { args: ["--dangerously-bypass-approvals-and-sandbox"] }],
+     ["caller env", { env: { FEISHU_APP_SECRET: "secret" } }],
+     ["caller cwd", { cwd: "/tmp" }],
++    [
++      "caller permissions profile",
++      { defaultPermissions: ":danger-full-access" },
++    ],
++    [
++      "caller Unix sockets",
++      { unixSockets: { "/var/run/docker.sock": "allow" } },
++    ],
++    ["caller network mode", { networkMode: "full" }],
+   ])("fails closed before spawn for invalid %s", async (_name, overrides) => {
+     const deps = validDependencies();
+     const runner = createCodexRunner(deps);
+@@ -1021,6 +1080,7 @@ describe("codex runner trusted path bindings", () => {
+         directory: true,
+         symlinkFree: true,
+         mode: 0o700,
++        permissionProfileCompatible: true,
+       },
+     ],
+     [
+@@ -1031,6 +1091,7 @@ describe("codex runner trusted path bindings", () => {
+         directory: false,
+         symlinkFree: true,
+         mode: 0o700,
++        permissionProfileCompatible: true,
+       },
+     ],
+     [
+@@ -1041,6 +1102,7 @@ describe("codex runner trusted path bindings", () => {
+         directory: true,
+         symlinkFree: false,
+         mode: 0o700,
++        permissionProfileCompatible: true,
+       },
+     ],
+     [
+@@ -1051,6 +1113,18 @@ describe("codex runner trusted path bindings", () => {
+         directory: true,
+         symlinkFree: true,
+         mode: 0o755,
++        permissionProfileCompatible: true,
++      },
++    ],
++    [
++      "legacy sandbox settings present",
++      {
++        requestedPath: CODEX_HOME,
++        realPath: CODEX_HOME,
++        directory: true,
++        symlinkFree: true,
++        mode: 0o700,
++        permissionProfileCompatible: false,
+       },
+     ],
+   ])("rejects Codex home verifier evidence for %s", async (_name, evidence) => {

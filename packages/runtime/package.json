@@ -1,0 +1,34 @@
+{
+  "name": "@executive-assistant/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "executive-assistant-runtime": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup --config tsup.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@executive-assistant/action-gateway": "workspace:*",
+    "@executive-assistant/bridge": "workspace:*",
+    "@executive-assistant/contracts": "workspace:*",
+    "@executive-assistant/job-store": "workspace:*",
+    "@larksuiteoapi/node-sdk": "1.65.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.0",
+    "tsup": "8.3.5",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  }
+}

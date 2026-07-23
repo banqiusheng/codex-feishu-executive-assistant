@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "appId": "__APP_ID__",
+  "tenantKey": "__TENANT_KEY__",
+  "presidentOpenId": null,
+  "presidentChatId": null,
+  "pairing": {
+    "enabled": true,
+    "codeHash": "__PAIRING_CODE_HASH__",
+    "expiresAt": "__PAIRING_EXPIRES_AT__"
+  },
+  "secretRef": {
+    "type": "macos-keychain",
+    "service": "com.codex-feishu-executive-assistant.bot",
+    "account": "__APP_ID__"
+  },
+  "paths": {
+    "assistantRoot": "__ASSISTANT_ROOT__",
+    "runtimeRoot": "__RUNTIME_ROOT__",
+    "workspaceRoot": "__ASSISTANT_ROOT__",
+    "jobsRoot": "__JOBS_ROOT__",
+    "outputsRoot": "__OUTPUTS_ROOT__",
+    "pptProjectsRoot": "__PPT_PROJECTS_ROOT__",
+    "codexHome": "__CODEX_HOME__",
+    "larkHome": "__LARK_HOME__",
+    "databasePath": "__DATABASE_PATH__",
+    "logsRoot": "__LOGS_ROOT__"
+  },
+  "executables": {
+    "node": "__NODE_EXECUTABLE__",
+    "codex": "__CODEX_EXECUTABLE__",
+    "larkCli": "__LARK_CLI_EXECUTABLE__",
+    "gatewayClient": "__GATEWAY_CLIENT__",
+    "runtimeEntry": "__RUNTIME_ENTRY__"
+  },
+  "visualFirstPpt": {
+    "skillRoot": "__VISUAL_FIRST_PPT_ROOT__",
+    "tag": "v0.3.0",
+    "commitSha": "bb775f68f951c3e444d00623bc88976b20c13e7d",
+    "treeSha": "5ad18d178e8191105dcc68717e4639d3a68f0c73",
+    "presentationsPlugin": {
+      "id": "presentations@openai-primary-runtime",
+      "version": "__PRESENTATIONS_PLUGIN_VERSION__"
+    }
+  },
+  "launchd": {
+    "label": "com.codex-feishu.executive-assistant"
+  }
+}

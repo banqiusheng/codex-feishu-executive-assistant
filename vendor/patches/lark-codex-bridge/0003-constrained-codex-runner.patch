@@ -1,0 +1,3781 @@
+diff --git a/PATCHES.md b/PATCHES.md
+index 8c88e588b560cbcf8cd921b330a45c7cf9ab662f..5920a6a1dcecdb3b9ed1a731fe05bb8cf5f7a0d3 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -36,5 +36,42 @@
+   offline patch path allowlists, deterministic vendor replay, strict manifest,
+   and repository gates.
+ 
+-Every future upstream modification must use a separately named patch file and
+-record its reason and verification here.
++## `0003-constrained-codex-runner.patch`
++
++- Purpose: add a constrained, injectable Codex runner seam and strict task
++  workspace resolver without connecting either seam to the existing live
++  channel.
++- Runtime or business logic: static invocation construction, trusted verifier
++  evidence checks, one-time own-data snapshots for requests, dependencies, and
++  verifier evidence, minimal child environment, stdin-only prompts with observed
++  writable completion, raw-byte-bounded fatal-UTF-8 JSONL parsing, a fail-closed
++  Codex 0.142 protocol state machine, and close-confirmed interruption handling.
++  Proxies, accessors, hidden/symbol/unknown request fields, sparse or extended
++  evidence arrays, and post-construction dependency replacement fail closed;
++  captured capabilities run without the mutable dependency record as receiver,
++  and the final argv/environment/options are frozen before spawn.
++  The verifier interfaces are mandatory seams; Stage A does not claim that a
++  real Codex binary, gateway release signature, UDS, macOS sandbox, or network
++  denial was exercised.
++- Applies after `0001-workspace-adapter.patch` and
++  `0002-fail-closed-ingress.patch` to upstream commit
++  `e8b0dc0cdfe2fb378bef7081618138a20d934aa9`.
++- Exact paths: `PATCHES.md`, `src/agent/codex-runner.ts`,
++  `src/security/workspace.ts`, `test/codex-runner.test.ts`, and
++  `test/workspace.test.ts`.
++- Verification: canonical UUID and realpath boundaries, strict `0700` task
++  workspaces and Codex home evidence, `0600` non-symlink UDS evidence, Codex
++  minimum-version and required-feature evidence, release manifest/hash/signature
++  evidence, async mutation/TOCTOU tests across request, dependencies, verifier
++  objects and arrays, exact safe argv, frozen invocation, environment allowlist,
++  prompt backpressure and redaction, strict known-event ordering, four-field
++  completion usage, sanitized
++  nonterminal reconnect diagnostics, resume session binding, raw-byte line and
++  queue bounds, fatal UTF-8, 30-minute accepted-event idle reset, TERM/KILL with
++  an explicit unconfirmed-termination stream and result settlement only after
++  observed close, no automatic retry, deterministic vendor replay, strict
++  manifest, and repository gates. Resume JSONL compatibility is a static shared-
++  handler inference (`UNVERIFIED_RESUME_PROTOCOL`), not a recorded resume run;
++  a minimum-version feature probe also does not establish schema compatibility
++  for future Codex versions, whose unknown events therefore fail closed.
++
+diff --git a/src/agent/codex-runner.ts b/src/agent/codex-runner.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c69de7e410e5b20783afa2c42173f6490747809
+--- /dev/null
++++ b/src/agent/codex-runner.ts
+@@ -0,0 +1,1359 @@
++import type { EventEmitter } from "node:events";
++import { isAbsolute, join } from "node:path";
++import type { Readable, Writable } from "node:stream";
++import { TextDecoder, types as utilTypes } from "node:util";
++
++import {
++  isCanonicalUuid,
++  resolveTaskWorkspace,
++} from "../security/workspace.js";
++
++const REQUIRED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
++const REQUIRED_CODEX_VERSION = "0.142.0";
++const REQUIRED_CODEX_FEATURES = new Set([
++  "exec-json",
++  "exec-resume-stdin",
++  "approval-never",
++  "workspace-write-network-deny",
++]);
++const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
++const TERMINATION_GRACE_MS = 10 * 1000;
++const MAX_JSONL_BYTES = 1024 * 1024;
++const MAX_PENDING_EVENTS = 256;
++const MAX_PENDING_EVENT_BYTES = 4 * 1024 * 1024;
++const SAFE_REQUEST_KEYS = new Set([
++  "taskId",
++  "sessionId",
++  "workspace",
++  "gatewaySocket",
++  "gatewayClient",
++  "prompt",
++]);
++const REQUIRED_REQUEST_KEYS = [
++  "taskId",
++  "workspace",
++  "gatewaySocket",
++  "gatewayClient",
++  "prompt",
++] as const;
++const REQUIRED_DEPENDENCY_KEYS = [
++  "codexPath",
++  "codexHome",
++  "workspaceRoot",
++  "spawn",
++  "verifyCodexBinary",
++  "verifyCodexHome",
++  "verifyGatewayRelease",
++  "lstatGatewaySocket",
++] as const;
++const SAFE_DEPENDENCY_KEYS = new Set([
++  ...REQUIRED_DEPENDENCY_KEYS,
++  "resolveWorkspace",
++]);
++
++export type CodexRunEvent = Readonly<Record<string, unknown>>;
++
++export type CodexRunFailureReason =
++  | "non_zero_exit"
++  | "signal_exit"
++  | "spawn_error"
++  | "invalid_json"
++  | "invalid_utf8"
++  | "invalid_event"
++  | "unknown_event"
++  | "invalid_event_sequence"
++  | "missing_success_terminal"
++  | "codex_reported_failure"
++  | "line_too_large"
++  | "buffer_too_large"
++  | "event_queue_overflow"
++  | "incomplete_line"
++  | "stdin_incomplete"
++  | "stdin_error"
++  | "stdout_error"
++  | "stderr_error"
++  | "idle_timeout";
++
++export type CodexRunResult =
++  | {
++      status: "SUCCEEDED";
++      exitCode: 0;
++      signal: null;
++      requiresConfirmation: false;
++      automaticRetry: false;
++    }
++  | {
++      status:
++        | "EXIT_FAILURE"
++        | "SIGNALLED"
++        | "SPAWN_ERROR"
++        | "CODEX_ERROR"
++        | "PROTOCOL_ERROR"
++        | "IO_ERROR"
++        | "INTERRUPTED_REQUIRES_CONFIRMATION";
++      exitCode: number | null;
++      signal: NodeJS.Signals | null;
++      requiresConfirmation: true;
++      automaticRetry: false;
++      reason: CodexRunFailureReason;
++    };
++
++export interface CodexTerminationUnconfirmed {
++  status: "TERMINATION_UNCONFIRMED";
++  reason: CodexRunFailureReason;
++  termSignalAccepted: boolean;
++  killSignalAccepted: boolean;
++  requiresConfirmation: true;
++  automaticRetry: false;
++}
++
++export interface CodexRunRequest {
++  taskId: string;
++  sessionId?: string;
++  workspace: string;
++  gatewaySocket: string;
++  gatewayClient: string;
++  prompt: string;
++}
++
++export interface CodexRunHandle {
++  events: AsyncIterable<CodexRunEvent>;
++  terminationEvents: AsyncIterable<CodexTerminationUnconfirmed>;
++  result: Promise<CodexRunResult>;
++}
++
++export interface CodexChildProcess extends EventEmitter {
++  stdin: Writable;
++  stdout: Readable;
++  stderr: Readable;
++  exitCode: number | null;
++  signalCode: NodeJS.Signals | null;
++  kill(signal: NodeJS.Signals): boolean;
++}
++
++export interface CodexSpawnOptions {
++  cwd: string;
++  env: Readonly<Record<string, string>>;
++  shell: false;
++  stdio: readonly ["pipe", "pipe", "pipe"];
++}
++
++export interface CodexBinaryEvidence {
++  path: string;
++  version: string;
++  executable: boolean;
++  features: readonly string[];
++}
++
++export interface TrustedDirectoryEvidence {
++  requestedPath: string;
++  realPath: string;
++  directory: boolean;
++  symlinkFree: boolean;
++  mode: number;
++}
++
++export interface GatewayReleaseEvidence {
++  requestedPath: string;
++  realPath: string;
++  publicBinDirectory: string;
++  publicBinEntries: readonly string[];
++  expectedSha256: string;
++  actualSha256: string;
++  signatureVerified: boolean;
++  executable: boolean;
++}
++
++export interface GatewaySocketEvidence {
++  symbolicLink: boolean;
++  socket: boolean;
++  mode: number;
++}
++
++export interface CodexRunnerDependencies {
++  codexPath: string;
++  codexHome: string;
++  workspaceRoot: string;
++  spawn: (
++    command: string,
++    args: readonly string[],
++    options: CodexSpawnOptions,
++  ) => CodexChildProcess;
++  verifyCodexBinary: (path: string) => Promise<CodexBinaryEvidence>;
++  verifyCodexHome: (path: string) => Promise<TrustedDirectoryEvidence>;
++  verifyGatewayRelease: (path: string) => Promise<GatewayReleaseEvidence>;
++  lstatGatewaySocket: (path: string) => Promise<GatewaySocketEvidence>;
++  resolveWorkspace?: typeof resolveTaskWorkspace;
++}
++
++interface VerifiedInvocation {
++  command: string;
++  args: readonly string[];
++  options: CodexSpawnOptions;
++}
++
++class AsyncEventQueue<T> implements AsyncIterable<T> {
++  private readonly values: Array<{ value: T; bytes: number }> = [];
++  private readonly waiters: Array<(result: IteratorResult<T>) => void> = [];
++  private queuedBytes = 0;
++  private closed = false;
++
++  push(value: T, bytes: number): boolean {
++    if (this.closed) return false;
++    const waiter = this.waiters.shift();
++    if (waiter) {
++      waiter({ done: false, value });
++      return true;
++    }
++    if (
++      this.values.length >= MAX_PENDING_EVENTS ||
++      this.queuedBytes + bytes > MAX_PENDING_EVENT_BYTES
++    ) {
++      return false;
++    }
++    this.values.push({ value, bytes });
++    this.queuedBytes += bytes;
++    return true;
++  }
++
++  close(): void {
++    if (this.closed) return;
++    this.closed = true;
++    for (const waiter of this.waiters.splice(0))
++      waiter({ done: true, value: undefined });
++  }
++
++  [Symbol.asyncIterator](): AsyncIterator<T> {
++    return {
++      next: () => {
++        const entry = this.values.shift();
++        if (entry !== undefined) {
++          this.queuedBytes -= entry.bytes;
++          return Promise.resolve({ done: false, value: entry.value });
++        }
++        if (this.closed)
++          return Promise.resolve({ done: true, value: undefined });
++        return new Promise<IteratorResult<T>>((resolve) =>
++          this.waiters.push(resolve),
++        );
++      },
++    };
++  }
++}
++
++function assertAbsolutePath(
++  value: unknown,
++  label: string,
++): asserts value is string {
++  if (typeof value !== "string" || value.length === 0 || !isAbsolute(value)) {
++    throw new Error(`${label} must be an absolute path`);
++  }
++  if (value.includes("\0"))
++    throw new Error(`${label} contains invalid characters`);
++}
++
++function freezeNullRecord<T extends object>(entries: T): T {
++  return Object.freeze(
++    Object.assign(Object.create(null) as object, entries),
++  ) as T;
++}
++
++function snapshotOwnDataRecord(
++  input: unknown,
++  requiredKeys: readonly string[],
++  allowedKeys: ReadonlySet<string>,
++): Readonly<Record<string, unknown>> | null {
++  if (input === null || typeof input !== "object") {
++    return null;
++  }
++  if (utilTypes.isProxy(input)) return null;
++  try {
++    if (Array.isArray(input)) return null;
++    const prototype = Object.getPrototypeOf(input);
++    if (prototype !== Object.prototype && prototype !== null) return null;
++    const ownKeys = Reflect.ownKeys(input);
++    if (
++      ownKeys.some((key) => typeof key !== "string" || !allowedKeys.has(key)) ||
++      requiredKeys.some((key) => !ownKeys.includes(key))
++    ) {
++      return null;
++    }
++    const snapshot = Object.create(null) as Record<string, unknown>;
++    for (const key of ownKeys as string[]) {
++      const descriptor = Object.getOwnPropertyDescriptor(input, key);
++      if (
++        descriptor === undefined ||
++        !("value" in descriptor) ||
++        descriptor.enumerable !== true
++      ) {
++        return null;
++      }
++      snapshot[key] = descriptor.value;
++    }
++    return Object.freeze(snapshot);
++  } catch {
++    return null;
++  }
++}
++
++function snapshotDenseStringArray(value: unknown): readonly string[] | null {
++  if (value === null || typeof value !== "object") return null;
++  if (utilTypes.isProxy(value)) return null;
++  try {
++    if (
++      !Array.isArray(value) ||
++      Object.getPrototypeOf(value) !== Array.prototype
++    ) {
++      return null;
++    }
++    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
++    if (
++      lengthDescriptor === undefined ||
++      !("value" in lengthDescriptor) ||
++      !Number.isSafeInteger(lengthDescriptor.value) ||
++      lengthDescriptor.value < 0 ||
++      lengthDescriptor.value > 256
++    ) {
++      return null;
++    }
++    const length = lengthDescriptor.value as number;
++    const expectedKeys = new Set([
++      "length",
++      ...Array.from({ length }, (_, index) => String(index)),
++    ]);
++    const ownKeys = Reflect.ownKeys(value);
++    if (
++      ownKeys.length !== expectedKeys.size ||
++      ownKeys.some((key) => typeof key !== "string" || !expectedKeys.has(key))
++    ) {
++      return null;
++    }
++    const snapshot: string[] = [];
++    for (let index = 0; index < length; index += 1) {
++      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
++      if (
++        descriptor === undefined ||
++        !("value" in descriptor) ||
++        descriptor.enumerable !== true ||
++        typeof descriptor.value !== "string"
++      ) {
++        return null;
++      }
++      snapshot.push(descriptor.value);
++    }
++    return Object.freeze(snapshot);
++  } catch {
++    return null;
++  }
++}
++
++function snapshotRunRequest(input: unknown): CodexRunRequest {
++  const request = snapshotOwnDataRecord(
++    input,
++    REQUIRED_REQUEST_KEYS,
++    SAFE_REQUEST_KEYS,
++  );
++  if (request === null) throw new Error("invalid Codex run request");
++  const taskId = request.taskId;
++  const sessionId = request.sessionId;
++  const workspace = request.workspace;
++  const gatewaySocket = request.gatewaySocket;
++  const gatewayClient = request.gatewayClient;
++  const prompt = request.prompt;
++  if (!isCanonicalUuid(taskId)) throw new Error("invalid task id");
++  if (sessionId !== undefined && !isCanonicalUuid(sessionId)) {
++    throw new Error("invalid session id");
++  }
++  assertAbsolutePath(workspace, "workspace");
++  assertAbsolutePath(gatewaySocket, "gateway socket");
++  assertAbsolutePath(gatewayClient, "gateway client");
++  if (
++    typeof prompt !== "string" ||
++    prompt.length === 0 ||
++    prompt.trim().length === 0 ||
++    prompt.includes("\0") ||
++    Buffer.byteLength(prompt, "utf8") > MAX_JSONL_BYTES
++  ) {
++    throw new Error("prompt must be a non-empty bounded string");
++  }
++  return freezeNullRecord<CodexRunRequest>(
++    sessionId === undefined
++      ? { taskId, workspace, gatewaySocket, gatewayClient, prompt }
++      : {
++          taskId,
++          sessionId,
++          workspace,
++          gatewaySocket,
++          gatewayClient,
++          prompt,
++        },
++  );
++}
++
++function snapshotRunnerDependencies(input: unknown): CodexRunnerDependencies {
++  const dependencies = snapshotOwnDataRecord(
++    input,
++    REQUIRED_DEPENDENCY_KEYS,
++    SAFE_DEPENDENCY_KEYS,
++  );
++  if (dependencies === null) {
++    throw new Error("invalid Codex runner dependencies");
++  }
++  const codexPath = dependencies.codexPath;
++  const codexHome = dependencies.codexHome;
++  const workspaceRoot = dependencies.workspaceRoot;
++  const spawn = dependencies.spawn;
++  const resolveWorkspace = dependencies.resolveWorkspace;
++  const verifyCodexBinary = dependencies.verifyCodexBinary;
++  const verifyCodexHome = dependencies.verifyCodexHome;
++  const verifyGatewayRelease = dependencies.verifyGatewayRelease;
++  const lstatGatewaySocket = dependencies.lstatGatewaySocket;
++  if (
++    typeof codexPath !== "string" ||
++    typeof codexHome !== "string" ||
++    typeof workspaceRoot !== "string" ||
++    typeof spawn !== "function" ||
++    (resolveWorkspace !== undefined &&
++      typeof resolveWorkspace !== "function") ||
++    typeof verifyCodexBinary !== "function" ||
++    typeof verifyCodexHome !== "function" ||
++    typeof verifyGatewayRelease !== "function" ||
++    typeof lstatGatewaySocket !== "function"
++  ) {
++    throw new Error("invalid Codex runner dependencies");
++  }
++  const stable = freezeNullRecord<CodexRunnerDependencies>({
++    codexPath,
++    codexHome,
++    workspaceRoot,
++    spawn(command, args, options) {
++      return Reflect.apply(spawn, undefined, [
++        command,
++        args,
++        options,
++      ]) as CodexChildProcess;
++    },
++    async verifyCodexBinary(path) {
++      return (await Reflect.apply(verifyCodexBinary, undefined, [
++        path,
++      ])) as CodexBinaryEvidence;
++    },
++    async verifyCodexHome(path) {
++      return (await Reflect.apply(verifyCodexHome, undefined, [
++        path,
++      ])) as TrustedDirectoryEvidence;
++    },
++    async verifyGatewayRelease(path) {
++      return (await Reflect.apply(verifyGatewayRelease, undefined, [
++        path,
++      ])) as GatewayReleaseEvidence;
++    },
++    async lstatGatewaySocket(path) {
++      return (await Reflect.apply(lstatGatewaySocket, undefined, [
++        path,
++      ])) as GatewaySocketEvidence;
++    },
++    resolveWorkspace:
++      resolveWorkspace === undefined
++        ? resolveTaskWorkspace
++        : async (root, taskId) =>
++            (await Reflect.apply(resolveWorkspace, undefined, [
++              root,
++              taskId,
++            ])) as string,
++  });
++  return stable;
++}
++
++function snapshotCodexBinaryEvidence(
++  input: unknown,
++): CodexBinaryEvidence | null {
++  const evidence = snapshotOwnDataRecord(
++    input,
++    ["path", "version", "executable", "features"],
++    new Set(["path", "version", "executable", "features"]),
++  );
++  if (evidence === null) return null;
++  const features = snapshotDenseStringArray(evidence.features);
++  if (
++    typeof evidence.path !== "string" ||
++    typeof evidence.version !== "string" ||
++    typeof evidence.executable !== "boolean" ||
++    features === null
++  ) {
++    return null;
++  }
++  return freezeNullRecord<CodexBinaryEvidence>({
++    path: evidence.path,
++    version: evidence.version,
++    executable: evidence.executable,
++    features,
++  });
++}
++
++function snapshotCodexHomeEvidence(
++  input: unknown,
++): TrustedDirectoryEvidence | null {
++  const evidence = snapshotOwnDataRecord(
++    input,
++    ["requestedPath", "realPath", "directory", "symlinkFree", "mode"],
++    new Set(["requestedPath", "realPath", "directory", "symlinkFree", "mode"]),
++  );
++  if (
++    evidence === null ||
++    typeof evidence.requestedPath !== "string" ||
++    typeof evidence.realPath !== "string" ||
++    typeof evidence.directory !== "boolean" ||
++    typeof evidence.symlinkFree !== "boolean" ||
++    typeof evidence.mode !== "number"
++  ) {
++    return null;
++  }
++  return freezeNullRecord<TrustedDirectoryEvidence>({
++    requestedPath: evidence.requestedPath,
++    realPath: evidence.realPath,
++    directory: evidence.directory,
++    symlinkFree: evidence.symlinkFree,
++    mode: evidence.mode,
++  });
++}
++
++function snapshotGatewaySocketEvidence(
++  input: unknown,
++): GatewaySocketEvidence | null {
++  const evidence = snapshotOwnDataRecord(
++    input,
++    ["symbolicLink", "socket", "mode"],
++    new Set(["symbolicLink", "socket", "mode"]),
++  );
++  if (
++    evidence === null ||
++    typeof evidence.symbolicLink !== "boolean" ||
++    typeof evidence.socket !== "boolean" ||
++    typeof evidence.mode !== "number"
++  ) {
++    return null;
++  }
++  return freezeNullRecord<GatewaySocketEvidence>({
++    symbolicLink: evidence.symbolicLink,
++    socket: evidence.socket,
++    mode: evidence.mode,
++  });
++}
++
++function snapshotGatewayReleaseEvidence(
++  input: unknown,
++): GatewayReleaseEvidence | null {
++  const evidence = snapshotOwnDataRecord(
++    input,
++    [
++      "requestedPath",
++      "realPath",
++      "publicBinDirectory",
++      "publicBinEntries",
++      "expectedSha256",
++      "actualSha256",
++      "signatureVerified",
++      "executable",
++    ],
++    new Set([
++      "requestedPath",
++      "realPath",
++      "publicBinDirectory",
++      "publicBinEntries",
++      "expectedSha256",
++      "actualSha256",
++      "signatureVerified",
++      "executable",
++    ]),
++  );
++  if (evidence === null) return null;
++  const publicBinEntries = snapshotDenseStringArray(evidence.publicBinEntries);
++  if (
++    typeof evidence.requestedPath !== "string" ||
++    typeof evidence.realPath !== "string" ||
++    typeof evidence.publicBinDirectory !== "string" ||
++    publicBinEntries === null ||
++    typeof evidence.expectedSha256 !== "string" ||
++    typeof evidence.actualSha256 !== "string" ||
++    typeof evidence.signatureVerified !== "boolean" ||
++    typeof evidence.executable !== "boolean"
++  ) {
++    return null;
++  }
++  return freezeNullRecord<GatewayReleaseEvidence>({
++    requestedPath: evidence.requestedPath,
++    realPath: evidence.realPath,
++    publicBinDirectory: evidence.publicBinDirectory,
++    publicBinEntries,
++    expectedSha256: evidence.expectedSha256,
++    actualSha256: evidence.actualSha256,
++    signatureVerified: evidence.signatureVerified,
++    executable: evidence.executable,
++  });
++}
++
++function isStrictSha256(value: unknown): value is string {
++  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
++
++function isCompatibleCodexVersion(value: unknown): value is string {
++  if (typeof value !== "string" || !/^\d+\.\d+\.\d+$/.test(value)) return false;
++  const current = value.split(".").map(Number);
++  const minimum = REQUIRED_CODEX_VERSION.split(".").map(Number);
++  for (let index = 0; index < minimum.length; index += 1) {
++    const difference = (current[index] ?? 0) - (minimum[index] ?? 0);
++    if (difference !== 0) return difference > 0;
++  }
++  return true;
++}
++
++async function trustedCall<T>(
++  message: string,
++  call: () => Promise<T>,
++): Promise<T> {
++  try {
++    return await call();
++  } catch {
++    throw new Error(message);
++  }
++}
++
++function buildArgs(sessionId: string | undefined): readonly string[] {
++  const safetyPrefix = [
++    "--ask-for-approval",
++    "never",
++    "--sandbox",
++    "workspace-write",
++    "-c",
++    "sandbox_workspace_write.network_access=false",
++    "exec",
++  ];
++  return Object.freeze(
++    sessionId
++      ? [
++          ...safetyPrefix,
++          "resume",
++          sessionId,
++          "--strict-config",
++          "--json",
++          "--skip-git-repo-check",
++          "-",
++        ]
++      : [
++          ...safetyPrefix,
++          "--strict-config",
++          "--json",
++          "--skip-git-repo-check",
++          "-",
++        ],
++  );
++}
++
++async function verifyInvocation(
++  dependencies: CodexRunnerDependencies,
++  request: CodexRunRequest,
++): Promise<VerifiedInvocation> {
++  assertAbsolutePath(dependencies.codexPath, "codex path");
++  assertAbsolutePath(dependencies.codexHome, "codex home");
++  assertAbsolutePath(dependencies.workspaceRoot, "workspace root");
++
++  const resolveWorkspace =
++    dependencies.resolveWorkspace ?? resolveTaskWorkspace;
++  const workspace = await trustedCall(
++    "task workspace verification failed",
++    () => resolveWorkspace(dependencies.workspaceRoot, request.taskId),
++  );
++  assertAbsolutePath(workspace, "resolved workspace");
++  if (workspace !== request.workspace)
++    throw new Error("task workspace verification failed");
++
++  const codexEvidence = snapshotCodexBinaryEvidence(
++    await trustedCall("codex binary verification failed", () =>
++      dependencies.verifyCodexBinary(dependencies.codexPath),
++    ),
++  );
++  if (
++    codexEvidence === null ||
++    codexEvidence.path !== dependencies.codexPath ||
++    !isCompatibleCodexVersion(codexEvidence.version) ||
++    codexEvidence.executable !== true ||
++    [...REQUIRED_CODEX_FEATURES].some(
++      (feature) => !codexEvidence.features.includes(feature),
++    )
++  ) {
++    throw new Error("codex binary verification failed");
++  }
++
++  const codexHomeEvidence = snapshotCodexHomeEvidence(
++    await trustedCall("codex home verification failed", () =>
++      dependencies.verifyCodexHome(dependencies.codexHome),
++    ),
++  );
++  if (
++    codexHomeEvidence === null ||
++    codexHomeEvidence.requestedPath !== dependencies.codexHome ||
++    codexHomeEvidence.realPath !== dependencies.codexHome ||
++    codexHomeEvidence.directory !== true ||
++    codexHomeEvidence.symlinkFree !== true ||
++    codexHomeEvidence.mode !== 0o700
++  ) {
++    throw new Error("codex home verification failed");
++  }
++
++  const expectedSocket = join(workspace, "gateway.sock");
++  if (request.gatewaySocket !== expectedSocket) {
++    throw new Error("gateway socket must be the task workspace gateway.sock");
++  }
++  const socketEvidence = snapshotGatewaySocketEvidence(
++    await trustedCall("gateway socket verification failed", () =>
++      dependencies.lstatGatewaySocket(request.gatewaySocket),
++    ),
++  );
++  if (
++    socketEvidence === null ||
++    socketEvidence.symbolicLink !== false ||
++    socketEvidence.socket !== true ||
++    socketEvidence.mode !== 0o600
++  ) {
++    throw new Error("gateway socket verification failed");
++  }
++
++  const gatewayEvidence = snapshotGatewayReleaseEvidence(
++    await trustedCall("gateway release verification failed", () =>
++      dependencies.verifyGatewayRelease(request.gatewayClient),
++    ),
++  );
++  if (gatewayEvidence === null) {
++    throw new Error("gateway release verification failed");
++  }
++  try {
++    assertAbsolutePath(
++      gatewayEvidence.publicBinDirectory,
++      "gateway public bin",
++    );
++    assertAbsolutePath(gatewayEvidence.realPath, "gateway real path");
++  } catch {
++    throw new Error("gateway release verification failed");
++  }
++  const expectedGatewayRealPath = join(
++    gatewayEvidence.publicBinDirectory,
++    "assistant-gateway",
++  );
++  if (
++    gatewayEvidence.requestedPath !== request.gatewayClient ||
++    gatewayEvidence.realPath !== expectedGatewayRealPath ||
++    !Array.isArray(gatewayEvidence.publicBinEntries) ||
++    gatewayEvidence.publicBinEntries.length !== 1 ||
++    gatewayEvidence.publicBinEntries[0] !== "assistant-gateway" ||
++    !isStrictSha256(gatewayEvidence.expectedSha256) ||
++    !isStrictSha256(gatewayEvidence.actualSha256) ||
++    gatewayEvidence.expectedSha256 !== gatewayEvidence.actualSha256 ||
++    gatewayEvidence.signatureVerified !== true ||
++    gatewayEvidence.executable !== true
++  ) {
++    throw new Error("gateway release verification failed");
++  }
++
++  const env = freezeNullRecord<Record<string, string>>({
++    PATH: REQUIRED_PATH,
++    CODEX_HOME: codexHomeEvidence.realPath,
++    ASSISTANT_GATEWAY_SOCKET: request.gatewaySocket,
++    ASSISTANT_GATEWAY_CLIENT: gatewayEvidence.realPath,
++    LANG: "zh_CN.UTF-8",
++  });
++  const stdio = Object.freeze(["pipe", "pipe", "pipe"] as const);
++  const options = freezeNullRecord<CodexSpawnOptions>({
++    cwd: workspace,
++    env,
++    shell: false,
++    stdio,
++  });
++  return freezeNullRecord<VerifiedInvocation>({
++    command: dependencies.codexPath,
++    args: buildArgs(request.sessionId),
++    options,
++  });
++}
++
++const KNOWN_ITEM_TYPES = new Set([
++  "agent_message",
++  "reasoning",
++  "command_execution",
++  "file_change",
++  "mcp_tool_call",
++  "web_search",
++  "todo_list",
++  "collab_tool_call",
++]);
++
++type CodexProtocolState =
++  | "expect_thread"
++  | "expect_turn"
++  | "in_turn"
++  | "succeeded"
++  | "failed";
++
++type ProtocolDecision =
++  | { kind: "accepted"; event: CodexRunEvent }
++  | { kind: "codex_failure" }
++  | {
++      kind: "protocol_error";
++      reason: "unknown_event" | "invalid_event" | "invalid_event_sequence";
++    };
++
++function isBoundedString(
++  value: unknown,
++  maximumBytes: number,
++): value is string {
++  return (
++    typeof value === "string" &&
++    value.length > 0 &&
++    value.trim() === value &&
++    Buffer.byteLength(value, "utf8") <= maximumBytes
++  );
++}
++
++function isUsage(value: unknown): boolean {
++  if (!isRecord(value)) return false;
++  return [
++    "input_tokens",
++    "cached_input_tokens",
++    "output_tokens",
++    "reasoning_output_tokens",
++  ].every((key) => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0);
++}
++
++function isKnownItem(value: unknown): boolean {
++  if (!isRecord(value)) return false;
++  return (
++    isBoundedString(value.id, 256) &&
++    /^[A-Za-z0-9._:-]+$/.test(value.id) &&
++    typeof value.type === "string" &&
++    KNOWN_ITEM_TYPES.has(value.type)
++  );
++}
++
++function isFailurePayload(value: unknown): boolean {
++  return (
++    isRecord(value) &&
++    isBoundedString(value.message, 4096) &&
++    !value.message.includes("\0")
++  );
++}
++
++function createCodexJsonlProtocol(expectedSessionId: string | undefined) {
++  let state: CodexProtocolState = "expect_thread";
++
++  return {
++    accept(event: CodexRunEvent): ProtocolDecision {
++      const type = event.type;
++      if (typeof type !== "string") {
++        return { kind: "protocol_error", reason: "invalid_event" };
++      }
++      if (state === "succeeded" || state === "failed") {
++        return { kind: "protocol_error", reason: "invalid_event_sequence" };
++      }
++
++      switch (type) {
++        case "thread.started":
++          if (state !== "expect_thread") {
++            return {
++              kind: "protocol_error",
++              reason: "invalid_event_sequence",
++            };
++          }
++          if (!isCanonicalUuid(event.thread_id)) {
++            return { kind: "protocol_error", reason: "invalid_event" };
++          }
++          if (
++            expectedSessionId !== undefined &&
++            event.thread_id !== expectedSessionId
++          ) {
++            return { kind: "protocol_error", reason: "invalid_event" };
++          }
++          state = "expect_turn";
++          return { kind: "accepted", event };
++        case "turn.started":
++          if (state !== "expect_turn") {
++            return {
++              kind: "protocol_error",
++              reason: "invalid_event_sequence",
++            };
++          }
++          state = "in_turn";
++          return { kind: "accepted", event };
++        case "item.started":
++        case "item.updated":
++        case "item.completed":
++          if (state !== "in_turn") {
++            return {
++              kind: "protocol_error",
++              reason: "invalid_event_sequence",
++            };
++          }
++          if (!isKnownItem(event.item)) {
++            return { kind: "protocol_error", reason: "invalid_event" };
++          }
++          return { kind: "accepted", event };
++        case "turn.completed":
++          if (state !== "in_turn") {
++            return {
++              kind: "protocol_error",
++              reason: "invalid_event_sequence",
++            };
++          }
++          if (!isUsage(event.usage)) {
++            return { kind: "protocol_error", reason: "invalid_event" };
++          }
++          state = "succeeded";
++          return { kind: "accepted", event };
++        case "turn.failed":
++          if (state !== "in_turn") {
++            return {
++              kind: "protocol_error",
++              reason: "invalid_event_sequence",
++            };
++          }
++          if (!isRecord(event.error) || !isFailurePayload(event.error)) {
++            return { kind: "protocol_error", reason: "invalid_event" };
++          }
++          state = "failed";
++          return { kind: "codex_failure" };
++        case "error":
++          if (state !== "in_turn") {
++            return {
++              kind: "protocol_error",
++              reason: "invalid_event_sequence",
++            };
++          }
++          if (!isFailurePayload(event)) {
++            return { kind: "protocol_error", reason: "invalid_event" };
++          }
++          return { kind: "accepted", event: { type: "error" } };
++        default:
++          return { kind: "protocol_error", reason: "unknown_event" };
++      }
++    },
++    hasSuccessTerminal(): boolean {
++      return state === "succeeded";
++    },
++  };
++}
++
++function completedRun(result: CodexRunResult): CodexRunHandle {
++  const queue = new AsyncEventQueue<CodexRunEvent>();
++  const terminationEvents = new AsyncEventQueue<CodexTerminationUnconfirmed>();
++  queue.close();
++  terminationEvents.close();
++  return {
++    events: queue,
++    terminationEvents,
++    result: Promise.resolve(result),
++  };
++}
++
++interface PendingTermination {
++  status:
++    | "SPAWN_ERROR"
++    | "CODEX_ERROR"
++    | "PROTOCOL_ERROR"
++    | "IO_ERROR"
++    | "INTERRUPTED_REQUIRES_CONFIRMATION";
++  reason: CodexRunFailureReason;
++}
++
++function startChildRun(
++  child: CodexChildProcess,
++  prompt: string,
++  expectedSessionId: string | undefined,
++): CodexRunHandle {
++  const events = new AsyncEventQueue<CodexRunEvent>();
++  const terminationEvents = new AsyncEventQueue<CodexTerminationUnconfirmed>();
++  const decoder = new TextDecoder("utf-8", { fatal: true });
++  const protocol = createCodexJsonlProtocol(expectedSessionId);
++  let buffer = Buffer.alloc(0);
++  let stdoutCompleted = false;
++  let stdinEndRequested = false;
++  let stdinFinishObserved = child.stdin.writableFinished;
++  let closeObserved = false;
++  let settled = false;
++  let pendingTermination: PendingTermination | undefined;
++  let termSignalAccepted = false;
++  let terminationNoticeEmitted = false;
++  let idleTimer: NodeJS.Timeout | undefined;
++  let killTimer: NodeJS.Timeout | undefined;
++  let resolveResult!: (value: CodexRunResult) => void;
++  const result = new Promise<CodexRunResult>((resolve) => {
++    resolveResult = resolve;
++  });
++
++  const clearTimers = (): void => {
++    if (idleTimer) clearTimeout(idleTimer);
++    if (killTimer) clearTimeout(killTimer);
++    idleTimer = undefined;
++    killTimer = undefined;
++  };
++
++  const removeListeners = (): void => {
++    child.removeListener("error", onChildError);
++    child.removeListener("close", onClose);
++    child.stdin.removeListener("error", onStdinError);
++    child.stdin.removeListener("drain", onDrain);
++    child.stdin.removeListener("finish", onStdinFinish);
++    child.stdout.removeListener("data", onStdoutData);
++    child.stdout.removeListener("end", onStdoutEnd);
++    child.stdout.removeListener("error", onStdoutError);
++    child.stderr.removeListener("data", discardStderr);
++    child.stderr.removeListener("error", onStderrError);
++  };
++
++  const finish = (value: CodexRunResult): void => {
++    if (settled) return;
++    settled = true;
++    clearTimers();
++    removeListeners();
++    events.close();
++    terminationEvents.close();
++    resolveResult(value);
++  };
++
++  const finishTermination = (
++    termination: PendingTermination,
++    exitCode: number | null,
++    signal: NodeJS.Signals | null,
++  ): void => {
++    finish({
++      status: termination.status,
++      exitCode,
++      signal,
++      reason: termination.reason,
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++  };
++
++  const safeKill = (signal: NodeJS.Signals): boolean => {
++    try {
++      return child.kill(signal) === true;
++    } catch {
++      // Only fixed status/reason values are exposed to the caller.
++      return false;
++    }
++  };
++
++  const beginTermination = (termination: PendingTermination): void => {
++    if (settled || pendingTermination) return;
++    pendingTermination = termination;
++    buffer = Buffer.alloc(0);
++    if (idleTimer) clearTimeout(idleTimer);
++    idleTimer = undefined;
++
++    if (closeObserved) return;
++    termSignalAccepted = safeKill("SIGTERM");
++    if (settled || closeObserved) return;
++    killTimer = setTimeout(() => {
++      killTimer = undefined;
++      if (settled || closeObserved) return;
++      const killSignalAccepted = safeKill("SIGKILL");
++      if (settled || closeObserved || terminationNoticeEmitted) return;
++      terminationNoticeEmitted = true;
++      terminationEvents.push(
++        {
++          status: "TERMINATION_UNCONFIRMED",
++          reason: termination.reason,
++          termSignalAccepted,
++          killSignalAccepted,
++          requiresConfirmation: true,
++          automaticRetry: false,
++        },
++        1,
++      );
++    }, TERMINATION_GRACE_MS);
++  };
++
++  const onIdle = (): void => {
++    beginTermination({
++      status: "INTERRUPTED_REQUIRES_CONFIRMATION",
++      reason: "idle_timeout",
++    });
++  };
++
++  const resetIdle = (): void => {
++    if (settled || pendingTermination) return;
++    if (idleTimer) clearTimeout(idleTimer);
++    idleTimer = setTimeout(onIdle, IDLE_TIMEOUT_MS);
++  };
++
++  const acceptLine = (rawLine: Buffer): boolean => {
++    if (rawLine.byteLength > MAX_JSONL_BYTES) {
++      beginTermination({ status: "PROTOCOL_ERROR", reason: "line_too_large" });
++      return false;
++    }
++    let line: string;
++    try {
++      line = decoder.decode(rawLine);
++    } catch {
++      beginTermination({ status: "PROTOCOL_ERROR", reason: "invalid_utf8" });
++      return false;
++    }
++    const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
++    if (normalized.trim() === "") return true;
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(normalized);
++    } catch {
++      beginTermination({ status: "PROTOCOL_ERROR", reason: "invalid_json" });
++      return false;
++    }
++    if (
++      !isRecord(parsed) ||
++      typeof parsed.type !== "string" ||
++      !/^[a-z0-9._-]{1,128}$/.test(parsed.type)
++    ) {
++      beginTermination({ status: "PROTOCOL_ERROR", reason: "invalid_event" });
++      return false;
++    }
++    const decision = protocol.accept(parsed as CodexRunEvent);
++    if (decision.kind === "protocol_error") {
++      beginTermination({
++        status: "PROTOCOL_ERROR",
++        reason: decision.reason,
++      });
++      return false;
++    }
++    if (decision.kind === "codex_failure") {
++      beginTermination({
++        status: "CODEX_ERROR",
++        reason: "codex_reported_failure",
++      });
++      return false;
++    }
++    if (!events.push(decision.event, rawLine.byteLength)) {
++      beginTermination({
++        status: "PROTOCOL_ERROR",
++        reason: "event_queue_overflow",
++      });
++      return false;
++    }
++    resetIdle();
++    return true;
++  };
++
++  function onStdoutData(chunk: Buffer | string): void {
++    if (settled || pendingTermination) return;
++    const bytes =
++      typeof chunk === "string"
++        ? Buffer.from(chunk, "utf8")
++        : Buffer.from(chunk);
++    buffer = buffer.byteLength === 0 ? bytes : Buffer.concat([buffer, bytes]);
++    let offset = 0;
++    let newline = buffer.indexOf(0x0a, offset);
++    while (newline !== -1 && !pendingTermination) {
++      const line = buffer.subarray(offset, newline);
++      if (!acceptLine(line)) return;
++      offset = newline + 1;
++      newline = buffer.indexOf(0x0a, offset);
++    }
++    if (offset > 0) buffer = Buffer.from(buffer.subarray(offset));
++    if (!pendingTermination && buffer.byteLength > MAX_JSONL_BYTES) {
++      beginTermination({
++        status: "PROTOCOL_ERROR",
++        reason: "buffer_too_large",
++      });
++    }
++  }
++
++  const completeStdout = (): void => {
++    if (stdoutCompleted || pendingTermination) return;
++    stdoutCompleted = true;
++    if (buffer.byteLength === 0) return;
++    if (buffer.byteLength > MAX_JSONL_BYTES) {
++      beginTermination({
++        status: "PROTOCOL_ERROR",
++        reason: "buffer_too_large",
++      });
++      return;
++    }
++    let remainder: string;
++    try {
++      remainder = decoder.decode(buffer);
++    } catch {
++      beginTermination({ status: "PROTOCOL_ERROR", reason: "invalid_utf8" });
++      return;
++    }
++    buffer = Buffer.alloc(0);
++    if (remainder.trim() !== "") {
++      beginTermination({ status: "PROTOCOL_ERROR", reason: "incomplete_line" });
++    }
++  };
++
++  function onStdoutEnd(): void {
++    completeStdout();
++  }
++
++  function onChildError(): void {
++    if (pendingTermination) {
++      // A kill failure may emit "error" without proving the child exited.
++      // Keep the grace timer and close listener until close or forced kill.
++      return;
++    }
++    beginTermination({
++      status: "SPAWN_ERROR",
++      reason: "spawn_error",
++    });
++  }
++
++  function onStdinError(): void {
++    beginTermination({ status: "IO_ERROR", reason: "stdin_error" });
++  }
++
++  function onStdoutError(): void {
++    beginTermination({ status: "IO_ERROR", reason: "stdout_error" });
++  }
++
++  function onStderrError(): void {
++    beginTermination({ status: "IO_ERROR", reason: "stderr_error" });
++  }
++
++  function discardStderr(): void {
++    // Draining prevents pipe backpressure; stderr content is never retained or surfaced.
++  }
++
++  function onClose(code: number | null, signal: NodeJS.Signals | null): void {
++    if (settled) return;
++    closeObserved = true;
++    if (pendingTermination) {
++      finishTermination(pendingTermination, code, signal);
++      return;
++    }
++    completeStdout();
++    if (pendingTermination) {
++      finishTermination(pendingTermination, code, signal);
++      return;
++    }
++    if (
++      !stdinEndRequested ||
++      (!stdinFinishObserved && !child.stdin.writableFinished)
++    ) {
++      finishTermination(
++        { status: "IO_ERROR", reason: "stdin_incomplete" },
++        code,
++        signal,
++      );
++      return;
++    }
++    if (signal !== null) {
++      finish({
++        status: "SIGNALLED",
++        exitCode: code,
++        signal,
++        reason: "signal_exit",
++        requiresConfirmation: true,
++        automaticRetry: false,
++      });
++    } else if (code !== 0) {
++      finish({
++        status: "EXIT_FAILURE",
++        exitCode: code,
++        signal,
++        reason: "non_zero_exit",
++        requiresConfirmation: true,
++        automaticRetry: false,
++      });
++    } else if (!protocol.hasSuccessTerminal()) {
++      finishTermination(
++        { status: "PROTOCOL_ERROR", reason: "missing_success_terminal" },
++        code,
++        signal,
++      );
++    } else {
++      finish({
++        status: "SUCCEEDED",
++        exitCode: 0,
++        signal: null,
++        requiresConfirmation: false,
++        automaticRetry: false,
++      });
++    }
++  }
++
++  function onStdinFinish(): void {
++    stdinFinishObserved = true;
++  }
++
++  const endStdin = (): void => {
++    if (stdinEndRequested || child.stdin.writableEnded) return;
++    stdinEndRequested = true;
++    try {
++      child.stdin.end();
++    } catch {
++      beginTermination({ status: "IO_ERROR", reason: "stdin_error" });
++    }
++  };
++
++  const onDrain = (): void => {
++    if (!settled && !pendingTermination) endStdin();
++  };
++
++  child.on("error", onChildError);
++  child.on("close", onClose);
++  child.stdin.on("error", onStdinError);
++  child.stdin.on("finish", onStdinFinish);
++  child.stdout.on("data", onStdoutData);
++  child.stdout.on("end", onStdoutEnd);
++  child.stdout.on("error", onStdoutError);
++  child.stderr.on("data", discardStderr);
++  child.stderr.on("error", onStderrError);
++  resetIdle();
++
++  try {
++    const accepted = child.stdin.write(prompt, "utf8");
++    if (accepted) endStdin();
++    else child.stdin.once("drain", onDrain);
++  } catch {
++    onStdinError();
++  }
++
++  return { events, terminationEvents, result };
++}
++
++export function createCodexRunner(dependencies: CodexRunnerDependencies) {
++  let stableDependencies: CodexRunnerDependencies | null = null;
++  try {
++    stableDependencies = snapshotRunnerDependencies(dependencies);
++  } catch {
++    // Keep construction side-effect free while preserving the async start API.
++  }
++  return {
++    async start(input: CodexRunRequest): Promise<CodexRunHandle> {
++      if (stableDependencies === null) {
++        throw new Error("invalid Codex runner dependencies");
++      }
++      const request = snapshotRunRequest(input);
++      const invocation = await verifyInvocation(stableDependencies, request);
++      let child: CodexChildProcess;
++      try {
++        child = stableDependencies.spawn(
++          invocation.command,
++          invocation.args,
++          invocation.options,
++        );
++      } catch {
++        return completedRun({
++          status: "SPAWN_ERROR",
++          exitCode: null,
++          signal: null,
++          reason: "spawn_error",
++          requiresConfirmation: true,
++          automaticRetry: false,
++        });
++      }
++      return startChildRun(child, request.prompt, request.sessionId);
++    },
++  };
++}
+diff --git a/src/security/workspace.ts b/src/security/workspace.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..31de3ba65cee8af68ea31e33f241984a2430addd
+--- /dev/null
++++ b/src/security/workspace.ts
+@@ -0,0 +1,91 @@
++import { lstat, realpath } from "node:fs/promises";
++import { isAbsolute, join, relative, resolve, sep } from "node:path";
++
++const CANONICAL_UUID =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++
++export function isCanonicalUuid(value: unknown): value is string {
++  return typeof value === "string" && CANONICAL_UUID.test(value);
++}
++
++function assertWorkspaceRoot(root: unknown): asserts root is string {
++  if (typeof root !== "string" || !isAbsolute(root)) {
++    throw new Error("workspace root must be an absolute path");
++  }
++  if (root.includes("\0")) {
++    throw new Error("workspace root contains invalid characters");
++  }
++}
++
++async function lstatOrThrow(path: string, missingMessage: string) {
++  try {
++    return await lstat(path);
++  } catch (error) {
++    if (
++      error !== null &&
++      typeof error === "object" &&
++      "code" in error &&
++      error.code === "ENOENT"
++    ) {
++      throw new Error(missingMessage);
++    }
++    throw error;
++  }
++}
++
++export async function resolveTaskWorkspace(
++  root: string,
++  taskId: string,
++): Promise<string> {
++  assertWorkspaceRoot(root);
++  if (!isCanonicalUuid(taskId)) throw new Error("invalid task id");
++
++  const normalizedRoot = resolve(root);
++  const rootStat = await lstatOrThrow(
++    normalizedRoot,
++    "workspace root does not exist",
++  );
++  if (rootStat.isSymbolicLink()) {
++    throw new Error("workspace root must not contain symlinks");
++  }
++  if (!rootStat.isDirectory()) {
++    throw new Error("workspace root must be a directory");
++  }
++  if ((rootStat.mode & 0o777) !== 0o700) {
++    throw new Error("workspace root permissions must be 0700");
++  }
++
++  const rootRealPath = await realpath(normalizedRoot);
++  if (rootRealPath !== normalizedRoot) {
++    throw new Error("workspace root must not contain symlinks");
++  }
++
++  const candidate = join(normalizedRoot, taskId);
++  const candidateStat = await lstatOrThrow(
++    candidate,
++    "task workspace does not exist",
++  );
++  if (candidateStat.isSymbolicLink()) {
++    throw new Error("task workspace must not be a symlink");
++  }
++  if (!candidateStat.isDirectory()) {
++    throw new Error("task workspace must be a directory");
++  }
++  if ((candidateStat.mode & 0o777) !== 0o700) {
++    throw new Error("task workspace permissions must be 0700");
++  }
++
++  const candidateRealPath = await realpath(candidate);
++  const relativePath = relative(rootRealPath, candidateRealPath);
++  if (
++    relativePath === "" ||
++    isAbsolute(relativePath) ||
++    relativePath === ".." ||
++    relativePath.startsWith(`..${sep}`) ||
++    candidateRealPath !== join(rootRealPath, taskId)
++  ) {
++    throw new Error("task workspace escapes its root");
++  }
++
++  return candidateRealPath;
++}
+diff --git a/test/codex-runner.test.ts b/test/codex-runner.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..11d650038f2c612fdfdb269050ad9adc7d65e809
+--- /dev/null
++++ b/test/codex-runner.test.ts
+@@ -0,0 +1,2067 @@
++import { EventEmitter } from "node:events";
++import { PassThrough, Writable } from "node:stream";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import {
++  createCodexRunner,
++  type CodexChildProcess,
++  type CodexRunEvent,
++  type CodexRunnerDependencies,
++} from "../src/agent/codex-runner.js";
++
++const TASK_ID = "018f7d72-7a2b-7f45-8a12-8e20b8426a21";
++const SESSION_ID = "018f7d72-7a2b-7f45-8a12-8e20b8426a22";
++const WORKSPACE_ROOT = "/Users/test/PresidentAssistant/jobs";
++const WORKSPACE = `${WORKSPACE_ROOT}/${TASK_ID}`;
++const CODEX_PATH = "/opt/local/bin/codex";
++const CODEX_HOME = "/Users/test/PresidentAssistant/runtime/codex-home";
++const GATEWAY_SOCKET = `${WORKSPACE}/gateway.sock`;
++const GATEWAY_CLIENT =
++  "/Users/test/PresidentAssistant/runtime/current/public-bin/assistant-gateway";
++const HASH = "a".repeat(64);
++const REQUIRED_FEATURES = [
++  "exec-json",
++  "exec-resume-stdin",
++  "approval-never",
++  "workspace-write-network-deny",
++] as const;
++const THREAD_STARTED = { type: "thread.started", thread_id: SESSION_ID };
++const TURN_STARTED = { type: "turn.started" };
++const TURN_COMPLETED = {
++  type: "turn.completed",
++  usage: {
++    input_tokens: 12,
++    cached_input_tokens: 4,
++    output_tokens: 3,
++    reasoning_output_tokens: 2,
++  },
++};
++
++const NEW_ARGS = [
++  "--ask-for-approval",
++  "never",
++  "--sandbox",
++  "workspace-write",
++  "-c",
++  "sandbox_workspace_write.network_access=false",
++  "exec",
++  "--strict-config",
++  "--json",
++  "--skip-git-repo-check",
++  "-",
++];
++
++const RESUME_ARGS = [
++  "--ask-for-approval",
++  "never",
++  "--sandbox",
++  "workspace-write",
++  "-c",
++  "sandbox_workspace_write.network_access=false",
++  "exec",
++  "resume",
++  SESSION_ID,
++  "--strict-config",
++  "--json",
++  "--skip-git-repo-check",
++  "-",
++];
++
++class FakeChild extends EventEmitter implements CodexChildProcess {
++  readonly stdin: Writable;
++  readonly stdout = new PassThrough();
++  readonly stderr = new PassThrough();
++  readonly kills: NodeJS.Signals[] = [];
++  exitCode: number | null = null;
++  signalCode: NodeJS.Signals | null = null;
++
++  constructor(stdin: Writable = new PassThrough()) {
++    super();
++    this.stdin = stdin;
++  }
++
++  kill(signal: NodeJS.Signals): boolean {
++    this.kills.push(signal);
++    return true;
++  }
++
++  close(code: number | null = 0, signal: NodeJS.Signals | null = null): void {
++    this.exitCode = code;
++    this.signalCode = signal;
++    this.stdout.end();
++    this.stderr.end();
++    this.emit("close", code, signal);
++  }
++}
++
++function validDependencies(child = new FakeChild()): CodexRunnerDependencies & {
++  spawn: ReturnType<typeof vi.fn>;
++  verifyCodexBinary: ReturnType<typeof vi.fn>;
++  verifyCodexHome: ReturnType<typeof vi.fn>;
++  verifyGatewayRelease: ReturnType<typeof vi.fn>;
++  resolveWorkspace: ReturnType<typeof vi.fn>;
++  lstatGatewaySocket: ReturnType<typeof vi.fn>;
++} {
++  return {
++    codexPath: CODEX_PATH,
++    codexHome: CODEX_HOME,
++    workspaceRoot: WORKSPACE_ROOT,
++    spawn: vi.fn(() => child),
++    resolveWorkspace: vi.fn(async () => WORKSPACE),
++    verifyCodexBinary: vi.fn(async (path: string) => ({
++      path,
++      version: "0.142.0" as const,
++      executable: true as const,
++      features: REQUIRED_FEATURES,
++    })),
++    verifyCodexHome: vi.fn(async (path: string) => ({
++      requestedPath: path,
++      realPath: path,
++      directory: true as const,
++      symlinkFree: true as const,
++      mode: 0o700,
++    })),
++    verifyGatewayRelease: vi.fn(async (path: string) => ({
++      requestedPath: path,
++      realPath: path,
++      publicBinDirectory:
++        "/Users/test/PresidentAssistant/runtime/current/public-bin",
++      publicBinEntries: ["assistant-gateway"],
++      expectedSha256: HASH,
++      actualSha256: HASH,
++      signatureVerified: true as const,
++      executable: true as const,
++    })),
++    lstatGatewaySocket: vi.fn(async () => ({
++      symbolicLink: false,
++      socket: true,
++      mode: 0o600,
++    })),
++  };
++}
++
++function request(overrides: Record<string, unknown> = {}) {
++  return {
++    taskId: TASK_ID,
++    workspace: WORKSPACE,
++    gatewaySocket: GATEWAY_SOCKET,
++    gatewayClient: GATEWAY_CLIENT,
++    prompt: "整理附件",
++    ...overrides,
++  };
++}
++
++async function collectEvents(
++  events: AsyncIterable<CodexRunEvent>,
++): Promise<CodexRunEvent[]> {
++  const collected: CodexRunEvent[] = [];
++  for await (const event of events) collected.push(event);
++  return collected;
++}
++
++async function flush(): Promise<void> {
++  await Promise.resolve();
++  await Promise.resolve();
++}
++
++async function waitForStdinFinish(child: FakeChild): Promise<void> {
++  if (child.stdin.writableFinished) return;
++  await new Promise<void>((resolve) => child.stdin.once("finish", resolve));
++}
++
++async function withObjectPrototypeProperty<T>(
++  key: string,
++  value: unknown,
++  run: () => Promise<T>,
++): Promise<T> {
++  const previous = Object.getOwnPropertyDescriptor(Object.prototype, key);
++  Object.defineProperty(Object.prototype, key, {
++    configurable: true,
++    enumerable: true,
++    value,
++    writable: true,
++  });
++  try {
++    return await run();
++  } finally {
++    if (previous === undefined) {
++      Reflect.deleteProperty(Object.prototype, key);
++    } else {
++      Object.defineProperty(Object.prototype, key, previous);
++    }
++  }
++}
++
++function emitEvent(child: FakeChild, event: Record<string, unknown>): void {
++  child.stdout.write(`${JSON.stringify(event)}\n`);
++}
++
++function emitSuccessfulTurn(child: FakeChild): void {
++  emitEvent(child, THREAD_STARTED);
++  emitEvent(child, TURN_STARTED);
++  emitEvent(child, TURN_COMPLETED);
++}
++
++describe("codex runner invocation", () => {
++  it("uses the exact Codex 0.142.0 safe argv, cwd, shell setting and clean environment", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    vi.stubEnv("HOME", "/Users/leak");
++    vi.stubEnv("HTTPS_PROXY", "http://proxy.invalid");
++    vi.stubEnv("FEISHU_APP_SECRET", "secret");
++    vi.stubEnv("LARK_ACCESS_TOKEN", "token");
++    vi.stubEnv("LARK_CLI_PATH", "/unsafe/lark-cli");
++    const runner = createCodexRunner(deps);
++
++    await runner.start(request());
++
++    expect(deps.spawn).toHaveBeenCalledWith(CODEX_PATH, NEW_ARGS, {
++      cwd: WORKSPACE,
++      env: {
++        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
++        CODEX_HOME,
++        ASSISTANT_GATEWAY_SOCKET: GATEWAY_SOCKET,
++        ASSISTANT_GATEWAY_CLIENT: GATEWAY_CLIENT,
++        LANG: "zh_CN.UTF-8",
++      },
++      shell: false,
++      stdio: ["pipe", "pipe", "pipe"],
++    });
++    const serialized = JSON.stringify(deps.spawn.mock.calls[0]);
++    expect(serialized).not.toContain("整理附件");
++    expect(serialized).not.toContain("secret");
++    expect(serialized).not.toContain("token");
++    expect(serialized).not.toContain("proxy.invalid");
++    expect(serialized).not.toContain("lark-cli");
++  });
++
++  afterEach(() => {
++    vi.unstubAllEnvs();
++    vi.unstubAllGlobals();
++  });
++
++  it("uses the same root safety prefix and only an explicit canonical UUID for resume", async () => {
++    const deps = validDependencies();
++    const runner = createCodexRunner(deps);
++
++    await runner.start(request({ sessionId: SESSION_ID }));
++
++    expect(deps.spawn).toHaveBeenCalledWith(
++      CODEX_PATH,
++      RESUME_ARGS,
++      expect.objectContaining({ cwd: WORKSPACE, shell: false }),
++    );
++    const args = deps.spawn.mock.calls[0]?.[1] as string[];
++    expect(args).not.toContain("--last");
++    expect(args).not.toContain("--search");
++    expect(args).not.toContain("--add-dir");
++    expect(args).not.toContain("danger-full-access");
++    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
++  });
++
++  it("does not inherit an implicit resume session from Object.prototype", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    const runner = createCodexRunner(deps);
++
++    await withObjectPrototypeProperty("sessionId", SESSION_ID, () =>
++      runner.start(request()),
++    );
++
++    expect(deps.spawn.mock.calls[0]?.[1]).toEqual(NEW_ARGS);
++    child.close();
++  });
++
++  it("does not inherit an optional workspace resolver from Object.prototype", async () => {
++    const deps = validDependencies();
++    const pollutedResolver = vi.fn(async () => WORKSPACE);
++    Reflect.deleteProperty(deps, "resolveWorkspace");
++
++    const error = await withObjectPrototypeProperty(
++      "resolveWorkspace",
++      pollutedResolver,
++      () =>
++        createCodexRunner(deps)
++          .start(request())
++          .catch((caught: unknown) => caught),
++    );
++
++    expect(error).toBeInstanceOf(Error);
++    expect((error as Error).message).toBe("task workspace verification failed");
++    expect(pollutedResolver).not.toHaveBeenCalled();
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("passes a null-prototype five-field environment and options record", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++
++    await withObjectPrototypeProperty(
++      "FEISHU_APP_SECRET",
++      "prototype-secret",
++      () => createCodexRunner(deps).start(request()),
++    );
++
++    const options = deps.spawn.mock.calls[0]?.[2];
++    expect(Object.getPrototypeOf(options)).toBeNull();
++    expect(Object.getPrototypeOf(options?.env)).toBeNull();
++    expect(Object.keys(options?.env ?? {})).toEqual([
++      "PATH",
++      "CODEX_HOME",
++      "ASSISTANT_GATEWAY_SOCKET",
++      "ASSISTANT_GATEWAY_CLIENT",
++      "LANG",
++    ]);
++    expect(options?.env.FEISHU_APP_SECRET).toBeUndefined();
++    child.close();
++  });
++
++  it("rejects an accessor request instead of validating one session and spawning another", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    const input = request({ sessionId: SESSION_ID });
++    let reads = 0;
++    Object.defineProperty(input, "sessionId", {
++      enumerable: true,
++      configurable: true,
++      get() {
++        reads += 1;
++        return reads <= 2 ? SESSION_ID : "--last";
++      },
++    });
++
++    const started = await createCodexRunner(deps)
++      .start(input)
++      .then(
++        () => true,
++        () => false,
++      );
++    if (started) child.close();
++
++    expect(started).toBe(false);
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("rejects an accessor request instead of swapping the verified socket in the child environment", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    const input = request();
++    let reads = 0;
++    Object.defineProperty(input, "gatewaySocket", {
++      enumerable: true,
++      configurable: true,
++      get() {
++        reads += 1;
++        return reads <= 3 ? GATEWAY_SOCKET : "/tmp/unverified.sock";
++      },
++    });
++
++    const started = await createCodexRunner(deps)
++      .start(input)
++      .then(
++        () => true,
++        () => false,
++      );
++    if (started) child.close();
++
++    expect(started).toBe(false);
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("rejects an accessor request instead of writing a post-validation prompt", async () => {
++    const child = new FakeChild();
++    const chunks: Buffer[] = [];
++    child.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
++    const deps = validDependencies(child);
++    const input = request();
++    let reads = 0;
++    Object.defineProperty(input, "prompt", {
++      enumerable: true,
++      configurable: true,
++      get() {
++        reads += 1;
++        return reads <= 5 ? "safe prompt" : "unsafe\0post-validation";
++      },
++    });
++
++    const started = await createCodexRunner(deps)
++      .start(input)
++      .then(
++        () => true,
++        () => false,
++      );
++    await flush();
++    if (started) child.close();
++
++    expect(started).toBe(false);
++    expect(deps.spawn).not.toHaveBeenCalled();
++    expect(Buffer.concat(chunks)).toHaveLength(0);
++  });
++
++  it("snapshots a data request before an async verifier can mutate its socket", async () => {
++    const child = new FakeChild();
++    const chunks: Buffer[] = [];
++    child.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
++    const deps = validDependencies(child);
++    const input = request({
++      sessionId: SESSION_ID,
++      prompt: "original prompt",
++    });
++    deps.verifyGatewayRelease.mockImplementation(async (path: string) => {
++      Object.assign(input, {
++        sessionId: "018f7d72-7a2b-7f45-8a12-8e20b8426a99",
++        gatewaySocket: "/tmp/unverified.sock",
++        gatewayClient: "/tmp/lark-cli",
++        prompt: "unsafe\0post-validation",
++      });
++      return {
++        requestedPath: path,
++        realPath: path,
++        publicBinDirectory:
++          "/Users/test/PresidentAssistant/runtime/current/public-bin",
++        publicBinEntries: ["assistant-gateway"],
++        expectedSha256: HASH,
++        actualSha256: HASH,
++        signatureVerified: true,
++        executable: true,
++      };
++    });
++
++    await createCodexRunner(deps).start(input);
++    await waitForStdinFinish(child);
++
++    expect(deps.spawn.mock.calls[0]?.[1]).toEqual(RESUME_ARGS);
++    const options = deps.spawn.mock.calls[0]?.[2];
++    expect(options?.env.ASSISTANT_GATEWAY_SOCKET).toBe(GATEWAY_SOCKET);
++    expect(options?.env.ASSISTANT_GATEWAY_CLIENT).toBe(GATEWAY_CLIENT);
++    expect(Buffer.concat(chunks).toString("utf8")).toBe("original prompt");
++    child.close();
++  });
++
++  it("rejects mutable dependency accessors before a different Codex binary can be spawned", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    let reads = 0;
++    Object.defineProperty(deps, "codexPath", {
++      enumerable: true,
++      configurable: true,
++      get() {
++        reads += 1;
++        return reads <= 3 ? CODEX_PATH : "/tmp/lark-cli";
++      },
++    });
++
++    const started = await createCodexRunner(deps)
++      .start(request())
++      .then(
++        () => true,
++        () => false,
++      );
++    if (started) child.close();
++
++    expect(started).toBe(false);
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("rejects mutable Codex home evidence before it can alter the child environment", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    deps.verifyCodexHome.mockImplementation(async () => {
++      let reads = 0;
++      return {
++        requestedPath: CODEX_HOME,
++        get realPath() {
++          reads += 1;
++          return reads === 1 ? CODEX_HOME : "/tmp/unverified-codex-home";
++        },
++        directory: true,
++        symlinkFree: true,
++        mode: 0o700,
++      };
++    });
++
++    const started = await createCodexRunner(deps)
++      .start(request())
++      .then(
++        () => true,
++        () => false,
++      );
++    if (started) child.close();
++
++    expect(started).toBe(false);
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("rejects mutable gateway evidence before it can swap in a raw lark-cli path", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    deps.verifyGatewayRelease.mockImplementation(async () => {
++      let reads = 0;
++      return {
++        requestedPath: GATEWAY_CLIENT,
++        get realPath() {
++          reads += 1;
++          return reads <= 3 ? GATEWAY_CLIENT : "/tmp/lark-cli";
++        },
++        publicBinDirectory:
++          "/Users/test/PresidentAssistant/runtime/current/public-bin",
++        publicBinEntries: ["assistant-gateway"],
++        expectedSha256: HASH,
++        actualSha256: HASH,
++        signatureVerified: true,
++        executable: true,
++      };
++    });
++
++    const started = await createCodexRunner(deps)
++      .start(request())
++      .then(
++        () => true,
++        () => false,
++      );
++    if (started) child.close();
++
++    expect(started).toBe(false);
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it.each(["symbol", "hidden"] as const)(
++    "rejects a request with an unsupported %s field",
++    async (kind) => {
++      const child = new FakeChild();
++      const deps = validDependencies(child);
++      const input = request();
++      if (kind === "symbol") {
++        Object.defineProperty(input, Symbol("env"), {
++          enumerable: true,
++          value: { FEISHU_APP_SECRET: "secret" },
++        });
++      } else {
++        Object.defineProperty(input, "env", {
++          enumerable: false,
++          value: { FEISHU_APP_SECRET: "secret" },
++        });
++      }
++
++      const started = await createCodexRunner(deps)
++        .start(input)
++        .then(
++          () => true,
++          () => false,
++        );
++      if (started) child.close();
++
++      expect(started).toBe(false);
++      expect(deps.spawn).not.toHaveBeenCalled();
++    },
++  );
++
++  it("replaces a revoked request proxy failure with a fixed error before verification", async () => {
++    const deps = validDependencies();
++    const revocable = Proxy.revocable(request(), {});
++    revocable.revoke();
++
++    const error = await createCodexRunner(deps)
++      .start(revocable.proxy)
++      .catch((caught: unknown) => caught);
++
++    expect(error).toBeInstanceOf(Error);
++    expect((error as Error).message).toBe("invalid Codex run request");
++    expect(deps.resolveWorkspace).not.toHaveBeenCalled();
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("rejects a transparent request proxy before verification", async () => {
++    const deps = validDependencies();
++    const input = new Proxy(request(), {});
++
++    const error = await createCodexRunner(deps)
++      .start(input)
++      .catch((caught: unknown) => caught);
++
++    expect(error).toBeInstanceOf(Error);
++    expect((error as Error).message).toBe("invalid Codex run request");
++    expect(deps.resolveWorkspace).not.toHaveBeenCalled();
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("keeps dependencies fixed from runner construction onward", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    const originalSpawn = deps.spawn;
++    const replacementSpawn = vi.fn(() => child);
++    const runner = createCodexRunner(deps);
++
++    deps.codexPath = "/tmp/lark-cli";
++    deps.spawn = replacementSpawn;
++    await runner.start(request());
++
++    expect(originalSpawn).toHaveBeenCalledWith(
++      CODEX_PATH,
++      NEW_ARGS,
++      expect.any(Object),
++    );
++    expect(replacementSpawn).not.toHaveBeenCalled();
++    child.close();
++  });
++
++  it("snapshots the spawn capability before an async verifier can replace it", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    const originalSpawn = deps.spawn;
++    const replacementSpawn = vi.fn(() => child);
++    deps.verifyGatewayRelease.mockImplementation(async (path: string) => {
++      deps.spawn = replacementSpawn;
++      return {
++        requestedPath: path,
++        realPath: path,
++        publicBinDirectory:
++          "/Users/test/PresidentAssistant/runtime/current/public-bin",
++        publicBinEntries: ["assistant-gateway"],
++        expectedSha256: HASH,
++        actualSha256: HASH,
++        signatureVerified: true,
++        executable: true,
++      };
++    });
++
++    await createCodexRunner(deps).start(request());
++
++    expect(originalSpawn).toHaveBeenCalledOnce();
++    expect(replacementSpawn).not.toHaveBeenCalled();
++    child.close();
++  });
++
++  it("passes a frozen invocation to the snapshotted spawn capability", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++
++    await createCodexRunner(deps).start(request());
++
++    const [, args, options] = deps.spawn.mock.calls[0] ?? [];
++    expect(Object.isFrozen(args)).toBe(true);
++    expect(Object.isFrozen(options)).toBe(true);
++    expect(Object.isFrozen(options?.env)).toBe(true);
++    expect(Object.isFrozen(options?.stdio)).toBe(true);
++    child.close();
++  });
++
++  it("invokes snapshotted capabilities without the mutable dependency record as receiver", async () => {
++    const child = new FakeChild();
++    const deps = validDependencies(child);
++    const receivers: unknown[] = [];
++    deps.resolveWorkspace = vi.fn(function (this: unknown) {
++      receivers.push(this);
++      return Promise.resolve(WORKSPACE);
++    });
++    deps.verifyCodexBinary = vi.fn(function (this: unknown, path: string) {
++      receivers.push(this);
++      return Promise.resolve({
++        path,
++        version: "0.142.0",
++        executable: true,
++        features: REQUIRED_FEATURES,
++      });
++    });
++    deps.verifyCodexHome = vi.fn(function (this: unknown, path: string) {
++      receivers.push(this);
++      return Promise.resolve({
++        requestedPath: path,
++        realPath: path,
++        directory: true,
++        symlinkFree: true,
++        mode: 0o700,
++      });
++    });
++    deps.lstatGatewaySocket = vi.fn(function (this: unknown) {
++      receivers.push(this);
++      return Promise.resolve({
++        symbolicLink: false,
++        socket: true,
++        mode: 0o600,
++      });
++    });
++    deps.verifyGatewayRelease = vi.fn(function (this: unknown, path: string) {
++      receivers.push(this);
++      return Promise.resolve({
++        requestedPath: path,
++        realPath: path,
++        publicBinDirectory:
++          "/Users/test/PresidentAssistant/runtime/current/public-bin",
++        publicBinEntries: ["assistant-gateway"],
++        expectedSha256: HASH,
++        actualSha256: HASH,
++        signatureVerified: true,
++        executable: true,
++      });
++    });
++    deps.spawn = vi.fn(function (this: unknown) {
++      receivers.push(this);
++      return child;
++    });
++
++    await createCodexRunner(deps).start(request());
++
++    expect(receivers).toEqual(Array(6).fill(undefined));
++    child.close();
++  });
++
++  it.each(["own includes", "proxy"] as const)(
++    "rejects a feature list with a spoofable %s surface",
++    async (kind) => {
++      const deps = validDependencies();
++      const features: string[] = [...REQUIRED_FEATURES];
++      const unsafeFeatures =
++        kind === "proxy"
++          ? new Proxy(features, {})
++          : Object.defineProperty(features, "includes", {
++              enumerable: true,
++              value: () => true,
++            });
++      deps.verifyCodexBinary.mockResolvedValue({
++        path: CODEX_PATH,
++        version: "0.142.0",
++        executable: true,
++        features: unsafeFeatures,
++      });
++
++      const error = await createCodexRunner(deps)
++        .start(request())
++        .catch((caught: unknown) => caught);
++
++      expect(error).toBeInstanceOf(Error);
++      expect((error as Error).message).toBe("codex binary verification failed");
++      expect(deps.spawn).not.toHaveBeenCalled();
++    },
++  );
++
++  it("replaces a throwing evidence accessor with a fixed verification error", async () => {
++    const deps = validDependencies();
++    deps.verifyCodexHome.mockResolvedValue({
++      requestedPath: CODEX_HOME,
++      get realPath(): string {
++        throw new Error("sensitive verifier detail");
++      },
++      directory: true,
++      symlinkFree: true,
++      mode: 0o700,
++    });
++
++    const error = await createCodexRunner(deps)
++      .start(request())
++      .catch((caught: unknown) => caught);
++
++    expect(error).toBeInstanceOf(Error);
++    expect((error as Error).message).toBe("codex home verification failed");
++    expect((error as Error).message).not.toContain("sensitive");
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["task id", { taskId: ".." }],
++    ["uppercase task id", { taskId: TASK_ID.toUpperCase() }],
++    ["session id", { sessionId: "--last" }],
++    ["uppercase session id", { sessionId: SESSION_ID.toUpperCase() }],
++    ["workspace", { workspace: "relative/workspace" }],
++    ["workspace NUL", { workspace: `${WORKSPACE}\0escape` }],
++    ["gateway socket", { gatewaySocket: "gateway.sock" }],
++    ["gateway client", { gatewayClient: "assistant-gateway" }],
++    ["empty prompt", { prompt: "" }],
++    ["whitespace prompt", { prompt: "  \n\t" }],
++    ["non-string prompt", { prompt: Buffer.from("secret") }],
++    ["NUL prompt", { prompt: "hello\0secret" }],
++    ["overlong prompt", { prompt: "x".repeat(1024 * 1024 + 1) }],
++    ["caller argv", { args: ["--dangerously-bypass-approvals-and-sandbox"] }],
++    ["caller env", { env: { FEISHU_APP_SECRET: "secret" } }],
++    ["caller cwd", { cwd: "/tmp" }],
++  ])("fails closed before spawn for invalid %s", async (_name, overrides) => {
++    const deps = validDependencies();
++    const runner = createCodexRunner(deps);
++
++    await expect(runner.start(request(overrides))).rejects.toThrow();
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["empty", ""],
++    ["relative", "bin/codex"],
++    ["NUL", "/opt/bin/codex\0evil"],
++  ])(
++    "rejects an %s configured codex path before its verifier or spawn",
++    async (_name, codexPath) => {
++      const deps = { ...validDependencies(), codexPath };
++      const runner = createCodexRunner(deps);
++
++      await expect(runner.start(request())).rejects.toThrow();
++      expect(deps.verifyCodexBinary).not.toHaveBeenCalled();
++      expect(deps.spawn).not.toHaveBeenCalled();
++    },
++  );
++
++  it.each([
++    ["codex home relative", { codexHome: "runtime/codex-home" }],
++    ["codex home NUL", { codexHome: `${CODEX_HOME}\0evil` }],
++    ["workspace root relative", { workspaceRoot: "jobs" }],
++  ])("rejects invalid fixed configuration: %s", async (_name, config) => {
++    const deps = { ...validDependencies(), ...config };
++
++    await expect(createCodexRunner(deps).start(request())).rejects.toThrow();
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("writes the prompt only to stdin and closes stdin", async () => {
++    const child = new FakeChild();
++    const chunks: Buffer[] = [];
++    child.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
++    const deps = validDependencies(child);
++
++    await createCodexRunner(deps).start(
++      request({ prompt: "只在标准输入里的秘密提示" }),
++    );
++    await flush();
++
++    expect(Buffer.concat(chunks).toString("utf8")).toBe(
++      "只在标准输入里的秘密提示",
++    );
++    expect((child.stdin as Writable).writableEnded).toBe(true);
++    expect(JSON.stringify(deps.spawn.mock.calls)).not.toContain(
++      "只在标准输入里的秘密提示",
++    );
++  });
++
++  it.each([
++    ["workspace resolver", "resolveWorkspace"],
++    ["Codex binary verifier", "verifyCodexBinary"],
++    ["Codex home verifier", "verifyCodexHome"],
++    ["gateway release verifier", "verifyGatewayRelease"],
++    ["gateway socket lstat", "lstatGatewaySocket"],
++  ] as const)(
++    "sanitizes a thrown %s error before spawn",
++    async (_name, dependency) => {
++      const deps = validDependencies();
++      deps[dependency].mockRejectedValue(
++        new Error("raw verifier secret 整理附件"),
++      );
++
++      const error = await createCodexRunner(deps)
++        .start(request())
++        .catch((caught: unknown) => caught);
++
++      expect(error).toBeInstanceOf(Error);
++      expect((error as Error).message).not.toContain("raw verifier secret");
++      expect((error as Error).message).not.toContain("整理附件");
++      expect(deps.spawn).not.toHaveBeenCalled();
++    },
++  );
++
++  it("waits for stdin drain before ending after backpressure", async () => {
++    let releaseWrite: (() => void) | undefined;
++    const stdin = new Writable({
++      highWaterMark: 1,
++      write(_chunk, _encoding, callback) {
++        releaseWrite = callback;
++      },
++    });
++    const child = new FakeChild(stdin);
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    expect(stdin.writableEnded).toBe(false);
++    releaseWrite?.();
++    await flush();
++    expect(stdin.writableEnded).toBe(true);
++    await waitForStdinFinish(child);
++    emitSuccessfulTurn(child);
++    child.close();
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++  });
++
++  it("fails closed if the child closes before a backpressured prompt can end", async () => {
++    const stdin = new Writable({
++      highWaterMark: 1,
++      write(_chunk, _encoding, _callback) {
++        // Intentionally never drains before the child closes.
++      },
++    });
++    const child = new FakeChild(stdin);
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "IO_ERROR",
++      reason: "stdin_incomplete",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++  });
++
++  it("requires the stdin finish event instead of treating end invocation as a flush", async () => {
++    let releaseFinal: (() => void) | undefined;
++    const stdin = new Writable({
++      write(_chunk, _encoding, callback) {
++        callback();
++      },
++      final(callback) {
++        releaseFinal = callback;
++      },
++    });
++    const child = new FakeChild(stdin);
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    expect(stdin.writableEnded).toBe(true);
++    expect(stdin.writableFinished).toBe(false);
++    emitSuccessfulTurn(child);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "IO_ERROR",
++      reason: "stdin_incomplete",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++    releaseFinal?.();
++  });
++});
++
++describe("codex runner trusted path bindings", () => {
++  it("calls every trusted verifier before spawning", async () => {
++    const deps = validDependencies();
++
++    await createCodexRunner(deps).start(request());
++
++    expect(deps.resolveWorkspace).toHaveBeenCalledWith(WORKSPACE_ROOT, TASK_ID);
++    expect(deps.verifyCodexBinary).toHaveBeenCalledWith(CODEX_PATH);
++    expect(deps.verifyCodexHome).toHaveBeenCalledWith(CODEX_HOME);
++    expect(deps.verifyGatewayRelease).toHaveBeenCalledWith(GATEWAY_CLIENT);
++    expect(deps.lstatGatewaySocket).toHaveBeenCalledWith(GATEWAY_SOCKET);
++  });
++
++  it.each([
++    [
++      "wrong path",
++      {
++        path: "/other/codex",
++        version: "0.142.0",
++        executable: true,
++        features: REQUIRED_FEATURES,
++      },
++    ],
++    [
++      "old version",
++      {
++        path: CODEX_PATH,
++        version: "0.141.9",
++        executable: true,
++        features: REQUIRED_FEATURES,
++      },
++    ],
++    [
++      "malformed version",
++      {
++        path: CODEX_PATH,
++        version: "latest",
++        executable: true,
++        features: REQUIRED_FEATURES,
++      },
++    ],
++    [
++      "missing required feature",
++      {
++        path: CODEX_PATH,
++        version: "0.142.0",
++        executable: true,
++        features: ["exec-json"],
++      },
++    ],
++    [
++      "not executable",
++      {
++        path: CODEX_PATH,
++        version: "0.142.0",
++        executable: false,
++        features: REQUIRED_FEATURES,
++      },
++    ],
++  ])("rejects codex verifier evidence for %s", async (_name, evidence) => {
++    const deps = validDependencies();
++    deps.verifyCodexBinary.mockResolvedValue(evidence);
++
++    await expect(createCodexRunner(deps).start(request())).rejects.toThrow(
++      "codex binary verification failed",
++    );
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it("accepts a compatible newer Codex version when all feature probes pass", async () => {
++    const deps = validDependencies();
++    deps.verifyCodexBinary.mockResolvedValue({
++      path: CODEX_PATH,
++      version: "0.143.1",
++      executable: true,
++      features: [...REQUIRED_FEATURES, "future-safe-feature"],
++    });
++
++    await createCodexRunner(deps).start(request());
++
++    expect(deps.spawn).toHaveBeenCalledOnce();
++  });
++
++  it.each([
++    [
++      "wrong real path",
++      {
++        requestedPath: CODEX_HOME,
++        realPath: "/other/home",
++        directory: true,
++        symlinkFree: true,
++        mode: 0o700,
++      },
++    ],
++    [
++      "not a directory",
++      {
++        requestedPath: CODEX_HOME,
++        realPath: CODEX_HOME,
++        directory: false,
++        symlinkFree: true,
++        mode: 0o700,
++      },
++    ],
++    [
++      "symlinked path",
++      {
++        requestedPath: CODEX_HOME,
++        realPath: CODEX_HOME,
++        directory: true,
++        symlinkFree: false,
++        mode: 0o700,
++      },
++    ],
++    [
++      "permissions too broad",
++      {
++        requestedPath: CODEX_HOME,
++        realPath: CODEX_HOME,
++        directory: true,
++        symlinkFree: true,
++        mode: 0o755,
++      },
++    ],
++  ])("rejects Codex home verifier evidence for %s", async (_name, evidence) => {
++    const deps = validDependencies();
++    deps.verifyCodexHome.mockResolvedValue(evidence);
++
++    await expect(createCodexRunner(deps).start(request())).rejects.toThrow(
++      "codex home verification failed",
++    );
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["wrong requested path", { requestedPath: "/other/gateway" }],
++    ["wrong real path", { realPath: "/release/public-bin/not-gateway" }],
++    ["wrong public bin", { publicBinDirectory: "/release/bin" }],
++    [
++      "extra public binary",
++      { publicBinEntries: ["assistant-gateway", "lark-cli"] },
++    ],
++    ["hash mismatch", { actualSha256: "b".repeat(64) }],
++    [
++      "bad hash format",
++      { actualSha256: "A".repeat(64), expectedSha256: "A".repeat(64) },
++    ],
++    ["signature missing", { signatureVerified: false }],
++    ["not executable", { executable: false }],
++  ])("rejects gateway release evidence for %s", async (_name, override) => {
++    const deps = validDependencies();
++    const baseline = await deps.verifyGatewayRelease(GATEWAY_CLIENT);
++    deps.verifyGatewayRelease.mockResolvedValue({ ...baseline, ...override });
++
++    await expect(createCodexRunner(deps).start(request())).rejects.toThrow(
++      "gateway release verification failed",
++    );
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["outside workspace", `${WORKSPACE_ROOT}/${SESSION_ID}/gateway.sock`],
++    ["wrong basename", `${WORKSPACE}/other.sock`],
++    ["nested path", `${WORKSPACE}/nested/gateway.sock`],
++  ])(
++    "rejects a gateway socket %s before lstat or spawn",
++    async (_name, gatewaySocket) => {
++      const deps = validDependencies();
++
++      await expect(
++        createCodexRunner(deps).start(request({ gatewaySocket })),
++      ).rejects.toThrow(
++        "gateway socket must be the task workspace gateway.sock",
++      );
++      expect(deps.lstatGatewaySocket).not.toHaveBeenCalled();
++      expect(deps.spawn).not.toHaveBeenCalled();
++    },
++  );
++
++  it.each([
++    ["symlink", { symbolicLink: true, socket: true, mode: 0o600 }],
++    ["not a socket", { symbolicLink: false, socket: false, mode: 0o600 }],
++    [
++      "permissions too broad",
++      { symbolicLink: false, socket: true, mode: 0o666 },
++    ],
++  ])(
++    "rejects gateway socket lstat evidence for %s",
++    async (_name, evidence) => {
++      const deps = validDependencies();
++      deps.lstatGatewaySocket.mockResolvedValue(evidence);
++
++      await expect(createCodexRunner(deps).start(request())).rejects.toThrow(
++        "gateway socket verification failed",
++      );
++      expect(deps.spawn).not.toHaveBeenCalled();
++    },
++  );
++
++  it("rejects a caller workspace that differs from the resolver result", async () => {
++    const deps = validDependencies();
++    deps.resolveWorkspace.mockResolvedValue("/trusted/other-workspace");
++
++    await expect(createCodexRunner(deps).start(request())).rejects.toThrow(
++      "task workspace verification failed",
++    );
++    expect(deps.spawn).not.toHaveBeenCalled();
++  });
++});
++
++describe("codex runner JSONL and lifecycle", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  it("yields the known Codex 0.142 event sequence and succeeds only after turn.completed", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const eventsPromise = collectEvents(run.events);
++
++    child.stdout.write(`${JSON.stringify(THREAD_STARTED)}\n\n`);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, {
++      type: "item.completed",
++      item: { id: "item_1", type: "agent_message", text: "完成" },
++    });
++    emitEvent(child, TURN_COMPLETED);
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    await expect(eventsPromise).resolves.toEqual([
++      THREAD_STARTED,
++      TURN_STARTED,
++      {
++        type: "item.completed",
++        item: { id: "item_1", type: "agent_message", text: "完成" },
++      },
++      TURN_COMPLETED,
++    ]);
++    await expect(run.result).resolves.toEqual({
++      status: "SUCCEEDED",
++      exitCode: 0,
++      signal: null,
++      requiresConfirmation: false,
++      automaticRetry: false,
++    });
++  });
++
++  it.each([
++    ["no events", []],
++    ["thread only", [THREAD_STARTED]],
++    ["turn without completion", [THREAD_STARTED, TURN_STARTED]],
++  ])(
++    "does not treat exit zero with %s as success",
++    async (_name, protocolEvents) => {
++      const child = new FakeChild();
++      const run = await createCodexRunner(validDependencies(child)).start(
++        request(),
++      );
++      for (const event of protocolEvents) emitEvent(child, event);
++
++      await waitForStdinFinish(child);
++      child.close(0, null);
++
++      await expect(run.result).resolves.toMatchObject({
++        status: "PROTOCOL_ERROR",
++        reason: "missing_success_terminal",
++        requiresConfirmation: true,
++        automaticRetry: false,
++      });
++    },
++  );
++
++  it.each([
++    [
++      "missing reasoning counter",
++      { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
++    ],
++    ["negative input counter", { ...TURN_COMPLETED.usage, input_tokens: -1 }],
++    [
++      "negative cached-input counter",
++      { ...TURN_COMPLETED.usage, cached_input_tokens: -1 },
++    ],
++    ["negative output counter", { ...TURN_COMPLETED.usage, output_tokens: -1 }],
++    [
++      "negative reasoning counter",
++      { ...TURN_COMPLETED.usage, reasoning_output_tokens: -1 },
++    ],
++  ])("rejects %s in Codex 0.142 usage", async (_name, usage) => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, { type: "turn.completed", usage });
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    child.close(null, "SIGTERM");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_event",
++    });
++  });
++
++  it("binds a resumed run to the requested session id", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request({ sessionId: SESSION_ID }),
++    );
++    emitEvent(child, { type: "thread.started", thread_id: TASK_ID });
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    child.close(null, "SIGTERM");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_event",
++    });
++  });
++
++  it("accepts the observed collab_tool_call item type", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, {
++      type: "item.completed",
++      item: { id: "item_1", type: "collab_tool_call", status: "completed" },
++    });
++    emitEvent(child, TURN_COMPLETED);
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++  });
++
++  it("rejects the unobserved error item type", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, {
++      type: "item.completed",
++      item: { id: "item_1", type: "error", message: "raw secret" },
++    });
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    child.close(null, "SIGTERM");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_event",
++    });
++  });
++
++  it("treats turn.failed as a sanitized Codex failure even if the process exits zero", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const eventsPromise = collectEvents(run.events);
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, {
++      type: "turn.failed",
++      error: { message: "raw failure secret" },
++    });
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "CODEX_ERROR",
++      reason: "codex_reported_failure",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++    expect(JSON.stringify(await run.result)).not.toContain(
++      "raw failure secret",
++    );
++    expect(JSON.stringify(await eventsPromise)).not.toContain(
++      "raw failure secret",
++    );
++  });
++
++  it("accepts a bounded reconnect diagnostic but redacts it and still requires turn.completed", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const eventsPromise = collectEvents(run.events);
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, {
++      type: "error",
++      message: "Reconnecting... raw secret /Users/private/path",
++    });
++    emitEvent(child, {
++      type: "item.completed",
++      item: { id: "item_1", type: "agent_message", text: "完成" },
++    });
++    emitEvent(child, TURN_COMPLETED);
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++    const serializedEvents = JSON.stringify(await eventsPromise);
++    expect(serializedEvents).toContain('{"type":"error"}');
++    expect(serializedEvents).not.toContain("raw secret");
++    expect(serializedEvents).not.toContain("/Users/private/path");
++  });
++
++  it("does not let a reconnect diagnostic replace the required success terminal", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    emitEvent(child, { type: "error", message: "Reconnecting..." });
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "missing_success_terminal",
++    });
++  });
++
++  it.each([
++    ["turn before thread", [TURN_STARTED], "invalid_event_sequence"],
++    [
++      "error before turn",
++      [{ type: "error", message: "Reconnecting..." }],
++      "invalid_event_sequence",
++    ],
++    [
++      "unknown item type",
++      [
++        THREAD_STARTED,
++        TURN_STARTED,
++        {
++          type: "item.completed",
++          item: { id: "item_1", type: "future_unreviewed_item" },
++        },
++      ],
++      "invalid_event",
++    ],
++    [
++      "second event after success terminal",
++      [THREAD_STARTED, TURN_STARTED, TURN_COMPLETED, TURN_STARTED],
++      "invalid_event_sequence",
++    ],
++  ])(
++    "fails closed for protocol sequence: %s",
++    async (_name, events, reason) => {
++      const child = new FakeChild();
++      const run = await createCodexRunner(validDependencies(child)).start(
++        request(),
++      );
++      for (const event of events) emitEvent(child, event);
++
++      expect(child.kills).toEqual(["SIGTERM"]);
++      child.close(null, "SIGTERM");
++      await expect(run.result).resolves.toMatchObject({
++        status: "PROTOCOL_ERROR",
++        reason,
++      });
++    },
++  );
++
++  it("rejects malformed UTF-8 before JSON parsing", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    child.stdout.write(Buffer.from([0xff, 0x0a]));
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    child.close(null, "SIGTERM");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_utf8",
++    });
++  });
++
++  it("accepts CRLF and a UTF-8 code point split across stdout chunks", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const eventsPromise = collectEvents(run.events);
++    child.stdout.write(`${JSON.stringify(THREAD_STARTED)}\r\n`);
++    child.stdout.write(`${JSON.stringify(TURN_STARTED)}\r\n`);
++    const itemLine = Buffer.from(
++      `${JSON.stringify({
++        type: "item.completed",
++        item: { id: "item_1", type: "agent_message", text: "完成" },
++      })}\r\n`,
++      "utf8",
++    );
++    const multibyteStart = itemLine.indexOf(Buffer.from("完成", "utf8"));
++    expect(multibyteStart).toBeGreaterThan(0);
++    child.stdout.write(itemLine.subarray(0, multibyteStart + 1));
++    child.stdout.write(itemLine.subarray(multibyteStart + 1));
++    child.stdout.write(`${JSON.stringify(TURN_COMPLETED)}\r\n`);
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++    expect(JSON.stringify(await eventsPromise)).toContain("完成");
++  });
++
++  it("accepts a valid raw JSONL line exactly at the one-MiB limit", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    const emptyEvent = {
++      type: "item.completed",
++      item: { id: "item_1", type: "agent_message", text: "" },
++    };
++    const emptyLine = JSON.stringify(emptyEvent);
++    const textLength = 1024 * 1024 - Buffer.byteLength(emptyLine, "utf8");
++    const boundaryLine = JSON.stringify({
++      ...emptyEvent,
++      item: { ...emptyEvent.item, text: "x".repeat(textLength) },
++    });
++    expect(Buffer.byteLength(boundaryLine, "utf8")).toBe(1024 * 1024);
++    child.stdout.write(`${boundaryLine}\n`);
++    emitEvent(child, TURN_COMPLETED);
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++  });
++
++  it.each([
++    ["invalid JSON", "not-json\n", "invalid_json"],
++    ["JSON scalar", '"not-an-event"\n', "invalid_event"],
++    ["JSON array", "[]\n", "invalid_event"],
++    ["object without type", "{}\n", "invalid_event"],
++    ["object with numeric type", '{"type":123}\n', "invalid_event"],
++    ["object with empty type", '{"type":""}\n', "invalid_event"],
++    [
++      "object with multiline type",
++      '{"type":"progress\\nsecret-body"}\n',
++      "invalid_event",
++    ],
++    [
++      "object with overlong type",
++      `{"type":"${"x".repeat(129)}"}\n`,
++      "invalid_event",
++    ],
++    ["unknown safe event", '{"type":"progress"}\n', "unknown_event"],
++    ["overlong line", `${"x".repeat(1024 * 1024 + 1)}\n`, "line_too_large"],
++    [
++      "overlong whitespace line",
++      `${" ".repeat(1024 * 1024 + 1)}\n`,
++      "line_too_large",
++    ],
++  ])(
++    "fails closed for %s without exposing stdout",
++    async (_name, output, reason) => {
++      const child = new FakeChild();
++      const run = await createCodexRunner(validDependencies(child)).start(
++        request(),
++      );
++
++      child.stdout.write(output);
++
++      expect(child.kills).toEqual(["SIGTERM"]);
++      await vi.advanceTimersByTimeAsync(10_000);
++      expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++      const resultSpy = vi.fn();
++      void run.result.then(resultSpy);
++      await flush();
++      expect(resultSpy).not.toHaveBeenCalled();
++      child.close(null, "SIGKILL");
++
++      await expect(run.result).resolves.toEqual({
++        status: "PROTOCOL_ERROR",
++        exitCode: null,
++        signal: "SIGKILL",
++        reason,
++        requiresConfirmation: true,
++        automaticRetry: false,
++      });
++      expect(JSON.stringify(await run.result)).not.toContain(
++        output.slice(0, 32),
++      );
++    },
++  );
++
++  it("fails closed when the accumulated incomplete buffer exceeds the limit", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    child.stdout.write("x".repeat(600_000));
++    child.stdout.write("y".repeat(600_000));
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await vi.advanceTimersByTimeAsync(10_000);
++    child.close(null, "SIGKILL");
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "buffer_too_large",
++    });
++    expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++  });
++
++  it("fails closed when valid events exceed the bounded pending-event queue", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const largeEvent = `${JSON.stringify({
++      type: "item.updated",
++      item: {
++        id: "item_large",
++        type: "agent_message",
++        payload: "x".repeat(900_000),
++      },
++    })}\n`;
++
++    emitEvent(child, THREAD_STARTED);
++    emitEvent(child, TURN_STARTED);
++    for (let index = 0; index < 5; index += 1) child.stdout.write(largeEvent);
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await vi.advanceTimersByTimeAsync(10_000);
++    expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++    child.close(null, "SIGKILL");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "event_queue_overflow",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++  });
++
++  it("does not charge an event delivered directly to an awaiting consumer", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const iterator = run.events[Symbol.asyncIterator]();
++    const protocolEvents: Array<Record<string, unknown>> = [
++      THREAD_STARTED,
++      TURN_STARTED,
++      ...Array.from({ length: 6 }, (_, index) => ({
++        type: "item.updated",
++        item: {
++          id: `item_${index}`,
++          type: "agent_message",
++          payload: "x".repeat(900_000),
++        },
++      })),
++      TURN_COMPLETED,
++    ];
++
++    for (const event of protocolEvents) {
++      const next = iterator.next();
++      emitEvent(child, event);
++      await expect(next).resolves.toMatchObject({ done: false });
++    }
++    await waitForStdinFinish(child);
++    child.close(0, null);
++
++    expect(child.kills).toEqual([]);
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++  });
++
++  it("does not SIGKILL when a protocol-failed child closes during the grace period", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    child.stdout.write("not-json\n");
++    expect(child.kills).toEqual(["SIGTERM"]);
++
++    child.close(null, "SIGTERM");
++    await vi.advanceTimersByTimeAsync(10_000);
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_json",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++  });
++
++  it("keeps the forced-kill timer after a child error that does not prove exit", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    child.stdout.write("not-json\n");
++    child.emit("error", new Error("kill failed without exit"));
++
++    await vi.advanceTimersByTimeAsync(10_000);
++
++    expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++    await flush();
++    expect(resultSpy).not.toHaveBeenCalled();
++    child.close(null, "SIGKILL");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_json",
++    });
++  });
++
++  it("reports unconfirmed termination after accepted TERM and KILL without close", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const termination = run.terminationEvents[Symbol.asyncIterator]().next();
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++
++    child.stdout.write("not-json\n");
++    await vi.advanceTimersByTimeAsync(10_000);
++    await flush();
++
++    expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++    expect(resultSpy).not.toHaveBeenCalled();
++    await expect(termination).resolves.toEqual({
++      done: false,
++      value: {
++        status: "TERMINATION_UNCONFIRMED",
++        reason: "invalid_json",
++        termSignalAccepted: true,
++        killSignalAccepted: true,
++        requiresConfirmation: true,
++        automaticRetry: false,
++      },
++    });
++
++    child.close(null, "SIGKILL");
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_json",
++    });
++  });
++
++  it("settles reentrantly on a close emitted synchronously by TERM", async () => {
++    const child = new FakeChild();
++    child.kill = vi.fn((signal: NodeJS.Signals) => {
++      child.kills.push(signal);
++      child.close(null, signal);
++      return true;
++    });
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const termination = run.terminationEvents[Symbol.asyncIterator]().next();
++
++    child.stdout.write("not-json\n");
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "invalid_json",
++      signal: "SIGTERM",
++    });
++    await vi.advanceTimersByTimeAsync(10_000);
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await expect(termination).resolves.toEqual({
++      done: true,
++      value: undefined,
++    });
++  });
++
++  it.each(["returns false", "throws"])(
++    "reports unconfirmed termination when kill %s and keeps resources open until close",
++    async (killBehavior) => {
++      const child = new FakeChild();
++      child.kill = vi.fn((signal: NodeJS.Signals) => {
++        child.kills.push(signal);
++        if (killBehavior === "throws") throw new Error("raw kill failure");
++        return false;
++      });
++      const run = await createCodexRunner(validDependencies(child)).start(
++        request(),
++      );
++      const termination = run.terminationEvents[Symbol.asyncIterator]().next();
++      const eventStreamDone = run.events[Symbol.asyncIterator]().next();
++      const resultSpy = vi.fn();
++      const eventDoneSpy = vi.fn();
++      void run.result.then(resultSpy);
++      void eventStreamDone.then(eventDoneSpy);
++
++      child.stdout.write("not-json\n");
++      await vi.advanceTimersByTimeAsync(10_000);
++      await flush();
++
++      expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++      expect(resultSpy).not.toHaveBeenCalled();
++      expect(eventDoneSpy).not.toHaveBeenCalled();
++      expect(child.listenerCount("close")).toBeGreaterThan(0);
++      await expect(termination).resolves.toEqual({
++        done: false,
++        value: {
++          status: "TERMINATION_UNCONFIRMED",
++          reason: "invalid_json",
++          termSignalAccepted: false,
++          killSignalAccepted: false,
++          requiresConfirmation: true,
++          automaticRetry: false,
++        },
++      });
++
++      child.close(null, "SIGKILL");
++
++      await expect(run.result).resolves.toMatchObject({
++        status: "PROTOCOL_ERROR",
++        reason: "invalid_json",
++        signal: "SIGKILL",
++      });
++      await expect(eventStreamDone).resolves.toEqual({
++        done: true,
++        value: undefined,
++      });
++    },
++  );
++
++  it("treats a non-whitespace unterminated line at close as a protocol error", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    child.stdout.write('{"type":"incomplete"}');
++    child.close(0, null);
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "PROTOCOL_ERROR",
++      reason: "incomplete_line",
++    });
++  });
++
++  it("stderr and an incomplete stdout fragment do not reset idle", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    await vi.advanceTimersByTimeAsync(29 * 60_000);
++    child.stderr.write("noise that must never be surfaced\n");
++    child.stdout.write('{"type":"partial"');
++    await vi.advanceTimersByTimeAsync(60_000);
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    child.close(null, "SIGTERM");
++    await expect(run.result).resolves.toEqual({
++      status: "INTERRUPTED_REQUIRES_CONFIRMATION",
++      exitCode: null,
++      signal: "SIGTERM",
++      reason: "idle_timeout",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++    expect(JSON.stringify(await run.result)).not.toContain("noise");
++    expect(JSON.stringify(await run.result)).not.toContain("partial");
++  });
++
++  it("accepts one MiB of whitespace without resetting idle", async () => {
++    const child = new FakeChild();
++    await createCodexRunner(validDependencies(child)).start(request());
++
++    await vi.advanceTimersByTimeAsync(29 * 60_000 + 59_000);
++    child.stdout.write(`${" ".repeat(1024 * 1024)}\n`);
++    expect(child.kills).toEqual([]);
++    await vi.advanceTimersByTimeAsync(1_000);
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++  });
++
++  it("does not terminate at 29:59 and sends SIGTERM exactly at 30:00", async () => {
++    const child = new FakeChild();
++    await createCodexRunner(validDependencies(child)).start(request());
++
++    await vi.advanceTimersByTimeAsync(29 * 60_000 + 59_000);
++    expect(child.kills).toEqual([]);
++    await vi.advanceTimersByTimeAsync(1_000);
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await vi.advanceTimersByTimeAsync(5_000);
++    expect(child.kills).toEqual(["SIGTERM"]);
++  });
++
++  it("resets idle only after each valid complete event", async () => {
++    const child = new FakeChild();
++    await createCodexRunner(validDependencies(child)).start(request());
++
++    await vi.advanceTimersByTimeAsync(29 * 60_000);
++    emitEvent(child, THREAD_STARTED);
++    await flush();
++    await vi.advanceTimersByTimeAsync(29 * 60_000 + 59_000);
++    expect(child.kills).toEqual([]);
++    await vi.advanceTimersByTimeAsync(1_000);
++    expect(child.kills).toEqual(["SIGTERM"]);
++  });
++
++  it("sends SIGKILL once when the child is still alive ten seconds after idle TERM", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    await vi.advanceTimersByTimeAsync(30 * 60_000);
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await vi.advanceTimersByTimeAsync(9_999);
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await vi.advanceTimersByTimeAsync(1);
++    expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++    await flush();
++    expect(resultSpy).not.toHaveBeenCalled();
++    child.close(null, "SIGKILL");
++    await expect(run.result).resolves.toEqual({
++      status: "INTERRUPTED_REQUIRES_CONFIRMATION",
++      exitCode: null,
++      signal: "SIGKILL",
++      reason: "idle_timeout",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++  });
++
++  it("does not SIGKILL after the child exits during the grace period", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++
++    await vi.advanceTimersByTimeAsync(30 * 60_000);
++    child.close(null, "SIGTERM");
++    await vi.advanceTimersByTimeAsync(10_000);
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await expect(run.result).resolves.toMatchObject({
++      status: "INTERRUPTED_REQUIRES_CONFIRMATION",
++    });
++  });
++
++  it("settles once and does not send signals after an early successful close", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++
++    emitSuccessfulTurn(child);
++    await waitForStdinFinish(child);
++    child.close(0, null);
++    child.emit("close", 7, null);
++    await flush();
++    await vi.advanceTimersByTimeAsync(31 * 60_000);
++
++    expect(resultSpy).toHaveBeenCalledTimes(1);
++    expect(child.kills).toEqual([]);
++    await expect(run.result).resolves.toMatchObject({ status: "SUCCEEDED" });
++  });
++
++  it("does not infer close from non-null child exit fields", async () => {
++    const child = new FakeChild();
++    child.exitCode = 9;
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++    emitSuccessfulTurn(child);
++
++    await flush();
++    expect(resultSpy).not.toHaveBeenCalled();
++    expect(child.listenerCount("close")).toBeGreaterThan(0);
++
++    await waitForStdinFinish(child);
++    child.close(9, null);
++    await expect(run.result).resolves.toMatchObject({
++      status: "EXIT_FAILURE",
++      reason: "non_zero_exit",
++    });
++  });
++
++  it.each([
++    ["non-zero exit", 7, null, "EXIT_FAILURE", "non_zero_exit"],
++    ["external signal", null, "SIGINT", "SIGNALLED", "signal_exit"],
++  ] as const)(
++    "distinguishes %s",
++    async (_name, code, signal, status, reason) => {
++      const child = new FakeChild();
++      const run = await createCodexRunner(validDependencies(child)).start(
++        request(),
++      );
++      emitSuccessfulTurn(child);
++      await waitForStdinFinish(child);
++      child.close(code, signal);
++
++      await expect(run.result).resolves.toEqual({
++        status,
++        exitCode: code,
++        signal,
++        reason,
++        requiresConfirmation: true,
++        automaticRetry: false,
++      });
++    },
++  );
++
++  it("distinguishes a synchronous spawn failure without exposing its message or prompt", async () => {
++    const deps = validDependencies();
++    deps.spawn.mockImplementation(() => {
++      throw new Error("spawn leaked secret 整理附件");
++    });
++    const run = await createCodexRunner(deps).start(request());
++
++    await expect(run.result).resolves.toEqual({
++      status: "SPAWN_ERROR",
++      exitCode: null,
++      signal: null,
++      reason: "spawn_error",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++    expect(JSON.stringify(await run.result)).not.toContain("整理附件");
++    expect(await collectEvents(run.events)).toEqual([]);
++  });
++
++  it("waits for close after an emitted child spawn error", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++    child.emit("error", new Error("unsafe raw process error"));
++
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await flush();
++    expect(resultSpy).not.toHaveBeenCalled();
++
++    child.close(null, "SIGTERM");
++
++    await expect(run.result).resolves.toMatchObject({
++      status: "SPAWN_ERROR",
++      reason: "spawn_error",
++    });
++  });
++
++  it.each([
++    [
++      "stdin",
++      (child: FakeChild) =>
++        child.stdin.emit("error", new Error("stdin raw secret")),
++      "stdin_error",
++    ],
++    [
++      "stdout",
++      (child: FakeChild) =>
++        child.stdout.emit("error", new Error("stdout raw secret")),
++      "stdout_error",
++    ],
++  ] as const)(
++    "fails with a sanitized IO status for %s errors",
++    async (_name, trigger, reason) => {
++      const child = new FakeChild();
++      const run = await createCodexRunner(validDependencies(child)).start(
++        request(),
++      );
++      trigger(child);
++
++      expect(child.kills).toEqual(["SIGTERM"]);
++      await vi.advanceTimersByTimeAsync(10_000);
++      child.close(null, "SIGKILL");
++
++      await expect(run.result).resolves.toEqual({
++        status: "IO_ERROR",
++        exitCode: null,
++        signal: "SIGKILL",
++        reason,
++        requiresConfirmation: true,
++        automaticRetry: false,
++      });
++      expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
++      expect(JSON.stringify(await run.result)).not.toContain("raw secret");
++    },
++  );
++
++  it("sanitizes stderr stream errors and settles only once across later close/error events", async () => {
++    const child = new FakeChild();
++    const run = await createCodexRunner(validDependencies(child)).start(
++      request(),
++    );
++    const resultSpy = vi.fn();
++    void run.result.then(resultSpy);
++
++    child.stderr.emit("error", new Error("stderr raw secret"));
++    child.emit("error", new Error("later child raw secret"));
++    child.close(null, "SIGTERM");
++    child.emit("close", 7, null);
++    await flush();
++    await vi.advanceTimersByTimeAsync(10_000);
++
++    expect(resultSpy).toHaveBeenCalledTimes(1);
++    expect(child.kills).toEqual(["SIGTERM"]);
++    await expect(run.result).resolves.toEqual({
++      status: "IO_ERROR",
++      exitCode: null,
++      signal: "SIGTERM",
++      reason: "stderr_error",
++      requiresConfirmation: true,
++      automaticRetry: false,
++    });
++    expect(JSON.stringify(await run.result)).not.toContain("raw secret");
++  });
++});
+diff --git a/test/workspace.test.ts b/test/workspace.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eae58eab34ace0dce69792e3f68a637d49ee6ced
+--- /dev/null
++++ b/test/workspace.test.ts
+@@ -0,0 +1,191 @@
++import {
++  chmod,
++  mkdir,
++  mkdtemp,
++  realpath,
++  rm,
++  symlink,
++  writeFile,
++} from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++
++import { resolveTaskWorkspace } from "../src/security/workspace.js";
++
++const TASK_ID = "018f7d72-7a2b-7f45-8a12-8e20b8426a21";
++const OTHER_TASK_ID = "018f7d72-7a2b-7f45-8a12-8e20b8426a22";
++const created: string[] = [];
++
++async function fixtureRoot(): Promise<string> {
++  const fixture = await temporaryDirectory("assistant-workspace-");
++  created.push(fixture);
++  const root = join(fixture, "jobs");
++  await mkdir(root, { mode: 0o700 });
++  return root;
++}
++
++async function temporaryDirectory(prefix: string): Promise<string> {
++  return mkdtemp(join(await realpath(tmpdir()), prefix));
++}
++
++async function taskDirectory(root: string, taskId = TASK_ID): Promise<string> {
++  const candidate = join(root, taskId);
++  await mkdir(candidate, { mode: 0o700 });
++  await chmod(candidate, 0o700);
++  return candidate;
++}
++
++afterEach(async () => {
++  await Promise.all(
++    created.splice(0).map((path) => rm(path, { recursive: true, force: true })),
++  );
++});
++
++describe("resolveTaskWorkspace", () => {
++  it("returns the real path of the one 0700 task directory derived from the UUID", async () => {
++    const root = await fixtureRoot();
++    const candidate = await taskDirectory(root);
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).resolves.toBe(candidate);
++  });
++
++  it.each([
++    "..",
++    ".",
++    "",
++    "018f7d72-7a2b-7f45-8a12-8e20b8426a2",
++    "018F7D72-7A2B-7F45-8A12-8E20B8426A21",
++    "00000000-0000-0000-0000-000000000000",
++    `${TASK_ID}/nested`,
++  ])("rejects a non-canonical task id: %s", async (taskId) => {
++    const root = await fixtureRoot();
++
++    await expect(resolveTaskWorkspace(root, taskId)).rejects.toThrow(
++      "invalid task id",
++    );
++  });
++
++  it("rejects a relative root", async () => {
++    await expect(
++      resolveTaskWorkspace("relative/jobs", TASK_ID),
++    ).rejects.toThrow("workspace root must be an absolute path");
++  });
++
++  it("rejects a root path containing NUL", async () => {
++    await expect(
++      resolveTaskWorkspace("/tmp/jobs\0escape", TASK_ID),
++    ).rejects.toThrow("workspace root contains invalid characters");
++  });
++
++  it("rejects a missing root", async () => {
++    const fixture = await temporaryDirectory("assistant-workspace-missing-");
++    created.push(fixture);
++
++    await expect(
++      resolveTaskWorkspace(join(fixture, "missing"), TASK_ID),
++    ).rejects.toThrow("workspace root does not exist");
++  });
++
++  it("rejects a root that is a file", async () => {
++    const fixture = await temporaryDirectory("assistant-workspace-file-root-");
++    created.push(fixture);
++    const root = join(fixture, "jobs");
++    await writeFile(root, "not a directory");
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++      "workspace root must be a directory",
++    );
++  });
++
++  it("rejects a missing task directory and does not create it", async () => {
++    const root = await fixtureRoot();
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++      "task workspace does not exist",
++    );
++  });
++
++  it("rejects root directory permissions broader than 0700", async () => {
++    const root = await fixtureRoot();
++    await chmod(root, 0o755);
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++      "workspace root permissions must be 0700",
++    );
++  });
++
++  it("rejects a task path that is a file", async () => {
++    const root = await fixtureRoot();
++    await writeFile(join(root, TASK_ID), "not a directory");
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++      "task workspace must be a directory",
++    );
++  });
++
++  it.each([0o755, 0o750, 0o770, 0o777])(
++    "rejects task directory permissions %s instead of 0700",
++    async (mode) => {
++      const root = await fixtureRoot();
++      const candidate = await taskDirectory(root);
++      await chmod(candidate, mode);
++
++      await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++        "task workspace permissions must be 0700",
++      );
++    },
++  );
++
++  it("rejects the task path when it is a symlink outside the root", async () => {
++    const root = await fixtureRoot();
++    const outside = join(root, "..", "outside");
++    await mkdir(outside, { mode: 0o700 });
++    await symlink(outside, join(root, TASK_ID));
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++      "task workspace must not be a symlink",
++    );
++  });
++
++  it("rejects the task path when it is a symlink to another directory inside the root", async () => {
++    const root = await fixtureRoot();
++    await taskDirectory(root, OTHER_TASK_ID);
++    await symlink(join(root, OTHER_TASK_ID), join(root, TASK_ID));
++
++    await expect(resolveTaskWorkspace(root, TASK_ID)).rejects.toThrow(
++      "task workspace must not be a symlink",
++    );
++  });
++
++  it("rejects the root when the root itself is a symlink", async () => {
++    const fixture = await temporaryDirectory("assistant-workspace-root-link-");
++    created.push(fixture);
++    const realRoot = join(fixture, "real-jobs");
++    const linkedRoot = join(fixture, "jobs");
++    await mkdir(realRoot, { mode: 0o700 });
++    await taskDirectory(realRoot);
++    await symlink(realRoot, linkedRoot);
++
++    await expect(resolveTaskWorkspace(linkedRoot, TASK_ID)).rejects.toThrow(
++      "workspace root must not contain symlinks",
++    );
++  });
++
++  it("rejects a root reached through a symlinked parent component", async () => {
++    const fixture = await temporaryDirectory(
++      "assistant-workspace-parent-link-",
++    );
++    created.push(fixture);
++    const realParent = join(fixture, "real-parent");
++    const linkedParent = join(fixture, "linked-parent");
++    const realRoot = join(realParent, "jobs");
++    await mkdir(realRoot, { recursive: true, mode: 0o700 });
++    await taskDirectory(realRoot);
++    await symlink(realParent, linkedParent);
++
++    await expect(
++      resolveTaskWorkspace(join(linkedParent, "jobs"), TASK_ID),
++    ).rejects.toThrow("workspace root must not contain symlinks");
++  });
++});
