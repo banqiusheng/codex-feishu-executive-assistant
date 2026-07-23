@@ -15,6 +15,7 @@
   },
   "scripts": {
     "build": "tsup --config tsup.config.ts",
+    "pretypecheck": "pnpm --filter @executive-assistant/action-gateway build && pnpm --filter @executive-assistant/bridge build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts"
   },

@@ -8,6 +8,7 @@
 
 - 修复 GitHub Actions 中 Gitleaks 临时 SARIF 报告被 Prettier 当作项目文件检查，导致首次公开 `main` CI 误报失败。
 - 修复 GitHub Actions 未启用 Corepack shim，导致 pnpm 生命周期脚本在干净 runner 中找不到 `pnpm`。
+- 补齐 runtime 类型检查的 workspace 依赖构建前置项，避免本机旧 `dist` 缓存掩盖干净检出失败。
 
 ## [0.1.0-rc.1] - 2026-07-23
 
