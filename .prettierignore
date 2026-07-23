@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+results.sarif
 pnpm-lock.yaml
 .superpowers/
 docs/superpowers/

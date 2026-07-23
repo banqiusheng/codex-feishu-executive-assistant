@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+results.sarif
 .DS_Store
 .superpowers/
 .env

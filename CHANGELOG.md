@@ -4,7 +4,9 @@
 
 ## [Unreleased]
 
-- 尚无未发布变更。
+### Fixed
+
+- 修复 GitHub Actions 中 Gitleaks 临时 SARIF 报告被 Prettier 当作项目文件检查，导致首次公开 `main` CI 误报失败。
 
 ## [0.1.0-rc.1] - 2026-07-23
 
