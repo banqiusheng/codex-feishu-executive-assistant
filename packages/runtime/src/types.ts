@@ -39,7 +39,11 @@ export type RuntimeSecretRef = Readonly<{
 export type RuntimeConfig = Readonly<{
   schemaVersion: 1;
   appId: string;
-  tenantKey: string;
+  /**
+   * Legacy pre-bound tenant support. New self-built app installations omit this
+   * value and bind it from the first trusted private pairing event.
+   */
+  tenantKey: string | null;
   presidentOpenId: string | null;
   presidentChatId: string | null;
   pairing: RuntimePairingConfig;
@@ -72,7 +76,16 @@ export type RuntimeConfirmationCard = Readonly<{
   preview: Readonly<Record<string, unknown>>;
 }>;
 
+export type RuntimeTenantBindingRequest = Readonly<{
+  expectedTenantKey: string | null;
+  presidentOpenId: string | null;
+  presidentChatId: string | null;
+  pairingCodeHash: string | null;
+  pairingExpiresAt: string | null;
+}>;
+
 export interface RuntimeTransport {
+  resolveTenantKey(request: RuntimeTenantBindingRequest): Promise<string>;
   onMessage(
     handler: (event: SdkMessageEvent) => Promise<void>,
   ): void | Promise<void>;

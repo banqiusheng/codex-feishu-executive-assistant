@@ -17,7 +17,6 @@ export async function startProductionExecutiveRuntime(
   const appSecret = await secretProvider.load(config.appId, config.secretRef);
   const transport = createBuiltInLarkTransport({
     appId: config.appId,
-    tenantKey: config.tenantKey,
     appSecret,
   });
   const larkCli = config.executables.larkCli;

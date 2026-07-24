@@ -31,6 +31,7 @@ export type {
   RuntimePairingConfig,
   RuntimePaths,
   RuntimeSecretRef,
+  RuntimeTenantBindingRequest,
   RuntimeTextReply,
   RuntimeTransport,
   MvpLarkCliRunnerFactory,

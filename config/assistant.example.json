@@ -1,7 +1,6 @@
 {
   "schemaVersion": 1,
   "appId": "__APP_ID__",
-  "tenantKey": "__TENANT_KEY__",
   "presidentOpenId": null,
   "presidentChatId": null,
   "pairing": {

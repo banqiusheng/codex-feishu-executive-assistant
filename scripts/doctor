@@ -125,8 +125,9 @@ if (!path.isAbsolute(configPath)) {
         config?.schemaVersion !== 1 ||
         typeof config?.appId !== "string" ||
         !/^cli_[A-Za-z0-9_-]{6,128}$/.test(config.appId) ||
-        typeof config?.tenantKey !== "string" ||
-        !/^[A-Za-z0-9_-]{2,128}$/.test(config.tenantKey) ||
+        (config?.tenantKey != null &&
+          (typeof config.tenantKey !== "string" ||
+            !/^[A-Za-z0-9_-]{2,128}$/.test(config.tenantKey))) ||
         !(
           (config?.presidentOpenId === null && config?.presidentChatId === null) ||
           (typeof config?.presidentOpenId === "string" &&
@@ -455,6 +456,7 @@ if (
   config &&
   exactPairingIdentifier(config.presidentOpenId) &&
   exactPairingIdentifier(config.presidentChatId) &&
+  exactPairingIdentifier(config.tenantKey) &&
   config.pairing?.enabled === false
 ) {
   add("pairing", "PASS", "总裁私聊身份已由运行配置固定绑定。");
@@ -466,7 +468,16 @@ if (
       typeof config.pairing?.codeHash === "string" &&
       /^sha256:[0-9a-f]{64}$/.test(config.pairing.codeHash)
     ) {
-      add("pairing", "WARN", "仍处于一次性配对阶段；只有配对后才能正常接单。");
+      const expiresAt = Date.parse(config.pairing?.expiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        add(
+          "pairing",
+          "FAIL",
+          "一次性配对码已过期；请重新运行 ./scripts/install --apply 获取新码。",
+        );
+      } else {
+        add("pairing", "WARN", "仍处于一次性配对阶段；只有配对后才能正常接单。");
+      }
     } else {
       add("pairing", "FAIL", "既没有总裁绑定，也没有有效配对状态。");
     }
@@ -497,7 +508,13 @@ if (
         keys.some((key, index) => key !== expectedKeys[index]) ||
         state.version !== 1 ||
         state.appId !== config.appId ||
-        state.tenantKey !== config.tenantKey ||
+        !exactPairingIdentifier(state.tenantKey) ||
+        (config.tenantKey != null &&
+          state.tenantKey !== config.tenantKey) ||
+        (config.presidentOpenId !== null &&
+          state.presidentOpenId !== config.presidentOpenId) ||
+        (config.presidentChatId !== null &&
+          state.presidentChatId !== config.presidentChatId) ||
         !exactPairingIdentifier(state.presidentOpenId) ||
         !exactPairingIdentifier(state.presidentChatId) ||
         typeof state.pairedAt !== "string" ||
@@ -505,7 +522,7 @@ if (
       ) {
         throw new Error("pairing_state_invalid");
       }
-      add("pairing", "PASS", "权限 0600 的持久配对状态已绑定到当前 App 和 Tenant。");
+      add("pairing", "PASS", "权限 0600 的持久配对状态已从可信私聊绑定到当前 App 和 Tenant。");
     } catch {
       add("pairing", "FAIL", "持久配对状态的路径、权限、schema 或身份绑定无效。");
     }

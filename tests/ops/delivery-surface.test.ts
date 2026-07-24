@@ -98,6 +98,29 @@ describe("lean delivery surface", () => {
     );
   });
 
+  it("asks installers only for the App ID while keeping the App Secret in Keychain", () => {
+    const result = runZsh(installPath, ["--help"], {
+      HOME: temporaryHome(),
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("--app-id");
+    expect(result.stdout).not.toMatch(/tenant[- ]key/i);
+    expect(result.stdout).toContain("App Secret 永远不能作为参数");
+  });
+
+  it("renews an unfinished pairing without changing completed pairing state", () => {
+    const installer = readFileSync(installPath, "utf8");
+    const doctor = readFileSync(doctorPath, "utf8");
+
+    expect(installer).toContain('canRenewPairing ? "renew-pairing"');
+    expect(installer).toContain("尚未完成总裁配对，已安全刷新一次性配对码");
+    expect(installer).toContain("不重置已完成的配对状态");
+    expect(doctor).toContain("一次性配对码已过期");
+    expect(doctor).toContain("./scripts/install --apply 获取新码");
+  });
+
   it("keeps restart non-mutating unless apply is explicitly authorized", () => {
     const plan = runZsh(restartPath, ["--plan"], {
       HOME: temporaryHome(),
@@ -158,7 +181,7 @@ describe("lean delivery surface", () => {
     const serialized = JSON.stringify(config);
 
     expect(config.schemaVersion).toBe(1);
-    expect(config.tenantKey).toBe("__TENANT_KEY__");
+    expect(config.tenantKey).toBeUndefined();
     expect(config.presidentOpenId).toBeNull();
     expect(config.presidentChatId).toBeNull();
     expect(serialized).toContain("macos-keychain");

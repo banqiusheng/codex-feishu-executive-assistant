@@ -44,11 +44,13 @@ import type {
   RuntimeConfig,
   RuntimeConfirmationCard,
   RuntimeFileReply,
+  RuntimeTenantBindingRequest,
   RuntimeTextReply,
   RuntimeTransport,
 } from "../src/types.js";
 
 const roots: string[] = [];
+const TENANT_KEY = "tenant_test_001";
 
 afterEach(async () => {
   for (const root of roots.splice(0)) {
@@ -68,6 +70,20 @@ class FakeTransport implements RuntimeTransport {
   connected = false;
   beforeTextReply: ((reply: RuntimeTextReply) => void) | undefined;
   cardEvidence: TrustedCardEvidence | null = null;
+  readonly tenantBindingRequests: RuntimeTenantBindingRequest[] = [];
+
+  async resolveTenantKey(
+    request: RuntimeTenantBindingRequest,
+  ): Promise<string> {
+    this.tenantBindingRequests.push(request);
+    if (
+      request.expectedTenantKey !== null &&
+      request.expectedTenantKey !== TENANT_KEY
+    ) {
+      throw new Error("FAKE_TENANT_MISMATCH");
+    }
+    return TENANT_KEY;
+  }
 
   onMessage(handler: (event: SdkMessageEvent) => Promise<void>): void {
     this.messageHandler = handler;
@@ -358,7 +374,10 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-async function fixtureConfig(unpaired = false): Promise<RuntimeConfig> {
+async function fixtureConfig(
+  unpaired = false,
+  includeLegacyTenantKey = true,
+): Promise<RuntimeConfig> {
   const created = await mkdtemp(join(tmpdir(), "executive-runtime-"));
   await chmod(created, 0o700);
   const root = await realpath(created);
@@ -374,7 +393,7 @@ async function fixtureConfig(unpaired = false): Promise<RuntimeConfig> {
   return parseRuntimeConfig({
     schemaVersion: 1,
     appId: "cli_test_app",
-    tenantKey: "tenant_test_001",
+    ...(includeLegacyTenantKey ? { tenantKey: TENANT_KEY } : {}),
     presidentOpenId: unpaired ? null : "ou_synthetic_president",
     presidentChatId: unpaired ? null : "oc_synthetic_private_chat",
     pairing: {
@@ -433,7 +452,7 @@ function message(
         event_id: `event-${sequence}`,
         event_type: "im.message.receive_v1",
         app_id: "cli_test_app",
-        tenant_key: "tenant_test_001",
+        tenant_key: TENANT_KEY,
       }),
       event: Object.freeze({
         sender: Object.freeze({
@@ -441,7 +460,7 @@ function message(
             open_id: senderId,
           }),
           sender_type: "user",
-          tenant_key: "tenant_test_001",
+          tenant_key: TENANT_KEY,
         }),
         message: Object.freeze({
           message_id: messageId,
@@ -466,6 +485,14 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 }
 
 describe("executive runtime offline integration", () => {
+  it("accepts a new self-built app config without a manually supplied Tenant Key", async () => {
+    const config = await fixtureConfig(true, false);
+
+    expect(config.appId).toBe("cli_test_app");
+    expect(config.tenantKey).toBeNull();
+    expect(config.pairing.enabled).toBe(true);
+  });
+
   it("persists a strict BOSS DM before ACK, runs one Codex task, saves the session, and replies", async () => {
     const config = await fixtureConfig();
     const transport = new FakeTransport();
@@ -594,7 +621,7 @@ describe("executive runtime offline integration", () => {
         .digest("hex")}` as const;
       transport.cardEvidence = Object.freeze({
         appId: config.appId,
-        tenantKey: config.tenantKey,
+        tenantKey: TENANT_KEY,
         eventId: "card-action-5",
         messageId: "confirmation-1",
         senderOpenId: "ou_synthetic_president",
@@ -724,7 +751,7 @@ describe("executive runtime offline integration", () => {
   });
 
   it("persists the first pairing and restores it without re-running completed work", async () => {
-    const config = await fixtureConfig(true);
+    const config = await fixtureConfig(true, false);
     const firstTransport = new FakeTransport();
     const firstRunner = new ImmediateRunner();
     const firstRuntime = await startExecutiveRuntime(config, {
@@ -733,6 +760,9 @@ describe("executive runtime offline integration", () => {
       larkRunnerFactory: () => new FakeLarkRunner(),
       instanceId: "runtime-pairing-first",
     });
+    expect(
+      firstTransport.tenantBindingRequests[0]?.expectedTenantKey,
+    ).toBeNull();
     await firstTransport.emitMessage(message(30, "482913"));
     expect(firstRunner.starts).toHaveLength(0);
     expect(firstTransport.textReplies.map((reply) => reply.text)).toEqual([
@@ -757,6 +787,9 @@ describe("executive runtime offline integration", () => {
       instanceId: "runtime-pairing-second",
     });
     try {
+      expect(secondTransport.tenantBindingRequests[0]?.expectedTenantKey).toBe(
+        TENANT_KEY,
+      );
       expect(secondRunner.starts).toHaveLength(0);
       await secondTransport.emitMessage(message(32, "继续补一页摘要"));
       await secondRuntime.waitForIdle();
@@ -785,7 +818,7 @@ describe("executive runtime offline integration", () => {
     store.ingestEvent(
       {
         appId: config.appId,
-        tenantKey: config.tenantKey,
+        tenantKey: TENANT_KEY,
         eventId: "pre-crash-event",
         messageId: "pre-crash-message",
         senderOpenId: "ou_synthetic_president",

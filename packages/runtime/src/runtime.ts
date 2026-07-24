@@ -276,7 +276,8 @@ async function readPairingState(
   if (
     state.version !== 1 ||
     state.appId !== config.appId ||
-    state.tenantKey !== config.tenantKey ||
+    !exactIdentifier(state.tenantKey) ||
+    (config.tenantKey !== null && state.tenantKey !== config.tenantKey) ||
     !exactIdentifier(state.presidentOpenId) ||
     !exactIdentifier(state.presidentChatId) ||
     typeof state.pairedAt !== "string" ||
@@ -287,7 +288,7 @@ async function readPairingState(
   return Object.freeze({
     version: 1,
     appId: config.appId,
-    tenantKey: config.tenantKey,
+    tenantKey: state.tenantKey,
     presidentOpenId: state.presidentOpenId,
     presidentChatId: state.presidentChatId,
     pairedAt: state.pairedAt,
@@ -558,6 +559,17 @@ export async function startExecutiveRuntime(
   let channel: BridgeChannel | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
   try {
+    const tenantKey = await dependencies.transport.resolveTenantKey(
+      Object.freeze({
+        expectedTenantKey: persistedPairing?.tenantKey ?? config.tenantKey,
+        presidentOpenId:
+          config.presidentOpenId ?? persistedPairing?.presidentOpenId ?? null,
+        presidentChatId:
+          config.presidentChatId ?? persistedPairing?.presidentChatId ?? null,
+        pairingCodeHash: config.pairing.codeHash,
+        pairingExpiresAt: config.pairing.expiresAt,
+      }),
+    );
     store = openJobStore({
       filename: config.paths.databasePath,
       instanceId,
@@ -574,7 +586,7 @@ export async function startExecutiveRuntime(
     if (boundPresidentOpenId !== null && boundPresidentChatId !== null) {
       store.bindPrincipal({
         appId: config.appId,
-        tenantKey: config.tenantKey,
+        tenantKey,
         presidentOpenId: boundPresidentOpenId,
         presidentChatId: boundPresidentChatId,
         pairedAt: now(),
@@ -586,7 +598,7 @@ export async function startExecutiveRuntime(
     );
     let policy: AccessPolicy = Object.freeze({
       appId: config.appId,
-      tenantKey: config.tenantKey,
+      tenantKey,
       presidentOpenId:
         config.presidentOpenId ?? persistedPairing?.presidentOpenId ?? null,
       presidentChatId:
@@ -1101,7 +1113,7 @@ export async function startExecutiveRuntime(
           const next: PairingState = Object.freeze({
             version: 1,
             appId: config.appId,
-            tenantKey: config.tenantKey,
+            tenantKey,
             presidentOpenId: raw.metadata.senderOpenId,
             presidentChatId: raw.metadata.chatId,
             pairedAt: raw.receivedAt,
@@ -1128,14 +1140,14 @@ export async function startExecutiveRuntime(
           }
           store?.bindPrincipal({
             appId: config.appId,
-            tenantKey: config.tenantKey,
+            tenantKey,
             presidentOpenId: next.presidentOpenId,
             presidentChatId: next.presidentChatId,
             pairedAt: now(),
           });
           policy = Object.freeze({
             appId: config.appId,
-            tenantKey: config.tenantKey,
+            tenantKey,
             presidentOpenId: next.presidentOpenId,
             presidentChatId: next.presidentChatId,
             pairing: Object.freeze({ active: false, codeHash: null }),
@@ -1444,7 +1456,7 @@ export async function startExecutiveRuntime(
 
     channel = await startChannel({
       appId: config.appId,
-      tenantKey: config.tenantKey,
+      tenantKey,
       runtime: runtimePorts,
       sourceFactory: () => sourceProjection(dependencies.transport),
       cardEvidenceVerifier: Object.freeze({
@@ -1518,7 +1530,11 @@ export async function startExecutiveRuntime(
     });
   } catch (cause) {
     if (heartbeat) clearInterval(heartbeat);
-    await channel?.disconnect().catch(() => undefined);
+    if (channel) {
+      await channel.disconnect().catch(() => undefined);
+    } else {
+      await dependencies.transport.disconnect().catch(() => undefined);
+    }
     store?.releaseRuntimeLease("bridge", instanceId);
     store?.close();
     await lock.release().catch(() => undefined);

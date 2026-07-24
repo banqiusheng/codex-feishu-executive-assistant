@@ -7,7 +7,7 @@
 - Mac mini 已登录总裁的专用 macOS 账号，并保持供电、联网和唤醒。
 - 已安装 Node.js 22 LTS、Corepack 和 Xcode Command Line Tools。
 - 已安装并登录 Codex CLI。
-- 已准备飞书自建应用的 App ID、Tenant Key 和 App Secret。
+- 已准备飞书自建应用的 App ID 和 App Secret；不需要手工查找 Tenant Key。
 - 飞书应用已启用机器人、长连接和私聊消息事件，并完成版本发布与管理员审批。
 - App Secret 不要粘贴到聊天、配置文件或命令行参数中。
 
@@ -27,7 +27,7 @@
 7. 精确核验并安装 `visual-first-ppt v0.3.0`，不覆盖来源不一致的已有安装；
 8. 引导完成专用 Codex 登录，并把 Bot App Secret 通过 Keychain 自身的安全输入写入 macOS Keychain；
 9. 初始化机器人专用飞书 CLI，并由总裁本人完成日历、通讯录和妙记用户授权；
-10. 生成含 Tenant Key、但不含任何 Secret 的运行配置；
+10. 生成不含任何 Secret 的运行配置；总裁发送正确的一次性私聊配对码后，程序从可信事件自动绑定企业标识；
 11. 注册一个用户级 LaunchAgent，使服务登录后自动启动、异常退出后自动拉起。
 
 `imagegen` 是 Codex 会话级系统能力，不会因为安装 Presentations 插件就自动出现在空的专用 Home。安装器不会复制系统 Skill 或伪造可用性；`doctor` 会保持 `WARN`，直到目标 Mac mini 的新 Codex 任务真实确认 `Presentations` 和 `imagegen` 都已暴露并完成一次 PPT 验收。

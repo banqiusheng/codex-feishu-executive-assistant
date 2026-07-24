@@ -30,6 +30,11 @@ cd codex-feishu-executive-assistant
 ./scripts/install --apply
 ```
 
+飞书自建应用只需准备 App ID 和 App Secret。安装程序不会索要 Tenant Key；
+企业标识会在总裁发送正确的一次性私聊配对码时，由可信事件自动绑定并持久化。
+App Secret 仍只在 macOS Keychain 的安全提示中输入。
+如果配对码过期或遗失，重新运行 `./scripts/install --apply` 会在尚未配对时安全刷新新码。
+
 也可以直接把下面这句话交给 Codex：
 
 > 请读取本仓库的 AGENTS.md 和 BOOTSTRAP.md，先运行 `./scripts/install --plan`，确认无误后在交互终端运行 `./scripts/install --apply`。App Secret 只在 macOS Keychain 的安全提示中输入，不要写进聊天或文件。

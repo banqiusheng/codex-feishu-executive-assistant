@@ -179,7 +179,7 @@ export function parseRuntimeConfig(value: unknown): RuntimeConfig {
   if (value.schemaVersion !== 1) return invalid("schemaVersion");
 
   const appId = exactIdentifier(value.appId, "appId") as string;
-  const tenantKey = exactIdentifier(value.tenantKey, "tenantKey") as string;
+  const tenantKey = exactIdentifier(value.tenantKey ?? null, "tenantKey", true);
   const presidentOpenId = exactIdentifier(
     value.presidentOpenId,
     "presidentOpenId",

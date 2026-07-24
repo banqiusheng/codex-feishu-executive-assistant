@@ -17,7 +17,6 @@ readonly KEYCHAIN_SERVICE="com.codex-feishu-executive-assistant.bot"
 
 typeset mode="auto"
 typeset app_id=""
-typeset tenant_key=""
 typeset pairing_code=""
 typeset pairing_hash=""
 typeset pairing_expires_at=""
@@ -27,14 +26,13 @@ usage() {
   print -r -- "用法："
   print -r -- "  ./scripts/install --plan"
   print -r -- "  ./scripts/install --verify-only"
-  print -r -- "  ./scripts/install --apply [--app-id cli_xxx] [--tenant-key TENANT_KEY]"
+  print -r -- "  ./scripts/install --apply [--app-id cli_xxx]"
   print -r -- ""
   print -r -- "说明："
   print -r -- "  --plan         只显示计划，不修改电脑。"
   print -r -- "  --verify-only  只校验仓库锁和交付文件，不修改电脑。"
   print -r -- "  --apply        执行安装；Keychain 和 LaunchAgent 只在此模式变更。"
   print -r -- "  --app-id       可提前给出非秘密 App ID；App Secret 永远不能作为参数。"
-  print -r -- "  --tenant-key   可提前给出非秘密 Tenant Key；也可在安装时输入。"
 }
 
 die() {
@@ -79,11 +77,6 @@ while (( $# > 0 )); do
     --app-id)
       (( $# >= 2 )) || die "--app-id 缺少值。" 64
       app_id="$2"
-      shift 2
-      ;;
-    --tenant-key)
-      (( $# >= 2 )) || die "--tenant-key 缺少值。" 64
-      tenant_key="$2"
       shift 2
       ;;
     --help|-h)
@@ -272,12 +265,6 @@ if [[ -z "${app_id}" ]]; then
 fi
 [[ "${app_id}" =~ '^cli_[A-Za-z0-9_-]{6,128}$' ]] ||
   die "App ID 格式不正确，应以 cli_ 开头。"
-if [[ -z "${tenant_key}" ]]; then
-  print -n -r -- "请输入飞书 Tenant Key（不是 App Secret）："
-  IFS= read -r tenant_key
-fi
-[[ "${tenant_key}" =~ '^[A-Za-z0-9_-]{2,128}$' ]] ||
-  die "Tenant Key 格式不正确，只能包含字母、数字、下划线或连字符。"
 
 typeset corepack_executable="${commands[corepack]:-}"
 typeset codex_executable="${commands[codex]:-}"
@@ -739,19 +726,38 @@ fi
 lark_user_auth_is_healthy ||
   die "飞书用户授权健康检查未通过。"
 
+generate_pairing_contract() {
+  typeset -a generated
+  generated=("${(@f)$(
+    "${node_executable}" --input-type=module <<'NODE'
+import { createHash, randomBytes } from "node:crypto";
+const code = randomBytes(8).toString("hex").toUpperCase();
+const hash = `sha256:${createHash("sha256").update(code, "utf8").digest("hex")}`;
+const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+process.stdout.write(`${code}\n${hash}\n${expiresAt}\n`);
+NODE
+  )}")
+  (( ${#generated[@]} == 3 )) || die "无法生成一次性配对码。"
+  pairing_code="${generated[1]}"
+  pairing_hash="${generated[2]}"
+  pairing_expires_at="${generated[3]}"
+}
+
 if [[ -e "${config_path}" ]]; then
   [[ -f "${config_path}" && ! -L "${config_path}" ]] ||
     die "已有运行配置不是可信普通文件。"
   /bin/chmod 0600 "${config_path}"
-  "${node_executable}" --input-type=module - \
-    "${config_path}" "${app_id}" "${tenant_key}" "${lark_home}" \
+  typeset existing_config_state
+  existing_config_state="$("${node_executable}" --input-type=module - \
+    "${config_path}" "${app_id}" "${runtime_root}" "${lark_home}" \
     "${lark_cli_executable}" \
     "${presentations_plugin_version}" <<'NODE'
 import fs from "node:fs";
+import path from "node:path";
 const [
   configPath,
   expectedAppId,
-  expectedTenantKey,
+  expectedRuntimeRoot,
   expectedLarkHome,
   expectedLarkCli,
   expectedPresentationsVersion,
@@ -760,7 +766,10 @@ const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 if (
   config.schemaVersion !== 1 ||
   config.appId !== expectedAppId ||
-  config.tenantKey !== expectedTenantKey ||
+  (config.tenantKey != null &&
+    (typeof config.tenantKey !== "string" ||
+      !/^[A-Za-z0-9_-]{2,128}$/.test(config.tenantKey))) ||
+  config.paths?.runtimeRoot !== expectedRuntimeRoot ||
   config.paths?.larkHome !== expectedLarkHome ||
   config.executables?.larkCli !== expectedLarkCli ||
   config.visualFirstPpt?.presentationsPlugin?.id !==
@@ -774,28 +783,67 @@ const serialized = JSON.stringify(config);
 if (/"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/.test(serialized)) {
   throw new Error("existing_config_contains_secret_field");
 }
+const pairingPath = path.join(expectedRuntimeRoot, "pairing.json");
+const canRenewPairing =
+  config.presidentOpenId === null &&
+  config.presidentChatId === null &&
+  config.pairing?.enabled === true &&
+  !fs.existsSync(pairingPath);
+process.stdout.write(canRenewPairing ? "renew-pairing" : "preserve");
 NODE
-  note "已有同 App ID 配置保持不变，不重置配对状态。"
+  )" || die "已有运行配置与本次安装身份不一致。"
+  if [[ "${existing_config_state}" == "renew-pairing" ]]; then
+    generate_pairing_contract
+    PAIRING_HASH="${pairing_hash}" \
+    PAIRING_EXPIRES_AT="${pairing_expires_at}" \
+      "${node_executable}" --input-type=module - "${config_path}" <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+
+const [target] = process.argv.slice(2);
+const config = JSON.parse(fs.readFileSync(target, "utf8"));
+if (
+  config.presidentOpenId !== null ||
+  config.presidentChatId !== null ||
+  config.pairing?.enabled !== true
+) {
+  throw new Error("pairing_state_no_longer_renewable");
+}
+config.pairing = {
+  ...config.pairing,
+  enabled: true,
+  codeHash: process.env.PAIRING_HASH,
+  expiresAt: process.env.PAIRING_EXPIRES_AT,
+};
+const serialized = `${JSON.stringify(config, null, 2)}\n`;
+const temp = path.join(path.dirname(target), `.assistant.json.${process.pid}.tmp`);
+const fd = fs.openSync(temp, "wx", 0o600);
+try {
+  fs.writeFileSync(fd, serialized, "utf8");
+  fs.fsyncSync(fd);
+} finally {
+  fs.closeSync(fd);
+}
+try {
+  fs.renameSync(temp, target);
+} catch (error) {
+  fs.rmSync(temp, { force: true });
+  throw error;
+}
+NODE
+    /bin/chmod 0600 "${config_path}"
+    note "尚未完成总裁配对，已安全刷新一次性配对码。"
+  else
+    [[ "${existing_config_state}" == "preserve" ]] ||
+      die "已有运行配置状态无法识别。"
+    note "已有同 App ID 配置保持不变，不重置已完成的配对状态。"
+  fi
 else
-  typeset -a pairing_contract
-  pairing_contract=("${(@f)$(
-    "${node_executable}" --input-type=module <<'NODE'
-import { createHash, randomBytes } from "node:crypto";
-const code = randomBytes(8).toString("hex").toUpperCase();
-const hash = `sha256:${createHash("sha256").update(code, "utf8").digest("hex")}`;
-const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-process.stdout.write(`${code}\n${hash}\n${expiresAt}\n`);
-NODE
-  )}")
-  (( ${#pairing_contract[@]} == 3 )) || die "无法生成一次性配对码。"
-  pairing_code="${pairing_contract[1]}"
-  pairing_hash="${pairing_contract[2]}"
-  pairing_expires_at="${pairing_contract[3]}"
+  generate_pairing_contract
 
   CONFIG_TEMPLATE_PATH="${CONFIG_TEMPLATE}" \
   CONFIG_PATH="${config_path}" \
   APP_ID="${app_id}" \
-  TENANT_KEY="${tenant_key}" \
   PAIRING_HASH="${pairing_hash}" \
   PAIRING_EXPIRES_AT="${pairing_expires_at}" \
   ASSISTANT_ROOT="${assistant_root}" \
@@ -821,7 +869,6 @@ import path from "node:path";
 const template = JSON.parse(fs.readFileSync(process.env.CONFIG_TEMPLATE_PATH, "utf8"));
 const replacements = new Map([
   ["__APP_ID__", process.env.APP_ID],
-  ["__TENANT_KEY__", process.env.TENANT_KEY],
   ["__PAIRING_CODE_HASH__", process.env.PAIRING_HASH],
   ["__PAIRING_EXPIRES_AT__", process.env.PAIRING_EXPIRES_AT],
   ["__ASSISTANT_ROOT__", process.env.ASSISTANT_ROOT],

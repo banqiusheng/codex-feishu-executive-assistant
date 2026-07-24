@@ -12,11 +12,12 @@ import type {
   SdkMessageEvent,
   TrustedCardEvidence,
 } from "@executive-assistant/bridge";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 import type {
   RuntimeConfirmationCard,
   RuntimeFileReply,
+  RuntimeTenantBindingRequest,
   RuntimeTextReply,
   RuntimeTransport,
 } from "./types.js";
@@ -25,13 +26,104 @@ type CreateLarkChannel = (options: LarkChannelOptions) => LarkChannel;
 
 export type BuiltInLarkTransportOptions = Readonly<{
   appId: string;
-  tenantKey: string;
   appSecret: string;
   createChannel?: CreateLarkChannel;
 }>;
 
+const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const IDENTIFIER_MAX_LENGTH = 512;
+const MAX_BUFFERED_MESSAGES = 32;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isExactIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= IDENTIFIER_MAX_LENGTH &&
+    value === value.trim() &&
+    !value.includes("\0")
+  );
+}
+
+function rawTenantKey(message: NormalizedMessage): string | null {
+  if (!isRecord(message.raw) || !isRecord(message.raw.sender)) return null;
+  const tenantKey = message.raw.sender.tenant_key;
+  return isExactIdentifier(tenantKey) ? tenantKey : null;
+}
+
+function pairingCodeMatches(value: unknown, expectedHash: string): boolean {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 256 ||
+    value !== value.trim() ||
+    !SHA256_PATTERN.test(expectedHash)
+  ) {
+    return false;
+  }
+  const actual = createHash("sha256").update(value, "utf8").digest();
+  const expected = Buffer.from(expectedHash.slice("sha256:".length), "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function snapshotTenantBindingRequest(
+  value: RuntimeTenantBindingRequest,
+): RuntimeTenantBindingRequest {
+  const expectedTenantKey = value.expectedTenantKey;
+  const presidentOpenId = value.presidentOpenId;
+  const presidentChatId = value.presidentChatId;
+  const pairingCodeHash = value.pairingCodeHash;
+  const pairingExpiresAt = value.pairingExpiresAt;
+  const expected =
+    expectedTenantKey === null || isExactIdentifier(expectedTenantKey);
+  const hasPresident =
+    isExactIdentifier(presidentOpenId) && isExactIdentifier(presidentChatId);
+  const noPresident = presidentOpenId === null && presidentChatId === null;
+  const hasPairing =
+    typeof pairingCodeHash === "string" &&
+    SHA256_PATTERN.test(pairingCodeHash) &&
+    typeof pairingExpiresAt === "string" &&
+    Number.isFinite(Date.parse(pairingExpiresAt));
+  const noPairing = pairingCodeHash === null && pairingExpiresAt === null;
+  if (
+    !expected ||
+    !(
+      expectedTenantKey !== null ||
+      (hasPresident && noPairing) ||
+      (noPresident && hasPairing)
+    )
+  ) {
+    throw new Error("LARK_TENANT_BINDING_INVALID");
+  }
+  return Object.freeze({
+    expectedTenantKey,
+    presidentOpenId,
+    presidentChatId,
+    pairingCodeHash,
+    pairingExpiresAt,
+  });
+}
+
+function matchesTenantBinding(
+  message: NormalizedMessage,
+  request: RuntimeTenantBindingRequest,
+): boolean {
+  if (message.chatType !== "p2p") return false;
+  if (request.presidentOpenId !== null && request.presidentChatId !== null) {
+    return (
+      message.senderId === request.presidentOpenId &&
+      message.chatId === request.presidentChatId
+    );
+  }
+  return (
+    request.pairingCodeHash !== null &&
+    request.pairingExpiresAt !== null &&
+    Date.now() <= Date.parse(request.pairingExpiresAt) &&
+    pairingCodeMatches(message.content, request.pairingCodeHash)
+  );
 }
 
 function canonicalJson(value: unknown): string {
@@ -142,14 +234,29 @@ function rawMessageEvent(
   });
 }
 
+function sdkMessageEvent(
+  message: NormalizedMessage,
+  appId: string,
+  tenantKey: string,
+): SdkMessageEvent | null {
+  const raw = rawMessageEvent(message, appId, tenantKey);
+  if (raw === null) return null;
+  return Object.freeze({
+    messageId: message.messageId,
+    chatId: message.chatId,
+    chatType: message.chatType,
+    senderId: message.senderId,
+    createTime: message.createTime,
+    content: message.content,
+    resources: Object.freeze([...message.resources]),
+    raw,
+  });
+}
+
 export function createBuiltInLarkTransport(
   options: BuiltInLarkTransportOptions,
 ): RuntimeTransport {
-  if (
-    options.appId.length === 0 ||
-    options.tenantKey.length === 0 ||
-    options.appSecret.length === 0
-  ) {
+  if (options.appId.length === 0 || options.appSecret.length === 0) {
     throw new Error("LARK_TRANSPORT_CONFIG_INVALID");
   }
   const createChannel = options.createChannel ?? createLarkChannel;
@@ -170,26 +277,76 @@ export function createBuiltInLarkTransport(
   let lifecycleHandler:
     | ((state: LifecycleState, detail?: unknown) => void)
     | undefined;
+  let boundTenantKey: string | undefined;
+  const bufferedMessages: SdkMessageEvent[] = [];
+  let messageDeliveryTail: Promise<void> = Promise.resolve();
+  let connected = false;
+  let connectPromise: Promise<void> | undefined;
+  let tenantResolution:
+    | {
+        request: RuntimeTenantBindingRequest;
+        promise: Promise<string>;
+        resolve: (tenantKey: string) => void;
+      }
+    | undefined;
   const cardEvidence = new Map<string, TrustedCardEvidence>();
 
+  const deliverMessage = (event: SdkMessageEvent): Promise<void> => {
+    const handler = messageHandler;
+    if (!handler) return Promise.resolve();
+    const delivery = messageDeliveryTail.then(() => handler(event));
+    messageDeliveryTail = delivery.catch(() => undefined);
+    return delivery;
+  };
+
+  const bufferMessage = (event: SdkMessageEvent): void => {
+    if (bufferedMessages.length < MAX_BUFFERED_MESSAGES) {
+      bufferedMessages.push(event);
+    }
+  };
+
+  const ensureConnected = (): Promise<void> => {
+    if (connectPromise) return connectPromise;
+    lifecycleHandler?.("WS_CONNECTING");
+    connectPromise = channel
+      .connect()
+      .then(() => {
+        connected = true;
+        lifecycleHandler?.("WS_CONNECTED");
+      })
+      .catch((cause) => {
+        lifecycleHandler?.("WS_ERROR", cause);
+        throw cause;
+      });
+    return connectPromise;
+  };
+
   channel.on("message", async (message: NormalizedMessage) => {
-    const raw = rawMessageEvent(message, options.appId, options.tenantKey);
-    if (!messageHandler || raw === null) return;
-    await messageHandler(
-      Object.freeze({
-        messageId: message.messageId,
-        chatId: message.chatId,
-        chatType: message.chatType,
-        senderId: message.senderId,
-        createTime: message.createTime,
-        content: message.content,
-        resources: Object.freeze([...message.resources]),
-        raw,
-      }),
-    );
+    const candidateTenantKey = rawTenantKey(message);
+    if (candidateTenantKey === null) return;
+    if (boundTenantKey === undefined) {
+      const pending = tenantResolution;
+      if (!pending || !matchesTenantBinding(message, pending.request)) {
+        return;
+      }
+      const event = sdkMessageEvent(message, options.appId, candidateTenantKey);
+      if (event === null) return;
+      boundTenantKey = candidateTenantKey;
+      bufferMessage(event);
+      pending.resolve(candidateTenantKey);
+      return;
+    }
+    const event = sdkMessageEvent(message, options.appId, boundTenantKey);
+    if (event === null) return;
+    if (!messageHandler) {
+      bufferMessage(event);
+      return;
+    }
+    await deliverMessage(event);
   });
   channel.on("cardAction", async (event: CardActionEvent) => {
-    if (!cardHandler) return;
+    const tenantKey = boundTenantKey;
+    if (!cardHandler || tenantKey === undefined) return;
     const action = Object.freeze({
       value: event.action.value,
       tag: event.action.tag,
@@ -218,7 +375,7 @@ export function createBuiltInLarkTransport(
       evidenceKey,
       Object.freeze({
         appId: options.appId,
-        tenantKey: options.tenantKey,
+        tenantKey,
         eventId,
         messageId: event.messageId,
         senderOpenId: event.operator.openId,
@@ -255,27 +412,84 @@ export function createBuiltInLarkTransport(
   });
 
   return Object.freeze({
-    onMessage(handler: (event: SdkMessageEvent) => Promise<void>) {
+    async resolveTenantKey(request: RuntimeTenantBindingRequest) {
+      const stableRequest = snapshotTenantBindingRequest(request);
+      if (boundTenantKey !== undefined) {
+        if (
+          stableRequest.expectedTenantKey !== null &&
+          stableRequest.expectedTenantKey !== boundTenantKey
+        ) {
+          throw new Error("LARK_TENANT_BINDING_MISMATCH");
+        }
+        return boundTenantKey;
+      }
+      if (stableRequest.expectedTenantKey !== null) {
+        boundTenantKey = stableRequest.expectedTenantKey;
+        return boundTenantKey;
+      }
+      if (!tenantResolution) {
+        let resolveTenant!: (tenantKey: string) => void;
+        const promise = new Promise<string>((resolve) => {
+          resolveTenant = resolve;
+        });
+        tenantResolution = {
+          request: stableRequest,
+          promise,
+          resolve: resolveTenant,
+        };
+      }
+      try {
+        await ensureConnected();
+      } catch {
+        tenantResolution = undefined;
+        throw new Error("LARK_TENANT_BINDING_FAILED");
+      }
+      const pending = tenantResolution;
+      const expiresAt = pending.request.pairingExpiresAt;
+      if (expiresAt === null) return pending.promise;
+      const remainingMs = Date.parse(expiresAt) - Date.now();
+      if (remainingMs <= 0) {
+        tenantResolution = undefined;
+        throw new Error("LARK_TENANT_BINDING_EXPIRED");
+      }
+      let expiryTimer: NodeJS.Timeout | undefined;
+      try {
+        const resolved = await Promise.race([
+          pending.promise,
+          new Promise<never>((_resolve, reject) => {
+            expiryTimer = setTimeout(
+              () => reject(new Error("LARK_TENANT_BINDING_EXPIRED")),
+              Math.min(remainingMs, 2_147_483_647),
+            );
+          }),
+        ]);
+        if (tenantResolution === pending) tenantResolution = undefined;
+        return resolved;
+      } catch (cause) {
+        if (tenantResolution === pending) tenantResolution = undefined;
+        throw cause;
+      } finally {
+        if (expiryTimer) clearTimeout(expiryTimer);
+      }
+    },
+    async onMessage(handler: (event: SdkMessageEvent) => Promise<void>) {
       messageHandler = handler;
+      const pending = bufferedMessages.splice(0);
+      await Promise.all(pending.map((event) => deliverMessage(event)));
     },
     onCardAction(handler: (event: SdkCardActionEvent) => Promise<void>) {
       cardHandler = handler;
     },
     onLifecycle(handler: (state: LifecycleState, detail?: unknown) => void) {
       lifecycleHandler = handler;
+      if (connected) handler("WS_CONNECTED");
     },
     async connect() {
-      lifecycleHandler?.("WS_CONNECTING");
-      try {
-        await channel.connect();
-        lifecycleHandler?.("WS_CONNECTED");
-      } catch (cause) {
-        lifecycleHandler?.("WS_ERROR", cause);
-        throw cause;
-      }
+      await ensureConnected();
     },
     async disconnect() {
-      await channel.disconnect();
+      if (connectPromise) await channel.disconnect();
+      connected = false;
       lifecycleHandler?.("WS_DISCONNECTED");
     },
     async sendText(reply: RuntimeTextReply) {

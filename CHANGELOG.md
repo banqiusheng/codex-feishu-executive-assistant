@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- 移除飞书自建应用安装时手工填写 Tenant Key 的多余门槛；新安装只需要 App ID 和通过 macOS Keychain 输入的 App Secret，企业标识由正确的一次性私聊配对事件自动绑定并持久化，旧的预绑定配置继续兼容；配对码过期或遗失时可重跑安装安全刷新，配对后紧接发送的首条指令也会按序缓冲处理。
 - 修复 GitHub Actions 中 Gitleaks 临时 SARIF 报告被 Prettier 当作项目文件检查，导致首次公开 `main` CI 误报失败。
 - 修复 GitHub Actions 未启用 Corepack shim，导致 pnpm 生命周期脚本在干净 runner 中找不到 `pnpm`。
 - 补齐 runtime 类型检查的 workspace 依赖构建前置项，避免本机旧 `dist` 缓存掩盖干净检出失败。
