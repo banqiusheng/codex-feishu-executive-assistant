@@ -210,6 +210,8 @@ describe("lean delivery surface", () => {
       visualFirstPpt?: {
         license?: string;
         licenseSha256?: string;
+        skillPath?: string;
+        skillTreeSha?: string;
       };
     };
     const packageManifest = JSON.parse(
@@ -237,7 +239,35 @@ describe("lean delivery surface", () => {
     expect(lock.visualFirstPpt).toMatchObject({
       license: "MIT",
       licenseSha256: createHash("sha256").update(pptLicense).digest("hex"),
+      skillPath: "skills/visual-first-ppt",
+      skillTreeSha: "b2fc38bcd1c1d36f18f47543aa63abd1c7e13eba",
     });
+  });
+
+  it("installs the pinned visual-first-ppt skill subtree and only recoverably migrates the legacy whole-repository layout", () => {
+    const installer = readFileSync(installPath, "utf8");
+    const doctor = readFileSync(doctorPath, "utf8");
+
+    expect(installer).toContain(
+      'rev-parse "${ppt_contract[2]}:${ppt_contract[6]}"',
+    );
+    expect(installer).toContain(
+      'archive "${ppt_contract[2]}" -- "${ppt_contract[6]}"',
+    );
+    expect(installer).toContain("--strip-components 2");
+    expect(installer).toContain(
+      '"${ppt_skill_root}/skills/visual-first-ppt/SKILL.md"',
+    );
+    expect(installer).toContain("visual-first-ppt-legacy.");
+    expect(installer).toContain("不会直接删除");
+    expect(installer).toContain("visual-first-ppt-failed-migration");
+    expect(installer).toContain("ppt_install_receipt_shape");
+    expect(installer).not.toContain('/bin/rm -rf "${ppt_skill_root}"');
+    expect(doctor).toContain("schemaVersion: 2");
+    expect(doctor).toContain('skillPath: "skills/visual-first-ppt"');
+    expect(doctor).toContain(
+      'skillTreeSha: "b2fc38bcd1c1d36f18f47543aa63abd1c7e13eba"',
+    );
   });
 
   it("delegates PPT production and forbids raw Feishu execution in the assistant skill", () => {
@@ -328,20 +358,40 @@ describe("lean delivery surface", () => {
   it("configures and verifies the dedicated Feishu user authorization", () => {
     const installer = readFileSync(installPath, "utf8");
     const doctor = readFileSync(doctorPath, "utf8");
+    const requiredUserScopes = [
+      "calendar:calendar.event:create",
+      "calendar:calendar.event:update",
+      "contact:user:search",
+      "minutes:minutes.search:read",
+      "minutes:minutes.basic:read",
+      "minutes:minutes.artifacts:read",
+    ];
 
     expect(installer).toContain(
       'readonly lark_home="${runtime_root}/lark-home"',
     );
     expect(installer).toContain('readonly lark_profile="executive-assistant"');
     expect(installer).toContain("config strict-mode off");
-    expect(installer).toContain("auth login --domain calendar,contact,minutes");
+    for (const scope of requiredUserScopes) {
+      expect(installer).toContain(scope);
+      expect(doctor).toContain(scope);
+    }
+    expect(installer).not.toContain("auth login --domain");
+    expect(installer).toContain("auth scopes --json");
     expect(installer).toContain("auth status --json --verify");
-    expect(installer).toContain("if (result?.ok !== true) process.exit(2)");
-    expect(doctor).toContain(
-      '["--profile", "executive-assistant", "auth", "status", "--json"]',
+    expect(installer).toContain("auth check --scope");
+    expect(installer).toContain('result?.identity !== "user"');
+    expect(installer).toContain("result?.verified !== true");
+    expect(installer).toContain("result?.identities?.user?.verified !== true");
+    expect(installer).toContain(
+      "result?.missing == null ? [] : result.missing",
     );
-    expect(doctor).not.toContain(
-      '["--profile", "executive-assistant", "auth", "status", "--json", "--verify"]',
-    );
+    expect(installer).toContain('if [[ -n "${missing_app_scope_output}" ]]');
+    expect(installer).toContain('if [[ -n "${missing_user_scope_output}" ]]');
+    expect(installer).toContain("auth login --scope");
+    expect(doctor).toMatch(/"auth",\s*"status",\s*"--json",\s*"--verify"/);
+    expect(doctor).toMatch(/"auth",\s*"check",\s*"--scope"/);
+    expect(doctor).toMatch(/"auth",\s*"scopes",\s*"--json"/);
+    expect(doctor).toContain("report?.missing == null ? [] : report.missing");
   });
 });

@@ -53,6 +53,8 @@
     "tagObjectSha": "4962eb9bd5c55e8384b5228993c241b2220fcabb",
     "commitSha": "bb775f68f951c3e444d00623bc88976b20c13e7d",
     "treeSha": "5ad18d178e8191105dcc68717e4639d3a68f0c73",
+    "skillPath": "skills/visual-first-ppt",
+    "skillTreeSha": "b2fc38bcd1c1d36f18f47543aa63abd1c7e13eba",
     "license": "MIT",
     "licenseSha256": "947212107746594a12e5a1b5b3cab1a0c2f5d46b0a1ab5d438c4938adaf5d04e"
   },

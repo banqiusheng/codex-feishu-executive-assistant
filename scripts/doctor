@@ -20,13 +20,23 @@ import { createHash } from "node:crypto";
 const LABEL = "com.codex-feishu.executive-assistant";
 const KEYCHAIN_SERVICE = "com.codex-feishu-executive-assistant.bot";
 const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime";
+const REQUIRED_USER_SCOPES = Object.freeze([
+  "calendar:calendar.event:create",
+  "calendar:calendar.event:update",
+  "contact:user:search",
+  "minutes:minutes.search:read",
+  "minutes:minutes.basic:read",
+  "minutes:minutes.artifacts:read",
+]);
 const EXPECTED_PPT = Object.freeze({
-  schemaVersion: 1,
+  schemaVersion: 2,
   repository: "https://github.com/banqiusheng/visual-first-ppt.git",
   tag: "v0.3.0",
   tagObjectSha: "4962eb9bd5c55e8384b5228993c241b2220fcabb",
   commitSha: "bb775f68f951c3e444d00623bc88976b20c13e7d",
   treeSha: "5ad18d178e8191105dcc68717e4639d3a68f0c73",
+  skillPath: "skills/visual-first-ppt",
+  skillTreeSha: "b2fc38bcd1c1d36f18f47543aa63abd1c7e13eba",
 });
 const EXPECTED_LARK_CLI = Object.freeze({
   package: "@larksuite/cli",
@@ -372,27 +382,94 @@ if (
 }
 
 if (!larkCliVerified || typeof larkHome !== "string") {
+  add("app-user-scopes", "FAIL", "无法在可信飞书 CLI 环境中核验应用层 MVP 用户权限。");
   add("user-oauth", "FAIL", "无法在可信飞书 CLI 环境中核验总裁用户授权。");
 } else {
-  const result = run(
+  const larkEnvironment = {
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+    HOME: larkHome,
+    LANG: "C",
+    LC_ALL: "C",
+  };
+  const appScopeResult = run(
     larkCliExecutable,
-    ["--profile", "executive-assistant", "auth", "status", "--json"],
+    ["--profile", "executive-assistant", "auth", "scopes", "--json"],
+    { env: larkEnvironment },
+  );
+  let appScopesHealthy = false;
+  try {
+    const report = JSON.parse(appScopeResult.stdout);
+    const enabled = new Set(report?.userScopes);
+    appScopesHealthy =
+      appScopeResult.status === 0 &&
+      Array.isArray(report?.userScopes) &&
+      REQUIRED_USER_SCOPES.every((scope) => enabled.has(scope));
+  } catch {
+    appScopesHealthy = false;
+  }
+  add(
+    "app-user-scopes",
+    appScopesHealthy ? "PASS" : "FAIL",
+    appScopesHealthy
+      ? "飞书应用层 6 项 MVP 用户权限已生效。"
+      : "飞书应用层缺少 MVP 用户权限；请发布并批准应用版本后重跑安装。",
+  );
+
+  const statusResult = run(
+    larkCliExecutable,
+    [
+      "--profile",
+      "executive-assistant",
+      "auth",
+      "status",
+      "--json",
+      "--verify",
+    ],
+    { env: larkEnvironment },
+  );
+  let identityHealthy = false;
+  try {
+    const report = JSON.parse(statusResult.stdout);
+    identityHealthy =
+      statusResult.status === 0 &&
+      report?.identity === "user" &&
+      report?.verified === true &&
+      report?.identities?.user?.available === true &&
+      report?.identities?.user?.verified === true &&
+      report?.identities?.user?.status === "ready" &&
+      report?.identities?.user?.tokenStatus === "valid";
+  } catch {
+    identityHealthy = false;
+  }
+
+  const scopeResult = run(
+    larkCliExecutable,
+    [
+      "--profile",
+      "executive-assistant",
+      "auth",
+      "check",
+      "--scope",
+      REQUIRED_USER_SCOPES.join(" "),
+      "--json",
+    ],
     {
-      env: {
-        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
-        HOME: larkHome,
-        LANG: "C",
-        LC_ALL: "C",
-      },
+      env: larkEnvironment,
     },
   );
-  let healthy = false;
+  let scopesHealthy = false;
   try {
-    const report = JSON.parse(result.stdout);
-    healthy = result.status === 0 && report?.ok === true;
+    const report = JSON.parse(scopeResult.stdout);
+    const missing = report?.missing == null ? [] : report.missing;
+    scopesHealthy =
+      scopeResult.status === 0 &&
+      report?.ok === true &&
+      Array.isArray(missing) &&
+      missing.length === 0;
   } catch {
-    healthy = false;
+    scopesHealthy = false;
   }
+  const healthy = identityHealthy && scopesHealthy;
   add(
     "user-oauth",
     healthy ? "PASS" : "FAIL",

@@ -6,6 +6,8 @@
 
 ### Fixed
 
+- 修复安装器与只读 doctor 错把 `lark-cli 1.0.72 auth status` 的真实用户身份结构当作旧 `ok` 字段读取：现在同时核验应用层与当前用户的 6 项 MVP 权限、用户身份及令牌有效性；已有有效授权只会通过 `auth check` 计算差额并申请缺失项，不会扩大权限。本次实机重跑预期仅增量申请 `calendar:calendar.event:create` 和 `calendar:calendar.event:update`。
+- 修复安装器把 `visual-first-ppt v0.3.0` 整个仓库放进 Skill 根目录，导致 Codex 找不到根 `SKILL.md`：现在额外锁定并核验 `skills/visual-first-ppt` 子树，只安装该子目录；对安装器早期生成且内容精确匹配的旧布局执行可恢复迁移，旧目录进入权限 `0700` 的私有隔离区，迁移失败会恢复，不直接删除。
 - 移除飞书自建应用安装时手工填写 Tenant Key 的多余门槛；新安装只需要 App ID 和通过 macOS Keychain 输入的 App Secret，企业标识由正确的一次性私聊配对事件自动绑定并持久化，旧的预绑定配置继续兼容；配对码过期或遗失时可重跑安装安全刷新，配对后紧接发送的首条指令也会按序缓冲处理。
 - 修复 GitHub Actions 中 Gitleaks 临时 SARIF 报告被 Prettier 当作项目文件检查，导致首次公开 `main` CI 误报失败。
 - 修复 GitHub Actions 未启用 Corepack shim，导致 pnpm 生命周期脚本在干净 runner 中找不到 `pnpm`。

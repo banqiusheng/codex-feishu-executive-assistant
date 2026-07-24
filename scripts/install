@@ -130,6 +130,8 @@ const expected = {
   pptTagObject: "4962eb9bd5c55e8384b5228993c241b2220fcabb",
   pptCommit: "bb775f68f951c3e444d00623bc88976b20c13e7d",
   pptTree: "5ad18d178e8191105dcc68717e4639d3a68f0c73",
+  pptSkillPath: "skills/visual-first-ppt",
+  pptSkillTree: "b2fc38bcd1c1d36f18f47543aa63abd1c7e13eba",
   pptLicense: "MIT",
   pptLicenseSha256: "947212107746594a12e5a1b5b3cab1a0c2f5d46b0a1ab5d438c4938adaf5d04e",
   codexMinimum: "0.142.0",
@@ -148,6 +150,8 @@ const actual = {
   pptTagObject: lock.visualFirstPpt?.tagObjectSha,
   pptCommit: lock.visualFirstPpt?.commitSha,
   pptTree: lock.visualFirstPpt?.treeSha,
+  pptSkillPath: lock.visualFirstPpt?.skillPath,
+  pptSkillTree: lock.visualFirstPpt?.skillTreeSha,
   pptLicense: lock.visualFirstPpt?.license,
   pptLicenseSha256: lock.visualFirstPpt?.licenseSha256,
   codexMinimum: lock.codex?.minimumVersion,
@@ -186,16 +190,17 @@ for (const value of [
   expected.pptTagObject,
   expected.pptCommit,
   expected.pptTree,
+  expected.pptSkillPath,
+  expected.pptSkillTree,
 ]) {
   process.stdout.write(`${value}\n`);
 }
 NODE
   )" || die "依赖锁或配置模板不符合本仓库固定合同。"
 
-  typeset -ga ppt_contract
   typeset -ga dependency_contract
   dependency_contract=("${(@f)output}")
-  (( ${#dependency_contract[@]} == 8 )) || die "无法读取固定依赖版本。"
+  (( ${#dependency_contract[@]} == 10 )) || die "无法读取固定依赖版本。"
 
   typeset -ga ppt_contract
   ppt_contract=(
@@ -204,6 +209,8 @@ NODE
     "${dependency_contract[6]}"
     "${dependency_contract[7]}"
     "${dependency_contract[8]}"
+    "${dependency_contract[9]}"
+    "${dependency_contract[10]}"
   )
 }
 
@@ -301,6 +308,15 @@ readonly config_dir="${runtime_root}/config"
 readonly config_path="${config_dir}/assistant.json"
 readonly lark_cli_version="${dependency_contract[1]}"
 readonly lark_profile="executive-assistant"
+typeset -ar MVP_USER_SCOPES=(
+  "calendar:calendar.event:create"
+  "calendar:calendar.event:update"
+  "contact:user:search"
+  "minutes:minutes.search:read"
+  "minutes:minutes.basic:read"
+  "minutes:minutes.artifacts:read"
+)
+readonly mvp_user_scope_arg="${(j: :)MVP_USER_SCOPES}"
 readonly lark_home="${runtime_root}/lark-home"
 readonly lark_cli_install_root="${runtime_root}/lark-cli-${lark_cli_version}"
 readonly lark_cli_private_bin="${lark_cli_install_root}/private-bin"
@@ -474,38 +490,92 @@ install_local_skill() {
 
 install_local_skill "${EXECUTIVE_SKILL_SOURCE}" "${executive_skill_root}" "executive-assistant"
 
-verify_existing_ppt_skill() {
-  "${node_executable}" --input-type=module - "${ppt_skill_root}" \
+verify_ppt_receipt() {
+  local root="$1"
+  local receipt_mode="$2"
+  "${node_executable}" --input-type=module - "${root}" "${receipt_mode}" \
     "${ppt_contract[1]}" "${ppt_contract[2]}" "${ppt_contract[3]}" \
-    "${ppt_contract[4]}" "${ppt_contract[5]}" <<'NODE'
+    "${ppt_contract[4]}" "${ppt_contract[5]}" "${ppt_contract[6]}" \
+    "${ppt_contract[7]}" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 
-const [root, repository, tag, tagObjectSha, commitSha, treeSha] = process.argv.slice(2);
+const [
+  root,
+  receiptMode,
+  repository,
+  tag,
+  tagObjectSha,
+  commitSha,
+  treeSha,
+  skillPath,
+  skillTreeSha,
+] = process.argv.slice(2);
 const receiptPath = path.join(root, ".executive-assistant-install.json");
-const skillPath = path.join(root, "SKILL.md");
 const receiptStat = fs.lstatSync(receiptPath);
-const skillStat = fs.lstatSync(skillPath);
-if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || !skillStat.isFile() || skillStat.isSymbolicLink()) {
+if (
+  !receiptStat.isFile() ||
+  receiptStat.isSymbolicLink() ||
+  receiptStat.uid !== process.getuid() ||
+  (receiptStat.mode & 0o777) !== 0o600
+) {
   throw new Error("ppt_install_identity_invalid");
 }
 const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
-const expected = { schemaVersion: 1, repository, tag, tagObjectSha, commitSha, treeSha };
+const expected =
+  receiptMode === "current"
+    ? {
+        schemaVersion: 2,
+        repository,
+        tag,
+        tagObjectSha,
+        commitSha,
+        treeSha,
+        skillPath,
+        skillTreeSha,
+      }
+    : receiptMode === "legacy"
+      ? { schemaVersion: 1, repository, tag, tagObjectSha, commitSha, treeSha }
+      : null;
+if (expected === null) throw new Error("ppt_install_receipt_mode");
+const actualKeys = Object.keys(receipt).sort();
+const expectedKeys = Object.keys(expected).sort();
+if (
+  actualKeys.length !== expectedKeys.length ||
+  actualKeys.some((key, index) => key !== expectedKeys[index])
+) {
+  throw new Error("ppt_install_receipt_shape");
+}
 for (const [key, value] of Object.entries(expected)) {
   if (receipt[key] !== value) throw new Error(`ppt_install_mismatch:${key}`);
 }
 NODE
 }
 
-if [[ -e "${ppt_skill_root}" ]]; then
-  [[ -d "${ppt_skill_root}" && ! -L "${ppt_skill_root}" ]] ||
-    die "visual-first-ppt 的已有目标不是可信目录。"
-  verify_existing_ppt_skill ||
-    die "visual-first-ppt 已存在但来源收据不匹配；安装器不会覆盖。"
-  note "visual-first-ppt 固定版本已存在，复用现有目录。"
-else
+verify_existing_ppt_skill() {
+  [[ -d "${ppt_skill_root}" && ! -L "${ppt_skill_root}" ]] || return 1
+  [[ -f "${ppt_skill_root}/SKILL.md" && ! -L "${ppt_skill_root}/SKILL.md" ]] || return 1
+  [[ -f "${ppt_skill_root}/scripts/doctor.mjs" &&
+    ! -L "${ppt_skill_root}/scripts/doctor.mjs" ]] || return 1
+  [[ -z "$(/usr/bin/find "${ppt_skill_root}" -type l -print -quit)" ]] || return 1
+  verify_ppt_receipt "${ppt_skill_root}" "current"
+}
+
+verify_legacy_ppt_layout() {
+  [[ -d "${ppt_skill_root}" && ! -L "${ppt_skill_root}" ]] || return 1
+  [[ ! -e "${ppt_skill_root}/SKILL.md" ]] || return 1
+  [[ -f "${ppt_skill_root}/skills/visual-first-ppt/SKILL.md" &&
+    ! -L "${ppt_skill_root}/skills/visual-first-ppt/SKILL.md" ]] || return 1
+  [[ -f "${ppt_skill_root}/skills/visual-first-ppt/scripts/doctor.mjs" &&
+    ! -L "${ppt_skill_root}/skills/visual-first-ppt/scripts/doctor.mjs" ]] || return 1
+  [[ -z "$(/usr/bin/find "${ppt_skill_root}/skills/visual-first-ppt" -type l -print -quit)" ]] ||
+    return 1
+  verify_ppt_receipt "${ppt_skill_root}" "legacy"
+}
+
+fetch_ppt_repository() {
   note "下载并精确核验 visual-first-ppt ${ppt_contract[2]}。"
-  typeset ppt_repository_tmp
+  typeset -g ppt_repository_tmp
   ppt_repository_tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ea-ppt-repo.XXXXXX")"
   cleanup_paths+=("${ppt_repository_tmp}")
   /usr/bin/git -C "${ppt_repository_tmp}" init -q
@@ -520,29 +590,47 @@ else
     die "visual-first-ppt commit 校验失败。"
   [[ "$(/usr/bin/git -C "${ppt_repository_tmp}" rev-parse "refs/tags/${ppt_contract[2]}^{tree}")" == "${ppt_contract[5]}" ]] ||
     die "visual-first-ppt tree 校验失败。"
+  [[ "$(/usr/bin/git -C "${ppt_repository_tmp}" rev-parse "${ppt_contract[2]}:${ppt_contract[6]}")" == "${ppt_contract[7]}" ]] ||
+    die "visual-first-ppt Skill 子树校验失败。"
+}
 
-  typeset ppt_staging
+stage_ppt_skill() {
+  typeset -g ppt_staging
   ppt_staging="$(/usr/bin/mktemp -d "${skills_root}/ea-visual-first-ppt.XXXXXX")"
   cleanup_paths+=("${ppt_staging}")
-  /usr/bin/git -C "${ppt_repository_tmp}" archive "${ppt_contract[2]}" |
-    /usr/bin/tar -x -C "${ppt_staging}"
+  /usr/bin/git -C "${ppt_repository_tmp}" \
+    archive "${ppt_contract[2]}" -- "${ppt_contract[6]}" |
+    /usr/bin/tar -x -C "${ppt_staging}" --strip-components 2
+  [[ -f "${ppt_staging}/SKILL.md" && ! -L "${ppt_staging}/SKILL.md" ]] ||
+    die "visual-first-ppt archive 中缺少 Skill 入口。"
+  [[ -f "${ppt_staging}/scripts/doctor.mjs" &&
+    ! -L "${ppt_staging}/scripts/doctor.mjs" ]] ||
+    die "visual-first-ppt archive 中缺少 doctor。"
+  [[ -z "$(/usr/bin/find "${ppt_staging}" -type l -print -quit)" ]] ||
+    die "visual-first-ppt Skill 子树包含不允许的符号链接。"
+}
 
+write_ppt_receipt() {
   RECEIPT_PATH="${ppt_staging}/.executive-assistant-install.json" \
   PPT_REPOSITORY="${ppt_contract[1]}" \
   PPT_TAG="${ppt_contract[2]}" \
   PPT_TAG_OBJECT="${ppt_contract[3]}" \
   PPT_COMMIT="${ppt_contract[4]}" \
   PPT_TREE="${ppt_contract[5]}" \
+  PPT_SKILL_PATH="${ppt_contract[6]}" \
+  PPT_SKILL_TREE="${ppt_contract[7]}" \
     "${node_executable}" --input-type=module <<'NODE'
 import fs from "node:fs";
 
 const receipt = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   repository: process.env.PPT_REPOSITORY,
   tag: process.env.PPT_TAG,
   tagObjectSha: process.env.PPT_TAG_OBJECT,
   commitSha: process.env.PPT_COMMIT,
   treeSha: process.env.PPT_TREE,
+  skillPath: process.env.PPT_SKILL_PATH,
+  skillTreeSha: process.env.PPT_SKILL_TREE,
 };
 fs.writeFileSync(process.env.RECEIPT_PATH, `${JSON.stringify(receipt, null, 2)}\n`, {
   encoding: "utf8",
@@ -552,8 +640,56 @@ fs.writeFileSync(process.env.RECEIPT_PATH, `${JSON.stringify(receipt, null, 2)}\
 NODE
   /usr/bin/find "${ppt_staging}" -type d -exec /bin/chmod 0700 {} \;
   /usr/bin/find "${ppt_staging}" -type f -exec /bin/chmod 0600 {} \;
+}
+
+if [[ -e "${ppt_skill_root}" ]] && verify_existing_ppt_skill; then
+  note "visual-first-ppt 固定版本已存在，复用现有目录。"
+elif [[ ! -e "${ppt_skill_root}" ]]; then
+  fetch_ppt_repository
+  stage_ppt_skill
+  write_ppt_receipt
   /bin/mv "${ppt_staging}" "${ppt_skill_root}"
+  verify_existing_ppt_skill ||
+    die "visual-first-ppt 安装后的 Skill 子树或来源收据校验失败。"
   note "visual-first-ppt 已安装并记录固定来源。"
+elif verify_legacy_ppt_layout; then
+  fetch_ppt_repository
+  stage_ppt_skill
+  /usr/bin/diff -qr \
+    "${ppt_skill_root}/skills/visual-first-ppt" \
+    "${ppt_staging}" >/dev/null ||
+    die "visual-first-ppt 旧布局中的 Skill 内容已变化；安装器不会覆盖。"
+  write_ppt_receipt
+
+  readonly ppt_quarantine_root="${runtime_root}/quarantine"
+  if [[ -e "${ppt_quarantine_root}" ]]; then
+    [[ -d "${ppt_quarantine_root}" && ! -L "${ppt_quarantine_root}" ]] ||
+      die "visual-first-ppt 旧布局隔离目录不是可信目录。"
+  else
+    /bin/mkdir "${ppt_quarantine_root}"
+  fi
+  /bin/chmod 0700 "${ppt_quarantine_root}"
+  typeset ppt_quarantine
+  ppt_quarantine="$(/usr/bin/mktemp -d "${ppt_quarantine_root}/visual-first-ppt-legacy.XXXXXX")"
+  /bin/chmod 0700 "${ppt_quarantine}"
+  /bin/mv "${ppt_skill_root}" "${ppt_quarantine}/visual-first-ppt-repository"
+  if ! /bin/mv "${ppt_staging}" "${ppt_skill_root}"; then
+    /bin/mv "${ppt_quarantine}/visual-first-ppt-repository" "${ppt_skill_root}" ||
+      die "visual-first-ppt 迁移失败且旧布局无法自动恢复。"
+    die "visual-first-ppt 迁移失败；已恢复旧布局。"
+  fi
+  if ! verify_existing_ppt_skill; then
+    /bin/mv \
+      "${ppt_skill_root}" \
+      "${ppt_quarantine}/visual-first-ppt-failed-migration" ||
+      die "visual-first-ppt 新布局校验失败，且无法隔离失败的新布局。"
+    /bin/mv "${ppt_quarantine}/visual-first-ppt-repository" "${ppt_skill_root}" ||
+      die "visual-first-ppt 新布局校验失败，且旧布局无法自动恢复。"
+    die "visual-first-ppt 新布局校验失败；已恢复旧布局。"
+  fi
+  note "已把安装器早期生成的 visual-first-ppt 整仓布局移入可恢复隔离目录；不会直接删除。"
+else
+  die "visual-first-ppt 已存在但不是当前固定 Skill 或可验证旧布局；安装器不会覆盖。"
 fi
 
 note "从当前 Codex 定位官方 openai-primary-runtime marketplace。"
@@ -697,6 +833,37 @@ HOME="${lark_home}" "${lark_cli_executable}" \
   config strict-mode off >/dev/null ||
   die "飞书 CLI 无法启用 Bot 与 User 双身份能力。"
 
+lark_app_missing_scopes() {
+  local app_scope_json
+  app_scope_json="$(
+    HOME="${lark_home}" "${lark_cli_executable}" \
+      --profile "${lark_profile}" \
+      auth scopes --json 2>/dev/null
+  )" || return 1
+  print -rn -- "${app_scope_json}" |
+    "${node_executable}" --input-type=module -e '
+      let raw = "";
+      for await (const chunk of process.stdin) raw += chunk;
+      const result = JSON.parse(raw);
+      const required = process.argv.slice(1);
+      if (!Array.isArray(result?.userScopes)) process.exit(2);
+      const enabled = new Set(result.userScopes);
+      process.stdout.write(required.filter((scope) => !enabled.has(scope)).join("\n"));
+    ' "${MVP_USER_SCOPES[@]}"
+}
+
+typeset missing_app_scope_output
+missing_app_scope_output="$(lark_app_missing_scopes)" ||
+  die "无法读取飞书应用已生效的用户权限。"
+typeset -a missing_app_scopes=()
+if [[ -n "${missing_app_scope_output}" ]]; then
+  missing_app_scopes=(${(f)missing_app_scope_output})
+fi
+if (( ${#missing_app_scopes[@]} > 0 )); then
+  die "BLOCKED_SCOPE：飞书应用尚未生效以下 MVP 权限：${(j:, :)missing_app_scopes}。请发布并批准应用版本后重跑安装。"
+fi
+note "飞书应用层 6 项 MVP 用户权限已生效。"
+
 lark_user_auth_is_healthy() {
   local auth_json
   auth_json="$(
@@ -709,22 +876,102 @@ lark_user_auth_is_healthy() {
       let raw = "";
       for await (const chunk of process.stdin) raw += chunk;
       const result = JSON.parse(raw);
-      if (result?.ok !== true) process.exit(2);
+      if (
+        result?.identity !== "user" ||
+        result?.verified !== true ||
+        result?.identities?.user?.available !== true ||
+        result?.identities?.user?.verified !== true ||
+        result?.identities?.user?.status !== "ready" ||
+        result?.identities?.user?.tokenStatus !== "valid"
+      ) {
+        process.exit(2);
+      }
     ' >/dev/null
 }
 
+lark_user_scope_check_json() {
+  local check_json
+  local check_status=0
+  check_json="$(
+    HOME="${lark_home}" "${lark_cli_executable}" \
+      --profile "${lark_profile}" \
+      auth check --scope "${mvp_user_scope_arg}" --json 2>/dev/null
+  )" || check_status=$?
+  (( check_status == 0 || check_status == 1 )) || return 1
+  print -rn -- "${check_json}"
+}
+
+lark_user_scopes_are_healthy() {
+  local check_json
+  check_json="$(lark_user_scope_check_json)" || return 1
+  print -rn -- "${check_json}" |
+    "${node_executable}" --input-type=module -e '
+      let raw = "";
+      for await (const chunk of process.stdin) raw += chunk;
+      const result = JSON.parse(raw);
+      const missing = result?.missing == null ? [] : result.missing;
+      if (
+        result?.ok !== true ||
+        !Array.isArray(missing) ||
+        missing.length !== 0
+      ) {
+        process.exit(2);
+      }
+    ' >/dev/null
+}
+
+lark_user_missing_scopes() {
+  local check_json
+  check_json="$(lark_user_scope_check_json)" || return 1
+  print -rn -- "${check_json}" |
+    "${node_executable}" --input-type=module -e '
+      let raw = "";
+      for await (const chunk of process.stdin) raw += chunk;
+      const result = JSON.parse(raw);
+      const required = new Set(process.argv.slice(1));
+      const missing = result?.missing == null ? [] : result.missing;
+      if (
+        !Array.isArray(missing) ||
+        missing.some(
+          (scope) => typeof scope !== "string" || !required.has(scope),
+        )
+      ) {
+        process.exit(2);
+      }
+      process.stdout.write(missing.join("\n"));
+    ' "${MVP_USER_SCOPES[@]}"
+}
+
+typeset user_identity_healthy="no"
 if lark_user_auth_is_healthy; then
+  user_identity_healthy="yes"
+fi
+
+if [[ "${user_identity_healthy}" == "yes" ]] && lark_user_scopes_are_healthy; then
   note "飞书用户授权仍然有效，复用现有授权。"
 else
+  typeset -a missing_user_scopes=()
+  typeset requested_user_scope_arg="${mvp_user_scope_arg}"
+  if [[ "${user_identity_healthy}" == "yes" ]]; then
+    typeset missing_user_scope_output
+    missing_user_scope_output="$(lark_user_missing_scopes)" ||
+      die "无法读取飞书用户授权的精确权限差额。"
+    if [[ -n "${missing_user_scope_output}" ]]; then
+      missing_user_scopes=(${(f)missing_user_scope_output})
+    fi
+    (( ${#missing_user_scopes[@]} > 0 )) ||
+      die "飞书用户授权状态异常，但没有可安全申请的缺失 MVP 权限。"
+    requested_user_scope_arg="${(j: :)missing_user_scopes}"
+  fi
   print -r -- ""
-  print -r -- "接下来会打开飞书授权页。请由总裁本人授权日历、通讯录和妙记。"
+  print -r -- "接下来会打开飞书授权页，仅请求当前缺失的 MVP 权限：${requested_user_scope_arg}"
   HOME="${lark_home}" "${lark_cli_executable}" \
     --profile "${lark_profile}" \
-    auth login --domain calendar,contact,minutes ||
+    auth login --scope "${requested_user_scope_arg}" ||
     die "飞书用户授权未完成。"
 fi
-lark_user_auth_is_healthy ||
-  die "飞书用户授权健康检查未通过。"
+lark_user_auth_is_healthy && lark_user_scopes_are_healthy ||
+  die "飞书用户授权健康检查或 6 项 MVP 权限检查未通过。"
 
 generate_pairing_contract() {
   typeset -a generated
