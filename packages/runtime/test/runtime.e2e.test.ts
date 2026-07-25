@@ -576,7 +576,11 @@ class ControlledAcknowledgementDelay {
   wait = (milliseconds: number, signal: AbortSignal): Promise<void> => {
     this.milliseconds.push(milliseconds);
     return new Promise<void>((resolve) => {
-      const finish = (): void => resolve();
+      const finish = (): void => {
+        const index = this.pending.indexOf(finish);
+        if (index >= 0) this.pending.splice(index, 1);
+        resolve();
+      };
       this.pending.push(finish);
       signal.addEventListener("abort", finish, { once: true });
     });
@@ -746,7 +750,13 @@ describe("executive runtime offline integration", () => {
       delay.releaseNext();
       await runtime.waitForIdle();
 
-      expect(delay.milliseconds).toEqual([1_000, 2_000]);
+      expect(delay.milliseconds.at(-1)).toBe(2_000);
+      expect(delay.milliseconds.slice(0, -1)).not.toHaveLength(0);
+      expect(
+        delay.milliseconds
+          .slice(0, -1)
+          .every((milliseconds) => milliseconds === 1_000),
+      ).toBe(true);
       expect(transport.acknowledgementAttempts).toHaveLength(4);
       expect(
         transport.textReplies.filter(
@@ -757,6 +767,41 @@ describe("executive runtime offline integration", () => {
         expect.stringContaining("第一条离线任务"),
         expect.stringContaining("第二条离线任务"),
       ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("cancels a retrying ACK head without waiting out backoff and advances the next task", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const delay = new ControlledAcknowledgementDelay();
+    let firstAttempt = true;
+    transport.beforeAcknowledgement = () => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        throw codedFailure("ENOTFOUND");
+      }
+    };
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: delay.wait,
+      instanceId: "runtime-cancel-ack-backoff",
+    });
+    try {
+      await transport.emitMessage(message(157, "等待 ACK 的任务"));
+      await waitUntil(() => delay.pending.length === 1);
+      await transport.emitMessage(message(158, "停止当前任务"));
+      await settleWithin(runtime.waitForIdle(), "cancel-ack-backoff-idle");
+      expect(runner.starts).toHaveLength(0);
+
+      await transport.emitMessage(message(159, "取消后继续的任务"));
+      await runtime.waitForIdle();
+      expect(runner.starts).toHaveLength(1);
+      expect(runner.starts[0]?.prompt).toContain("取消后继续的任务");
     } finally {
       await runtime.close();
     }
@@ -968,7 +1013,7 @@ describe("executive runtime offline integration", () => {
     }
   });
 
-  it("allows a task-local legacy v1 marker only for an actual no-row recovery", async () => {
+  it("allows a task-local legacy v1 no-row backfill across a second restart before execution", async () => {
     const config = await fixtureConfig();
     await mkdir(config.paths.jobsRoot, { mode: 0o700 });
     const taskId = randomUUID();
@@ -1024,13 +1069,37 @@ describe("executive runtime offline integration", () => {
       .run(accepted.taskId);
     database.close();
 
+    const parkedTransport = new FakeTransport();
+    const parkedRunner = new ImmediateRunner();
+    const parkedRuntime = await startExecutiveRuntime(config, {
+      transport: parkedTransport,
+      runner: parkedRunner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-legacy-v1-first-recovery",
+      decorateAcknowledgementStore(store) {
+        return Object.freeze({
+          getNextTaskAcknowledgementCandidate: () => null,
+          beginTaskAcknowledgement: (input) =>
+            store.beginTaskAcknowledgement(input),
+          finishTaskAcknowledgement: (input) =>
+            store.finishTaskAcknowledgement(input),
+        });
+      },
+    });
+    try {
+      await parkedRuntime.waitForIdle();
+      expect(parkedRunner.starts).toHaveLength(0);
+    } finally {
+      await parkedRuntime.close();
+    }
+
     const transport = new FakeTransport();
     const runner = new ImmediateRunner();
     const runtime = await startExecutiveRuntime(config, {
       transport,
       runner,
       larkRunnerFactory: () => new FakeLarkRunner(),
-      instanceId: "runtime-legacy-v1-recovery",
+      instanceId: "runtime-legacy-v1-second-recovery",
     });
     try {
       await runtime.waitForIdle();
@@ -1038,6 +1107,100 @@ describe("executive runtime offline integration", () => {
       expect(runner.starts.map((start) => start.taskId)).toEqual([
         accepted.taskId,
       ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("rejects a legacy v1 marker for a normal acknowledgement with a real attempt", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const taskId = randomUUID();
+    const workspace = join(config.paths.jobsRoot, taskId);
+    const receivedAt = new Date().toISOString();
+    await mkdir(workspace, { mode: 0o700 });
+    await writeFile(
+      join(workspace, "input.json"),
+      `${JSON.stringify({
+        version: 1,
+        prompt: "不得降级接受 v1",
+        chatId: "oc_synthetic_private_chat",
+        messageId: "normal-v1-message",
+        eventId: "normal-v1-event",
+        receivedAt,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(workspace, "acknowledged.json"),
+      `${JSON.stringify({
+        version: 1,
+        acknowledgedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const seedLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const seedStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "runtime-normal-v1-seed",
+      lock: seedLock,
+    });
+    seedStore.ingestEvent(
+      {
+        appId: config.appId,
+        tenantKey: TENANT_KEY,
+        eventId: "normal-v1-event",
+        messageId: "normal-v1-message",
+        senderOpenId: "ou_synthetic_president",
+        chatId: "oc_synthetic_private_chat",
+        chatType: "p2p",
+        eventType: "im.message.receive_v1",
+        receivedAt,
+        payloadRef: `sha256:${"9".repeat(64)}`,
+      },
+      workspace,
+    );
+    expect(
+      seedStore.acquireRuntimeLease(
+        "bridge",
+        "runtime-normal-v1-seed",
+        new Date(),
+        60_000,
+      ),
+    ).toBe(true);
+    expect(
+      seedStore.beginTaskAcknowledgement({
+        taskId,
+        owner: "runtime-normal-v1-seed",
+        now: new Date(),
+      }),
+    ).toMatchObject({ state: "SENDING", attemptCount: 1 });
+    expect(
+      seedStore.finishTaskAcknowledgement({
+        taskId,
+        owner: "runtime-normal-v1-seed",
+        now: new Date(),
+        state: "ACKNOWLEDGED",
+        failureClass: null,
+      }),
+    ).toMatchObject({ state: "ACKNOWLEDGED", attemptCount: 1 });
+    seedStore.releaseRuntimeLease("bridge", "runtime-normal-v1-seed");
+    seedStore.close();
+    await seedLock.release();
+
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport: new FakeTransport(),
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-normal-v1-recovery",
+    });
+    try {
+      await runtime.waitForIdle();
+      expect(runner.starts).toHaveLength(0);
+      expect(runtime.getTask(taskId)?.state).toBe(
+        "INTERRUPTED_REQUIRES_CONFIRMATION",
+      );
     } finally {
       await runtime.close();
     }
@@ -1445,8 +1608,141 @@ describe("executive runtime offline integration", () => {
       expect(runtime.getTask(taskId)?.state).toBe(
         "INTERRUPTED_REQUIRES_CONFIRMATION",
       );
+      await transport.emitMessage(message(155, "崩溃对账后仍可处理下一任务"));
+      await runtime.waitForIdle();
+      expect(runner.starts).toHaveLength(1);
+      expect(runner.starts[0]?.prompt).toContain("崩溃对账后仍可处理下一任务");
     } finally {
       await runtime.close();
+    }
+
+    const inspectLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const inspectStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "recovery-inspector",
+      lock: inspectLock,
+    });
+    try {
+      expect(inspectStore.getTaskAcknowledgement(taskId)).toMatchObject({
+        state: "AMBIGUOUS",
+        lastFailureClass: "RESULT_AMBIGUOUS",
+      });
+    } finally {
+      inspectStore.close();
+      await inspectLock.release();
+    }
+  });
+
+  it("self-heals a cancelled orphan SENDING acknowledgement on restart", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const taskId = randomUUID();
+    const workspace = join(config.paths.jobsRoot, taskId);
+    const receivedAt = new Date().toISOString();
+    await mkdir(workspace, { mode: 0o700 });
+    await writeFile(
+      join(workspace, "input.json"),
+      `${JSON.stringify({
+        version: 1,
+        prompt: "取消中的崩溃任务",
+        chatId: "oc_synthetic_private_chat",
+        messageId: "cancelled-orphan-message",
+        eventId: "cancelled-orphan-event",
+        receivedAt,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const seedLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const seedStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "cancelled-orphan-seed",
+      lock: seedLock,
+    });
+    seedStore.ingestEvent(
+      {
+        appId: config.appId,
+        tenantKey: TENANT_KEY,
+        eventId: "cancelled-orphan-event",
+        messageId: "cancelled-orphan-message",
+        senderOpenId: "ou_synthetic_president",
+        chatId: "oc_synthetic_private_chat",
+        chatType: "p2p",
+        eventType: "im.message.receive_v1",
+        receivedAt,
+        payloadRef: `sha256:${"8".repeat(64)}`,
+      },
+      workspace,
+    );
+    expect(
+      seedStore.acquireRuntimeLease(
+        "bridge",
+        "cancelled-orphan-seed",
+        new Date(),
+        60_000,
+      ),
+    ).toBe(true);
+    seedStore.bindPrincipal({
+      appId: config.appId,
+      tenantKey: TENANT_KEY,
+      presidentOpenId: "ou_synthetic_president",
+      presidentChatId: "oc_synthetic_private_chat",
+      pairedAt: new Date(),
+    });
+    expect(
+      seedStore.beginTaskAcknowledgement({
+        taskId,
+        owner: "cancelled-orphan-seed",
+        now: new Date(),
+      }),
+    ).toMatchObject({ state: "SENDING" });
+    expect(
+      seedStore.cancelActiveTask({
+        appId: config.appId,
+        tenantKey: TENANT_KEY,
+        eventId: "cancelled-orphan-control",
+        messageId: "cancelled-orphan-control-message",
+        senderOpenId: "ou_synthetic_president",
+        chatId: "oc_synthetic_private_chat",
+        receivedAt: new Date().toISOString(),
+      }),
+    ).toMatchObject({ taskId, cancelled: true });
+    seedStore.releaseRuntimeLease("bridge", "cancelled-orphan-seed");
+    seedStore.close();
+    await seedLock.release();
+
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "cancelled-orphan-recovery",
+    });
+    try {
+      await runtime.waitForIdle();
+      expect(runtime.getTask(taskId)?.state).toBe("CANCELLED");
+      await transport.emitMessage(message(156, "取消崩溃后继续处理"));
+      await runtime.waitForIdle();
+      expect(runner.starts).toHaveLength(1);
+      expect(runner.starts[0]?.prompt).toContain("取消崩溃后继续处理");
+    } finally {
+      await runtime.close();
+    }
+
+    const inspectLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const inspectStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "cancelled-orphan-inspector",
+      lock: inspectLock,
+    });
+    try {
+      expect(inspectStore.getTaskAcknowledgement(taskId)).toMatchObject({
+        state: "AMBIGUOUS",
+        lastFailureClass: "RESULT_AMBIGUOUS",
+      });
+    } finally {
+      inspectStore.close();
+      await inspectLock.release();
     }
   });
 
@@ -1628,6 +1924,52 @@ describe("executive runtime offline integration", () => {
         "SUCCEEDED",
       ]);
     } finally {
+      await runtime.close();
+    }
+  });
+
+  it("level-triggers an acknowledged worker wake after a busy drain observed SENDING", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const runner = new GatedResultRunner();
+    let releaseSecondAcknowledgement: () => void = () => undefined;
+    const secondAcknowledgementAllowed = new Promise<void>((resolve) => {
+      releaseSecondAcknowledgement = resolve;
+    });
+    transport.beforeAcknowledgement = async () => {
+      if (transport.acknowledgementAttempts.length === 2) {
+        await secondAcknowledgementAllowed;
+      }
+    };
+    let releaseDuringClaim = false;
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-level-triggered-worker-wake",
+      claimNextTask(store, owner, currentTime, ttlMs) {
+        if (releaseDuringClaim) {
+          releaseDuringClaim = false;
+          releaseSecondAcknowledgement();
+        }
+        return store.claimNextTask(owner, currentTime, ttlMs);
+      },
+    });
+    try {
+      await transport.emitMessage(message(160, "占用旧 drain 的任务"));
+      await waitUntil(() => runner.starts.length === 1);
+      await transport.emitMessage(message(161, "无需新入站也必须启动的任务"));
+      await waitUntil(() => transport.acknowledgementAttempts.length === 2);
+
+      releaseDuringClaim = true;
+      runner.complete();
+      await waitUntil(() => runner.starts.length === 2);
+      await runtime.waitForIdle();
+
+      expect(runner.starts[1]?.prompt).toContain("无需新入站也必须启动的任务");
+    } finally {
+      runner.complete();
+      releaseSecondAcknowledgement();
       await runtime.close();
     }
   });

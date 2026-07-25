@@ -159,6 +159,139 @@ function acknowledge(store: JobStore, taskId: string, now: Date): void {
 }
 
 describe("task acknowledgement ledger", () => {
+  it.each([
+    ["RETRYABLE_DNS", "DNS_UNAVAILABLE"],
+    ["ACKNOWLEDGED", null],
+    ["AMBIGUOUS", "RESULT_AMBIGUOUS"],
+    ["FAILED_DEFINITE", "REMOTE_REJECTED"],
+  ] as const)(
+    "finalizes a cancelled SENDING acknowledgement as %s without reviving the task",
+    async (state, failureClass) => {
+      const { runtimeDir, store } = await storeFixture();
+      const first = store.ingestEvent(event(1), workspace(runtimeDir));
+      const second = store.ingestEvent(event(2), workspace(runtimeDir));
+      expect(
+        store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+      ).toBe(true);
+      store.bindPrincipal({
+        appId: "cli_test_app",
+        tenantKey: "tenant_test_001",
+        presidentOpenId: "ou_synthetic_president",
+        presidentChatId: "oc_synthetic_private_chat",
+        pairedAt: at(10),
+      });
+      expect(
+        store.beginTaskAcknowledgement({
+          taskId: first.taskId,
+          owner: "instance-a",
+          now: at(11),
+        }),
+      ).toMatchObject({ state: "SENDING" });
+      expect(
+        store.cancelActiveTask({
+          appId: "cli_test_app",
+          tenantKey: "tenant_test_001",
+          eventId: `cancel_${state}`,
+          messageId: `cancel_message_${state}`,
+          senderOpenId: "ou_synthetic_president",
+          chatId: "oc_synthetic_private_chat",
+          receivedAt: at(12).toISOString(),
+        }),
+      ).toMatchObject({ taskId: first.taskId, cancelled: true });
+
+      expect(
+        store.finishTaskAcknowledgement({
+          taskId: first.taskId,
+          owner: "instance-a",
+          now: at(13),
+          state,
+          failureClass,
+        }),
+      ).toMatchObject({ state, lastFailureClass: failureClass });
+      expect(store.getTask(first.taskId)?.state).toBe("CANCELLED");
+      expect(
+        store.beginTaskAcknowledgement({
+          taskId: second.taskId,
+          owner: "instance-a",
+          now: at(14),
+        }),
+      ).toMatchObject({ taskId: second.taskId, state: "SENDING" });
+    },
+  );
+
+  it.each(["CANCELLED", "INTERRUPTED_REQUIRES_CONFIRMATION"] as const)(
+    "enumerates an orphan SENDING acknowledgement whose task is %s",
+    async (taskState) => {
+      const { filename, runtimeDir, store } = await storeFixture();
+      const task = store.ingestEvent(event(), workspace(runtimeDir));
+      expect(
+        store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+      ).toBe(true);
+      expect(
+        store.beginTaskAcknowledgement({
+          taskId: task.taskId,
+          owner: "instance-a",
+          now: at(11),
+        }),
+      ).toMatchObject({ state: "SENDING" });
+      mutate(
+        filename,
+        "UPDATE tasks SET state = ? WHERE id = ?",
+        taskState,
+        task.taskId,
+      );
+
+      expect(store.listTaskAcknowledgementRecoveryCandidates()).toEqual([
+        {
+          taskId: task.taskId,
+          workspacePath: store.getTask(task.taskId)?.workspacePath,
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    ["CANCELLED", false, "AMBIGUOUS"],
+    ["CANCELLED", true, "ACKNOWLEDGED"],
+    ["INTERRUPTED_REQUIRES_CONFIRMATION", false, "AMBIGUOUS"],
+    ["INTERRUPTED_REQUIRES_CONFIRMATION", true, "ACKNOWLEDGED"],
+  ] as const)(
+    "reconciles an orphan %s SENDING acknowledgement with marker=%s to %s without changing the task",
+    async (taskState, markerPresent, expectedAcknowledgement) => {
+      const { filename, runtimeDir, store } = await storeFixture();
+      const task = store.ingestEvent(event(), workspace(runtimeDir));
+      expect(
+        store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+      ).toBe(true);
+      expect(
+        store.beginTaskAcknowledgement({
+          taskId: task.taskId,
+          owner: "instance-a",
+          now: at(11),
+        }),
+      ).toMatchObject({ state: "SENDING" });
+      mutate(
+        filename,
+        "UPDATE tasks SET state = ? WHERE id = ?",
+        taskState,
+        task.taskId,
+      );
+
+      expect(
+        store.reconcileTaskAcknowledgement({
+          taskId: task.taskId,
+          owner: "instance-a",
+          now: at(12),
+          markerPresent,
+        }),
+      ).toMatchObject({
+        state: expectedAcknowledgement,
+        lastFailureClass: markerPresent ? null : "RESULT_AMBIGUOUS",
+      });
+      expect(store.getTask(task.taskId)?.state).toBe(taskState);
+    },
+  );
+
   it("maps local evidence failure only to AMBIGUOUS and remote rejection only to FAILED_DEFINITE", async () => {
     const { store, runtimeDir } = await storeFixture();
     const localEvidence = store.ingestEvent(event(901), workspace(runtimeDir));
@@ -708,7 +841,10 @@ describe("task acknowledgement ledger", () => {
         now: at(20),
         markerPresent: false,
       }),
-    ).toBeNull();
+    ).toMatchObject({
+      state: "AMBIGUOUS",
+      lastFailureClass: "RESULT_AMBIGUOUS",
+    });
     expect(store.getTask(sending.taskId)).toMatchObject({
       state: "INTERRUPTED_REQUIRES_CONFIRMATION",
     });
@@ -721,7 +857,7 @@ describe("task acknowledgement ledger", () => {
     ["NOT_ATTEMPTED", true, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
     ["RETRYABLE_DNS", false, "RETRYABLE_DNS", "RECEIVED"],
     ["RETRYABLE_DNS", true, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
-    ["SENDING", false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["SENDING", false, "AMBIGUOUS", "INTERRUPTED_REQUIRES_CONFIRMATION"],
     ["SENDING", true, "ACKNOWLEDGED", "RECEIVED"],
     ["ACKNOWLEDGED", false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
     ["ACKNOWLEDGED", true, "ACKNOWLEDGED", "RECEIVED"],

@@ -2,8 +2,12 @@
 
 - 日期：2026-07-25
 - 方案状态：方案 A 与本文规格已由用户确认
-- 实施状态：`DESIGN_ONLY_NOT_IMPLEMENTED`
+- 实施状态：`LOCAL_IMPLEMENTED_AWAITING_FULL_GATES_PUBLIC_PUSH_REAL_ACCEPTANCE`
 - 适用范围：一位总裁、一台专用 Mac、一个飞书自建应用
+
+本文对应实现已在本地分支完成并通过相关离线定向回归，但完整仓库门禁、公开
+`main` 推送、目标 Mac mini 重新安装和真实飞书回放仍待后续门禁。此状态不代表
+production ready、24H 就绪或客户验收完成。
 
 ## 1. 目标
 

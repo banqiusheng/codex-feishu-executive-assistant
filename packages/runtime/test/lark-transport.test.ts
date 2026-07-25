@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import type {
   CardActionEvent,
+  HttpInstance,
+  HttpRequestOptions,
   LarkChannel,
   LarkChannelOptions,
   NormalizedMessage,
@@ -9,6 +11,122 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 
 import { createBuiltInLarkTransport } from "../src/lark-transport.js";
+
+class RecordingHttpInstance implements HttpInstance {
+  readonly calls: Array<
+    Readonly<{
+      method: string;
+      url: string | undefined;
+      timeout: number | undefined;
+    }>
+  > = [];
+
+  constructor(
+    private readonly response: (
+      method: string,
+      url: string | undefined,
+    ) => unknown = () => Object.freeze({}),
+  ) {}
+
+  private record<R>(
+    method: string,
+    url: string | undefined,
+    options: HttpRequestOptions<unknown> | undefined,
+  ): Promise<R> {
+    this.calls.push(Object.freeze({ method, url, timeout: options?.timeout }));
+    return Promise.resolve(this.response(method, url) as R);
+  }
+
+  request<T = unknown, R = T, D = unknown>(
+    options: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "request",
+      options.url,
+      options as HttpRequestOptions<unknown>,
+    );
+  }
+
+  get<T = unknown, R = T, D = unknown>(
+    url: string,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "get",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+
+  delete<T = unknown, R = T, D = unknown>(
+    url: string,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "delete",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+
+  head<T = unknown, R = T, D = unknown>(
+    url: string,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "head",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+
+  options<T = unknown, R = T, D = unknown>(
+    url: string,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "options",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+
+  post<T = unknown, R = T, D = unknown>(
+    url: string,
+    _data?: D,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "post",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+
+  put<T = unknown, R = T, D = unknown>(
+    url: string,
+    _data?: D,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "put",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+
+  patch<T = unknown, R = T, D = unknown>(
+    url: string,
+    _data?: D,
+    options?: HttpRequestOptions<D>,
+  ): Promise<R> {
+    return this.record<R>(
+      "patch",
+      url,
+      options as HttpRequestOptions<unknown> | undefined,
+    );
+  }
+}
 
 class FakeLarkChannel {
   messageHandler:
@@ -124,6 +242,82 @@ function normalizedMessage(
 }
 
 describe("built-in Lark transport tenant binding", () => {
+  it("binds a fixed-timeout HTTP wrapper that overrides caller timeout zero on every method", async () => {
+    const channel = new FakeLarkChannel();
+    const delegate = new RecordingHttpInstance();
+    let channelOptions: LarkChannelOptions | undefined;
+    createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      httpInstance: delegate,
+      acknowledgementHttpTimeoutMs: 17,
+      createChannel: (options) => {
+        channelOptions = options;
+        return channel as unknown as LarkChannel;
+      },
+    });
+    const bounded = channelOptions?.httpInstance;
+    expect(bounded).toBeDefined();
+    expect(bounded).not.toBe(delegate);
+
+    await bounded?.request({
+      url: "https://fixture.invalid/request",
+      timeout: 0,
+    });
+    await bounded?.get("https://fixture.invalid/get", { timeout: 0 });
+    await bounded?.delete("https://fixture.invalid/delete", { timeout: 0 });
+    await bounded?.head("https://fixture.invalid/head", { timeout: 0 });
+    await bounded?.options("https://fixture.invalid/options", { timeout: 0 });
+    await bounded?.post("https://fixture.invalid/post", {}, { timeout: 0 });
+    await bounded?.put("https://fixture.invalid/put", {}, { timeout: 0 });
+    await bounded?.patch("https://fixture.invalid/patch", {}, { timeout: 0 });
+
+    expect(delegate.calls.map((call) => call.timeout)).toEqual([
+      17, 17, 17, 17, 17, 17, 17, 17,
+    ]);
+  });
+
+  it("routes the SDK generated raw reply through the bounded delegate without network fallback", async () => {
+    const delegate = new RecordingHttpInstance((_method, url) => {
+      if (url?.includes("/auth/v3/tenant_access_token/internal")) {
+        return Object.freeze({
+          code: 0,
+          msg: "success",
+          tenant_access_token: "fixture-tenant-access-token",
+          expire: 7_200,
+        });
+      }
+      if (url?.includes("/im/v1/messages/")) {
+        return Object.freeze({
+          code: 0,
+          msg: "success",
+          data: Object.freeze({ message_id: "fixture-bounded-ack" }),
+        });
+      }
+      throw new Error("UNEXPECTED_OFFLINE_HTTP_REQUEST");
+    });
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      httpInstance: delegate,
+      acknowledgementHttpTimeoutMs: 19,
+    });
+
+    await expect(
+      transport.sendAcknowledgement({
+        chatId: "oc_fixture_private_chat",
+        text: "收到，我开始处理",
+        replyToMessageId: "message-fixture",
+      }),
+    ).resolves.toEqual({ messageId: "fixture-bounded-ack" });
+    expect(delegate.calls).toHaveLength(2);
+    expect(delegate.calls.map((call) => call.timeout)).toEqual([19, 19]);
+    expect(delegate.calls.map((call) => call.method)).toEqual([
+      "post",
+      "request",
+    ]);
+  });
+
   it("installs a fixed no-op SDK logger that cannot expose sensitive arguments", async () => {
     const channel = new FakeLarkChannel();
     let channelOptions: LarkChannelOptions | undefined;

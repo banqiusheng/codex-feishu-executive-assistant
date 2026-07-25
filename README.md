@@ -95,6 +95,13 @@ SIGHUP 中止，以及完成后 `auth status --verify` 与 `auth check` 复核�
 
 ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认。持久数据库 ACK 门禁、专用一次性 raw reply、静默 SDK logger、单 FIFO 协调器、仅 `ENOTFOUND` / `EAI_AGAIN` 的可恢复退避、严格 task-bound marker v2、数据库 finalization 不确定性执行屏障、worker/coordinator 进度握手、重复事件原路由恢复、启动前 marker/账本 truth table、无凭据 DNS/HTTPS 网络 doctor，以及零复制用户授权 helper 已在本地受控 seam 测试实现。完整仓库门禁、公开 push、真实浏览器点击和真实飞书回放仍待完成。
 
+本轮本地补修还覆盖了取消或崩溃遗留的 orphan `SENDING` 自愈、busy worker 的
+level-triggered 唤醒、退避中的取消重扫、SDK generated ACK 请求的底层 30 秒
+HTTP timeout，以及 legacy v1 backfill 的二次重启安全判据。安装后的非技术验收
+只需让 Codex 按 [Mac mini 安装说明](BOOTSTRAP.md#安装后简单验收)核验运行状态，
+再由总裁在飞书私聊发送一次测试；当前仍处于完整门禁、公开推送和真实回放之前，
+不代表 production ready 或 24H 验收完成。
+
 真实飞书收发、妙记、日程、通知、PPT 文件回传、Keychain 静默读取、用户授权续期和 LaunchAgent 异常拉起，仍必须在客户 Mac mini 与目标飞书租户中逐项验收。连续 24 小时实机测试通过前，不应把本候选版标记为 `production ready`。
 
 ## 本地质量命令

@@ -537,7 +537,7 @@ describe("task lifecycle", () => {
   );
 
   it("blocks touch when the owner's bridge lease expired without takeover", async () => {
-    const { filename, runtimeDir, store } = await storeFixture();
+    const { runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
     expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 100)).toBe(
       true,

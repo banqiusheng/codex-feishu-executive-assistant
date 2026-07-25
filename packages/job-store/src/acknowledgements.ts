@@ -255,8 +255,11 @@ export function listTaskAcknowledgementRecoveryCandidates(
       .prepare(
         `SELECT id AS taskId, workspace_path AS workspacePath
            FROM tasks
-          WHERE state = 'RECEIVED'
-          ORDER BY created_at, id`,
+           LEFT JOIN task_acknowledgements
+             ON task_acknowledgements.task_id = tasks.id
+          WHERE tasks.state = 'RECEIVED'
+             OR task_acknowledgements.state = 'SENDING'
+          ORDER BY tasks.created_at, tasks.id`,
       )
       .all() as ReadonlyArray<{
       taskId: unknown;
@@ -364,7 +367,7 @@ export function finishTaskAcknowledgement(
         if (
           acknowledgement === null ||
           acknowledgement.state !== "SENDING" ||
-          task?.state !== "RECEIVED"
+          task === undefined
         )
           return null;
         const changed = database
@@ -376,7 +379,10 @@ export function finishTaskAcknowledgement(
           throw new RuntimeStateError(
             "task_acknowledgement_persistence_failed",
           );
-        if (input.state === "AMBIGUOUS" || input.state === "FAILED_DEFINITE")
+        if (
+          task.state === "RECEIVED" &&
+          (input.state === "AMBIGUOUS" || input.state === "FAILED_DEFINITE")
+        )
           interruptTask(database, input.taskId as string, now);
         return findAcknowledgement(database, input.taskId as string);
       })
@@ -412,12 +418,16 @@ export function reconcileTaskAcknowledgement(
         const task = database
           .prepare("SELECT state FROM tasks WHERE id = ?")
           .get(input.taskId) as { state: unknown } | undefined;
-        if (task === undefined || task.state !== "RECEIVED") return null;
+        if (task === undefined) return null;
         const acknowledgement = findAcknowledgement(
           database,
           input.taskId as string,
         );
-        if (acknowledgement === null && input.markerPresent) {
+        if (
+          task.state === "RECEIVED" &&
+          acknowledgement === null &&
+          input.markerPresent
+        ) {
           database
             .prepare(
               "INSERT INTO task_acknowledgements(task_id, state, attempt_count, last_failure_class, created_at, updated_at) VALUES (?, 'ACKNOWLEDGED', 0, NULL, ?, ?)",
@@ -441,6 +451,25 @@ export function reconcileTaskAcknowledgement(
             );
           return findAcknowledgement(database, input.taskId as string);
         }
+        if (
+          acknowledgement !== null &&
+          acknowledgement.state === "SENDING" &&
+          !input.markerPresent
+        ) {
+          const changed = database
+            .prepare(
+              "UPDATE task_acknowledgements SET state = 'AMBIGUOUS', last_failure_class = 'RESULT_AMBIGUOUS', updated_at = ? WHERE task_id = ? AND state = 'SENDING'",
+            )
+            .run(now.iso, input.taskId).changes;
+          if (changed !== 1)
+            throw new RuntimeStateError(
+              "task_acknowledgement_persistence_failed",
+            );
+          if (task.state === "RECEIVED")
+            interruptTask(database, input.taskId as string, now);
+          return findAcknowledgement(database, input.taskId as string);
+        }
+        if (task.state !== "RECEIVED") return null;
         if (
           acknowledgement !== null &&
           !input.markerPresent &&

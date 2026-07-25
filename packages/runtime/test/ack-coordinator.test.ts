@@ -157,6 +157,7 @@ function coordinatorOptions(
     },
     wakeWorker: () => {
       store.events.push("wake");
+      return true;
     },
     tripExecutionBarrier: () => {
       store.events.push("barrier");
@@ -263,6 +264,132 @@ describe("single FIFO ACK coordinator", () => {
       "finish:ACKNOWLEDGED:null",
       "wake",
     ]);
+  });
+
+  it("retries an acknowledged worker wake until the worker accepts it", async () => {
+    const store = new MemoryAckStore(["ACKNOWLEDGED"]);
+    const accepted: boolean[] = [];
+    const coordinator = createAckCoordinator(
+      coordinatorOptions(store, {
+        wakeWorker: () => {
+          const next = accepted.length > 0;
+          accepted.push(next);
+          return next;
+        },
+      }),
+    );
+
+    await coordinator.start();
+    await coordinator.waitForIdle();
+    coordinator.wake();
+    await coordinator.waitForIdle();
+
+    expect(accepted).toEqual([false, true]);
+  });
+
+  it("rescans FIFO when begin observes that the candidate was cancelled", async () => {
+    const store = new MemoryAckStore(["NOT_ATTEMPTED", "NOT_ATTEMPTED"]);
+    let cancelled = false;
+    const coordinatorStore: AckCoordinatorStore = Object.freeze({
+      getNextTaskAcknowledgementCandidate: () =>
+        store.getNextTaskAcknowledgementCandidate(),
+      beginTaskAcknowledgement: (input) => {
+        if (!cancelled && input.taskId === "task-1") {
+          cancelled = true;
+          store.rows[0]!.executable = false;
+          return null;
+        }
+        return store.beginTaskAcknowledgement(input);
+      },
+      finishTaskAcknowledgement: (input) =>
+        store.finishTaskAcknowledgement(input),
+    });
+    const sends: string[] = [];
+    const coordinator = createAckCoordinator(
+      coordinatorOptions(store, {
+        store: coordinatorStore,
+        send: async (route) => {
+          sends.push(route.taskId);
+          return Object.freeze({ messageId: `reply-${route.taskId}` });
+        },
+      }),
+    );
+
+    await coordinator.start();
+    await coordinator.waitForIdle();
+
+    expect(sends).toEqual(["task-2"]);
+    expect(store.rows[1]?.state).toBe("ACKNOWLEDGED");
+  });
+
+  it("aborts acknowledgement backoff on wake and promptly rescans after cancellation", async () => {
+    const store = new MemoryAckStore(["RETRYABLE_DNS", "NOT_ATTEMPTED"]);
+    let observedSignal: AbortSignal | undefined;
+    const sends: string[] = [];
+    const coordinator = createAckCoordinator(
+      coordinatorOptions(store, {
+        delay: (_milliseconds, signal) => {
+          observedSignal = signal;
+          return new Promise<void>((resolve) => {
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+        send: async (route) => {
+          sends.push(route.taskId);
+          return Object.freeze({ messageId: `reply-${route.taskId}` });
+        },
+      }),
+    );
+
+    await coordinator.start();
+    await Promise.resolve();
+    store.rows[0]!.executable = false;
+    coordinator.wake();
+    try {
+      expect(observedSignal?.aborted).toBe(true);
+      await coordinator.waitForIdle();
+      expect(sends).toEqual(["task-2"]);
+    } finally {
+      await coordinator.stop();
+    }
+  });
+
+  it("restarts the remaining persisted backoff when a wake does not change the head", async () => {
+    const store = new MemoryAckStore(["RETRYABLE_DNS"]);
+    const delays: Array<{
+      milliseconds: number;
+      signal: AbortSignal;
+      resolve: () => void;
+    }> = [];
+    let sends = 0;
+    const coordinator = createAckCoordinator(
+      coordinatorOptions(store, {
+        delay: (milliseconds, signal) =>
+          new Promise<void>((resolve) => {
+            delays.push({ milliseconds, signal, resolve });
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          }),
+        send: async () => {
+          sends += 1;
+          return Object.freeze({ messageId: "reply-fixture" });
+        },
+      }),
+    );
+
+    await coordinator.start();
+    await Promise.resolve();
+    coordinator.wake();
+    await Promise.resolve();
+    await Promise.resolve();
+    try {
+      expect(delays.map((entry) => entry.milliseconds)).toEqual([1_000, 1_000]);
+      expect(sends).toBe(0);
+      delays[1]!.resolve();
+      await coordinator.waitForIdle();
+      expect(sends).toBe(1);
+    } finally {
+      await coordinator.stop();
+    }
   });
 
   it("classifies marker failure as local-evidence ambiguity without resend or wake", async () => {

@@ -187,6 +187,12 @@ export type RuntimeDependencies = Readonly<{
   decorateAcknowledgementStore?: (
     store: RuntimeAcknowledgementStore,
   ) => RuntimeAcknowledgementStore;
+  claimNextTask?: (
+    store: Pick<JobStore, "claimNextTask">,
+    owner: string,
+    now: Date,
+    ttlMs: number,
+  ) => TaskRecord | null;
 }>;
 
 export interface BotSecretProvider {

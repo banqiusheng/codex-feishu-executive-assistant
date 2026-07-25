@@ -1,6 +1,9 @@
 import {
   createLarkChannel,
+  defaultHttpInstance,
   type CardActionEvent,
+  type HttpInstance,
+  type HttpRequestOptions,
   type LarkChannel,
   type LarkChannelOptions,
   type NormalizedMessage,
@@ -30,11 +33,14 @@ export type BuiltInLarkTransportOptions = Readonly<{
   appId: string;
   appSecret: string;
   createChannel?: CreateLarkChannel;
+  httpInstance?: HttpInstance;
+  acknowledgementHttpTimeoutMs?: number;
 }>;
 
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const IDENTIFIER_MAX_LENGTH = 512;
 const MAX_BUFFERED_MESSAGES = 32;
+const ACKNOWLEDGEMENT_HTTP_TIMEOUT_MS = 30_000;
 const ignoreLarkSdkLog = (): void => undefined;
 const SILENT_LARK_SDK_LOGGER = Object.freeze({
   error: ignoreLarkSdkLog,
@@ -43,6 +49,89 @@ const SILENT_LARK_SDK_LOGGER = Object.freeze({
   debug: ignoreLarkSdkLog,
   trace: ignoreLarkSdkLog,
 });
+
+function fixedTimeoutOptions<D>(
+  options: HttpRequestOptions<D> | undefined,
+  timeout: number,
+): HttpRequestOptions<D> {
+  return { ...(options ?? {}), timeout };
+}
+
+function fixedTimeoutHttpInstance(
+  delegate: HttpInstance,
+  timeout: number,
+): HttpInstance {
+  return Object.freeze({
+    request<T = unknown, R = T, D = unknown>(
+      options: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.request<T, R, D>(fixedTimeoutOptions(options, timeout));
+    },
+    get<T = unknown, R = T, D = unknown>(
+      url: string,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.get<T, R, D>(url, fixedTimeoutOptions(options, timeout));
+    },
+    delete<T = unknown, R = T, D = unknown>(
+      url: string,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.delete<T, R, D>(
+        url,
+        fixedTimeoutOptions(options, timeout),
+      );
+    },
+    head<T = unknown, R = T, D = unknown>(
+      url: string,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.head<T, R, D>(url, fixedTimeoutOptions(options, timeout));
+    },
+    options<T = unknown, R = T, D = unknown>(
+      url: string,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.options<T, R, D>(
+        url,
+        fixedTimeoutOptions(options, timeout),
+      );
+    },
+    post<T = unknown, R = T, D = unknown>(
+      url: string,
+      data?: D,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.post<T, R, D>(
+        url,
+        data,
+        fixedTimeoutOptions(options, timeout),
+      );
+    },
+    put<T = unknown, R = T, D = unknown>(
+      url: string,
+      data?: D,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.put<T, R, D>(
+        url,
+        data,
+        fixedTimeoutOptions(options, timeout),
+      );
+    },
+    patch<T = unknown, R = T, D = unknown>(
+      url: string,
+      data?: D,
+      options?: HttpRequestOptions<D>,
+    ): Promise<R> {
+      return delegate.patch<T, R, D>(
+        url,
+        data,
+        fixedTimeoutOptions(options, timeout),
+      );
+    },
+  });
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -294,7 +383,14 @@ function sdkMessageEvent(
 export function createBuiltInLarkTransport(
   options: BuiltInLarkTransportOptions,
 ): RuntimeTransport {
-  if (options.appId.length === 0 || options.appSecret.length === 0) {
+  const acknowledgementHttpTimeoutMs =
+    options.acknowledgementHttpTimeoutMs ?? ACKNOWLEDGEMENT_HTTP_TIMEOUT_MS;
+  if (
+    options.appId.length === 0 ||
+    options.appSecret.length === 0 ||
+    !Number.isSafeInteger(acknowledgementHttpTimeoutMs) ||
+    acknowledgementHttpTimeoutMs <= 0
+  ) {
     throw new Error("LARK_TRANSPORT_CONFIG_INVALID");
   }
   const createChannel = options.createChannel ?? createLarkChannel;
@@ -304,6 +400,10 @@ export function createBuiltInLarkTransport(
     transport: "websocket",
     includeRawEvent: true,
     source: "executive-assistant-runtime",
+    httpInstance: fixedTimeoutHttpInstance(
+      options.httpInstance ?? defaultHttpInstance,
+      acknowledgementHttpTimeoutMs,
+    ),
     logger: SILENT_LARK_SDK_LOGGER,
     policy: {
       dmMode: "open",

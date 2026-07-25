@@ -573,7 +573,11 @@ export async function startExecutiveRuntime(
       const marker = await readAcknowledgementMarker(
         candidate.workspacePath,
         candidate.taskId,
-        Object.freeze({ allowLegacyV1: before === null }),
+        Object.freeze({
+          allowLegacyV1:
+            before === null ||
+            (before.state === "ACKNOWLEDGED" && before.attemptCount === 0),
+        }),
       );
       if (marker?.version === 1) {
         legacyAcknowledgementTasks.add(candidate.taskId);
@@ -585,9 +589,10 @@ export async function startExecutiveRuntime(
         markerPresent: marker !== null,
       });
       if (
-        reconciled?.state === "NOT_ATTEMPTED" ||
-        reconciled?.state === "RETRYABLE_DNS" ||
-        reconciled?.state === "ACKNOWLEDGED"
+        store.getTask(candidate.taskId)?.state === "RECEIVED" &&
+        (reconciled?.state === "NOT_ATTEMPTED" ||
+          reconciled?.state === "RETRYABLE_DNS" ||
+          reconciled?.state === "ACKNOWLEDGED")
       ) {
         const input = await readTaskInput(candidate.workspacePath);
         taskRoutes.set(
@@ -1119,7 +1124,10 @@ export async function startExecutiveRuntime(
       while (!closing && !executionBarrierTripped) {
         renewLease();
         if (executionBarrierTripped) return;
-        const task = store.claimNextTask(instanceId, now(), LEASE_TTL_MS);
+        const claimAt = now();
+        const task = dependencies.claimNextTask
+          ? dependencies.claimNextTask(store, instanceId, claimAt, LEASE_TTL_MS)
+          : store.claimNextTask(instanceId, claimAt, LEASE_TTL_MS);
         if (task === null) return;
         if (executionBarrierTripped) return;
         try {
@@ -1131,8 +1139,8 @@ export async function startExecutiveRuntime(
       }
     };
 
-    const wakeWorker = (): void => {
-      if (closing || drainPromise !== undefined) return;
+    const wakeWorker = (): boolean => {
+      if (closing || drainPromise !== undefined) return false;
       drainPromise = drain()
         .catch((cause) => {
           lastError = cause;
@@ -1143,6 +1151,7 @@ export async function startExecutiveRuntime(
             acknowledgementCoordinator?.wake();
           }
         });
+      return true;
     };
 
     const activeStore = store;
@@ -1503,6 +1512,7 @@ export async function startExecutiveRuntime(
           } else {
             await marker;
           }
+          if (result.cancelled) acknowledgementCoordinator?.wake();
           return result;
         },
       }),

@@ -361,7 +361,9 @@ export function claimNextTask(
         for (const row of activeRows) taskRecord(row);
         if (activeRows.length > 0) return null;
         const row = database
-          .prepare(`${TASK_SELECT} WHERE state = 'RECEIVED' ORDER BY created_at, id LIMIT 1`)
+          .prepare(
+            `${TASK_SELECT} WHERE state = 'RECEIVED' ORDER BY created_at, id LIMIT 1`,
+          )
           .get() as TaskRow | undefined;
         const next = row === undefined ? undefined : taskRecord(row);
         if (next === undefined) return null;
@@ -685,9 +687,7 @@ export function recoverOnStartup(
         requireOwnLiveBridge(database, instanceId, now);
         const active = (
           database
-            .prepare(
-              `${TASK_SELECT} WHERE state IN ('CLAIMED','RUNNING')`,
-            )
+            .prepare(`${TASK_SELECT} WHERE state IN ('CLAIMED','RUNNING')`)
             .all() as TaskRow[]
         ).map(taskRecord);
         const changedActions = invalidateAllActiveActions(database, now);

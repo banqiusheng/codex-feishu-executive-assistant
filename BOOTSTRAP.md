@@ -62,6 +62,26 @@
 ./scripts/restart --apply
 ```
 
+## 安装后简单验收
+
+安装命令退出 `0` 只说明安装流程没有报错，不等于助理服务已经验收。请让 Codex
+在同一台 Mac mini 上完成下面检查，不需要总裁复制任何链接或终端内容：
+
+1. 核验
+   `launchctl print gui/$(id -u)/com.codex-feishu.executive-assistant`
+   中的服务状态为 `state = running`，不能只确认 plist 已存在。
+2. 运行 `./scripts/doctor`，确认 `config`、`node`、`runtime-entry`、
+   `codex-login`、`lark-cli`、`app-user-scopes`、`user-oauth`、`sqlite`、
+   `launchd-plist`、`launchd-service` 和 `pairing` 没有 `FAIL`。
+3. 只在机器人私聊里发送一次“测试：请只回复连接正常”。发送后不要因为等待而
+   重复点击或重发。
+4. 目视确认飞书里恰好出现一条“收到，我开始处理”和一条最终回复；缺少、重复或
+   顺序异常都不算通过。
+
+`imagegen` 的 `WARN` 不阻塞上述纯文本验收，但会阻塞 PPT 能力验收。只有在目标
+Mac mini 的新 Codex 任务真实暴露 Presentations 与 `imagegen`，并成功回传一份
+PPT 后，才能把 PPT 标为已验收。
+
 ## 24H 边界
 
 LaunchAgent 只能在 Mac mini 已开机、用户已登录、保持唤醒且网络可用时持续工作。FileVault 重启后仍需本人登录一次；断电、系统睡眠、家庭网络或飞书/Codex 服务故障不属于本程序可以绕过的范围。

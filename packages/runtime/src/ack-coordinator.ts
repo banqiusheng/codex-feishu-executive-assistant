@@ -28,7 +28,7 @@ export type AckCoordinatorOptions = Readonly<{
     route: AcknowledgementRoute,
   ) => Promise<Readonly<{ messageId: string }>>;
   writeMarker: (taskId: string, acknowledgedAt: Date) => Promise<void>;
-  wakeWorker: () => void;
+  wakeWorker: () => boolean;
   tripExecutionBarrier: () => void;
 }>;
 
@@ -111,8 +111,7 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
   let stopping = false;
   let wakeRequested = false;
   let loopPromise: Promise<void> | undefined;
-  const abortController = new AbortController();
-  const wokenAcknowledged = new Set<string>();
+  let pendingDelayAbort: AbortController | undefined;
   const haltForFinalizationUncertainty = (): "halt" => {
     options.tripExecutionBarrier();
     return "halt";
@@ -139,10 +138,7 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
     const candidate = options.store.getNextTaskAcknowledgementCandidate();
     if (candidate === null) return "idle";
     if (candidate.state === "ACKNOWLEDGED") {
-      if (!wokenAcknowledged.has(candidate.taskId)) {
-        wokenAcknowledged.add(candidate.taskId);
-        options.wakeWorker();
-      }
+      options.wakeWorker();
       return "idle";
     }
     if (
@@ -154,8 +150,15 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
     if (candidate.state === "RETRYABLE_DNS") {
       const wait = remainingBackoff(candidate, options.now());
       if (wait > 0) {
-        await options.delay(wait, abortController.signal);
-        if (stopping || abortController.signal.aborted) return "halt";
+        const delayAbort = new AbortController();
+        pendingDelayAbort = delayAbort;
+        try {
+          await options.delay(wait, delayAbort.signal);
+        } finally {
+          if (pendingDelayAbort === delayAbort) pendingDelayAbort = undefined;
+        }
+        if (stopping) return "halt";
+        if (delayAbort.signal.aborted) return "continue";
       }
     }
 
@@ -177,7 +180,7 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
     } catch {
       return "halt";
     }
-    if (sending?.taskId !== candidate.taskId) return "halt";
+    if (sending?.taskId !== candidate.taskId) return "continue";
 
     try {
       await options.send(route);
@@ -233,7 +236,6 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
       return haltForFinalizationUncertainty();
     }
     if (stopping) return "halt";
-    wokenAcknowledged.add(candidate.taskId);
     options.wakeWorker();
     return "continue";
   };
@@ -262,6 +264,7 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
     wake(): void {
       if (stopping) return;
       wakeRequested = true;
+      pendingDelayAbort?.abort();
       schedule();
     },
     async stop(): Promise<void> {
@@ -270,7 +273,7 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
         return;
       }
       stopping = true;
-      abortController.abort();
+      pendingDelayAbort?.abort();
       await loopPromise;
     },
     async waitForIdle(): Promise<void> {
