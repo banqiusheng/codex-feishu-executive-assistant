@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim，并要求安装器从锁定 CLI 的结构化输出取得授权地址后直接调用 macOS 浏览器。当前提交仅完成书面设计门禁，尚未修改运行时或安装行为。
+
 ### Fixed
 
 - 修复 LaunchAgent 接到真实消息后，runtime 直接执行 `#!/usr/bin/env node` 的 Codex 脚本、却把子进程 `PATH` 固定为不含安装 Node 的系统目录，导致 Codex 在产生首个 JSONL 事件前以 127 退出：运行配置现在保留并验证安装时记录的 Node 绝对路径，由该 Node 直接启动固定 Codex 脚本，同时继续使用不含秘密和私有飞书 CLI 的精简环境；doctor 的 Codex 登录与插件检查也复用同一启动方式，并新增真实 shebang 进程回归。重复安装会原子刷新已漂移的非秘密 Node/Codex 路径；本版本只接受经安装器验证的 `#!/usr/bin/env node` Codex 入口，原生或未知入口明确停止。
