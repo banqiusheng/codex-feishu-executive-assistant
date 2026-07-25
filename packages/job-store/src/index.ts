@@ -13,7 +13,7 @@ export {
   type ApprovedAction,
   type ApproveActionInput,
   type AttemptOutcome,
-  type BeginNextTaskAcknowledgementInput,
+  type BeginTaskAcknowledgementInput,
   type BindPrincipalInput,
   type BindPrincipalResult,
   type ClaimedAction,

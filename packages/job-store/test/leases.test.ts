@@ -84,15 +84,16 @@ async function stores(): Promise<{
   return { filename, runtimeDir, first, second };
 }
 
-function acknowledgeNext(store: JobStore, now: Date): void {
-  const acknowledgement = store.beginNextTaskAcknowledgement({
+function acknowledgeNext(store: JobStore, taskId: string, now: Date): void {
+  const acknowledgement = store.beginTaskAcknowledgement({
+    taskId,
     owner: "instance-a",
     now,
   });
   expect(acknowledgement).not.toBeNull();
   expect(
     store.finishTaskAcknowledgement({
-      taskId: acknowledgement!.taskId,
+      taskId,
       owner: "instance-a",
       now,
       state: "ACKNOWLEDGED",
@@ -173,12 +174,12 @@ describe("task claiming", () => {
     if (lock === undefined) throw new Error("fixture lock missing");
     const peer = openJobStore({ filename, instanceId: "instance-a", lock });
     openStores.push(peer);
-    first.ingestEvent(event(1), workspace(runtimeDir));
+    const firstTask = first.ingestEvent(event(1), workspace(runtimeDir));
     first.ingestEvent(event(2), workspace(runtimeDir));
     expect(
       first.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
-    acknowledgeNext(first, at(10));
+    acknowledgeNext(first, firstTask.taskId, at(10));
 
     const firstClaim = first.claimNextTask("instance-a", at(11), 1_000);
     const peerClaim = peer.claimNextTask("instance-a", at(11), 1_000);
@@ -194,11 +195,14 @@ describe("task claiming", () => {
     "normalizes %s event task timestamps while claiming",
     async (_caseName, receivedAt) => {
       const { filename, runtimeDir, first } = await stores();
-      first.ingestEvent(event(1, { receivedAt }), workspace(runtimeDir));
+      const task = first.ingestEvent(
+        event(1, { receivedAt }),
+        workspace(runtimeDir),
+      );
       expect(
         first.acquireRuntimeLease("bridge", "instance-a", at(1_000), 1_000),
       ).toBe(true);
-      acknowledgeNext(first, at(1_000));
+      acknowledgeNext(first, task.taskId, at(1_000));
 
       const claimed = first.claimNextTask("instance-a", at(1_001), 1_000);
       const expected = new Date(receivedAt).toISOString();
@@ -270,7 +274,7 @@ describe("task claiming", () => {
     expect(
       first.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
-    acknowledgeNext(first, at(10));
+    acknowledgeNext(first, firstTask.taskId, at(10));
     expect(second.claimNextTask("instance-b", at(11), 1_000)).toBeNull();
 
     const claimed = first.claimNextTask("instance-a", at(11), 1_000);
@@ -293,7 +297,7 @@ describe("task claiming", () => {
     expect(
       first.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
-    acknowledgeNext(first, at(10));
+    acknowledgeNext(first, earlierId, at(10));
 
     const claimed = first.claimNextTask("instance-a", at(11), 1_000);
     expect(claimed?.id).toBe(earlierId);

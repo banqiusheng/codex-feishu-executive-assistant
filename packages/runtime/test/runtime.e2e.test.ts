@@ -611,6 +611,85 @@ describe("executive runtime offline integration", () => {
     }
   });
 
+  it("does not move an older recoverable task to SENDING for a newer inbound route", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const olderTaskId = randomUUID();
+    const olderWorkspace = join(config.paths.jobsRoot, olderTaskId);
+    await mkdir(olderWorkspace, { mode: 0o700 });
+    const seedLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const seedStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "runtime-fifo-seed",
+      lock: seedLock,
+    });
+    seedStore.ingestEvent(
+      {
+        appId: config.appId,
+        tenantKey: TENANT_KEY,
+        eventId: "older-recoverable-event",
+        messageId: "older-recoverable-message",
+        senderOpenId: "ou_synthetic_president",
+        chatId: "oc_synthetic_private_chat",
+        chatType: "p2p",
+        eventType: "im.message.receive_v1",
+        receivedAt: "2026-07-24T00:00:00.000Z",
+        payloadRef: `sha256:${"c".repeat(64)}`,
+      },
+      olderWorkspace,
+    );
+    seedStore.close();
+    await seedLock.release();
+
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-fifo-guard-instance",
+    });
+    try {
+      await expect(
+        transport.emitMessage(message(41, "不得借此消息改写旧任务")),
+      ).rejects.toThrow("ASSISTANT_TASK_ACK_FAILED");
+      await runtime.waitForIdle();
+      expect(transport.textReplies).toHaveLength(0);
+      expect(runner.starts).toHaveLength(0);
+    } finally {
+      await runtime.close();
+    }
+
+    const inspectLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const inspectStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "runtime-fifo-guard-inspector",
+      lock: inspectLock,
+    });
+    try {
+      const candidates =
+        inspectStore.listTaskAcknowledgementRecoveryCandidates();
+      expect(candidates).toHaveLength(2);
+      const newer = candidates.find(
+        (candidate) => candidate.taskId !== olderTaskId,
+      );
+      expect(newer).toBeDefined();
+      expect(inspectStore.getTaskAcknowledgement(olderTaskId)).toMatchObject({
+        state: "NOT_ATTEMPTED",
+        attemptCount: 0,
+      });
+      expect(
+        inspectStore.getTaskAcknowledgement(newer?.taskId ?? ""),
+      ).toMatchObject({
+        state: "NOT_ATTEMPTED",
+        attemptCount: 0,
+      });
+    } finally {
+      inspectStore.close();
+      await inspectLock.release();
+    }
+  });
+
   it("never executes a persisted task whose acknowledgement failed", async () => {
     const config = await fixtureConfig();
     const transport = new FakeTransport();
@@ -893,7 +972,8 @@ describe("executive runtime offline integration", () => {
       store.acquireRuntimeLease("bridge", "seed-instance", new Date(), 60_000),
     ).toBe(true);
     expect(
-      store.beginNextTaskAcknowledgement({
+      store.beginTaskAcknowledgement({
+        taskId,
         owner: "seed-instance",
         now: new Date(),
       }),
@@ -969,7 +1049,8 @@ describe("executive runtime offline integration", () => {
       ),
     ).toBe(true);
     expect(
-      store.beginNextTaskAcknowledgement({
+      store.beginTaskAcknowledgement({
+        taskId,
         owner: "seed-ack-instance",
         now: new Date(),
       }),

@@ -17,7 +17,7 @@ import {
 } from "./actions.js";
 import { cancelActiveTask } from "./control-events.js";
 import {
-  beginNextTaskAcknowledgement,
+  beginTaskAcknowledgement,
   finishTaskAcknowledgement,
   getNextTaskAcknowledgementCandidate,
   getTaskAcknowledgement,
@@ -241,8 +241,8 @@ export function openJobStoreWithMigrationDirectory(
           getNextTaskAcknowledgementCandidate(storeDatabase),
         listTaskAcknowledgementRecoveryCandidates: () =>
           listTaskAcknowledgementRecoveryCandidates(storeDatabase),
-        beginNextTaskAcknowledgement: (input) =>
-          beginNextTaskAcknowledgement(storeDatabase, instanceId, input),
+        beginTaskAcknowledgement: (input) =>
+          beginTaskAcknowledgement(storeDatabase, instanceId, input),
         finishTaskAcknowledgement: (input) =>
           finishTaskAcknowledgement(storeDatabase, instanceId, input),
         reconcileTaskAcknowledgement: (input) =>

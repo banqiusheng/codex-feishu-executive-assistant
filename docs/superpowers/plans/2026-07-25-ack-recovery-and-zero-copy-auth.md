@@ -26,8 +26,10 @@
 **Files:**
 
 - Create: `packages/job-store/migrations/003_task_acknowledgements.sql`
+- Create: `packages/job-store/migrations/004_single_inflight_task_acknowledgement.sql`
 - Create: `packages/job-store/src/acknowledgements.ts`
 - Create: `packages/job-store/test/acknowledgements.test.ts`
+- Create: `packages/job-store/test/fixtures/003_task_acknowledgements_predecessor.sql`
 - Modify: `packages/job-store/src/events.ts`
 - Modify: `packages/job-store/src/tasks.ts`
 - Modify: `packages/job-store/src/types.ts`
@@ -52,10 +54,11 @@ Add tests that prove:
 3. A legacy task with no row is not claimable.
 4. `claimNextTask` selects only `RECEIVED + ACKNOWLEDGED`.
 5. The oldest safe ACK candidate is selected FIFO.
-6. `beginNextTaskAcknowledgement` selects the global FIFO head inside its
-   immediate transaction, requires the live bridge lease, accepts only
-   `NOT_ATTEMPTED` or `RETRYABLE_DNS`, increments `attemptCount`, and persists
-   `SENDING`.
+6. `beginTaskAcknowledgement({ taskId, owner, now })` selects the global FIFO
+   head inside its immediate transaction and changes it to `SENDING` only when
+   its ID equals the expected `taskId`. A mismatch returns `null` with zero
+   writes. A match still requires the live bridge lease, accepts only
+   `NOT_ATTEMPTED` or `RETRYABLE_DNS`, and increments `attemptCount`.
 7. Finalization accepts only the exact transitions in the confirmed state
    machine.
 8. Startup reconciliation promotes a valid marker to `ACKNOWLEDGED`, keeps
@@ -106,14 +109,28 @@ CREATE INDEX task_acknowledgements_recovery_order
   ON task_acknowledgements(state, created_at, task_id);
 
 CREATE UNIQUE INDEX one_inflight_task_acknowledgement
-  ON task_acknowledgements(state)
+  ON task_acknowledgements(task_id)
   WHERE state = 'SENDING';
 ```
 
 Do not backfill historical tasks. The absence of a row is intentionally
-ambiguous. The partial unique index is deliberately unique on the constant
-filtered state, not `task_id`, so two different tasks cannot both be
-`SENDING`.
+ambiguous.
+
+Migration 003 is already checksum-recorded and must remain byte-for-byte
+append-only. Add migration 004 to repair its ineffective partial index without
+rewriting history:
+
+```sql
+DROP INDEX one_inflight_task_acknowledgement;
+
+CREATE UNIQUE INDEX one_inflight_task_acknowledgement
+  ON task_acknowledgements(state)
+  WHERE state = 'SENDING';
+```
+
+The replacement index is unique on the constant filtered state, so two
+different tasks cannot both be `SENDING`. Prove the upgrade with a database
+that already carries the predecessor 003 checksum.
 
 **Step 3: Add strict ACK store operations**
 
@@ -147,7 +164,7 @@ type TaskAcknowledgementRecord = Readonly<{
 Add `getTaskAcknowledgement(taskId)`,
 `getNextTaskAcknowledgementCandidate()`,
 `listTaskAcknowledgementRecoveryCandidates()`,
-`beginNextTaskAcknowledgement({ owner, now })`,
+`beginTaskAcknowledgement({ taskId, owner, now })`,
 `finishTaskAcknowledgement({ taskId, owner, now, state, failureClass })`, and
 `reconcileTaskAcknowledgement({ taskId, owner, now, markerPresent })` to
 `JobStore` and `SqliteJobStore`.
@@ -159,12 +176,13 @@ immediate transaction. `finishTaskAcknowledgement` may finalize only a current
 the task to a safe non-executable terminal/recovery state and invalidate pending
 task actions through existing task lifecycle helpers.
 
-**Audited safety clarification (2026-07-25):** the store-selected
-`beginNextTaskAcknowledgement` replaces the earlier caller-selected
-`beginTaskAcknowledgement`. Selection and `NOT_ATTEMPTED` / `RETRYABLE_DNS` to
-`SENDING` transition occur in the same immediate transaction, so a caller
-cannot name a later task and bypass the global FIFO head. All downstream
-callers use this store-selected contract.
+**Audited safety clarification (2026-07-25):**
+`beginTaskAcknowledgement` restores the frozen brief's exact expected-task
+contract without weakening FIFO. The store first selects the global oldest
+`RECEIVED` task inside the same immediate transaction. It performs the
+`NOT_ATTEMPTED` / `RETRYABLE_DNS` to `SENDING` transition only when that row's
+task ID equals the caller's expected `taskId`; any mismatch returns `null` with
+zero writes. The caller therefore cannot skip or mutate a different FIFO task.
 
 **Step 4: Wire atomic task creation and claim/recovery**
 
@@ -174,10 +192,10 @@ callers use this store-selected contract.
   `state = 'ACKNOWLEDGED'`.
 - Keep the runtime file gate even after adding the database gate.
 - Keep the existing one-shot production path runnable in this slice:
-  `beginNext -> transport success -> durable marker -> ACKNOWLEDGED -> wake`.
-  Unknown transport or marker outcomes become non-executable and never forge
-  an ACK. Task 2 replaces this one-shot seam with the bounded DNS retry
-  coordinator.
+  `begin(expected taskId and FIFO match) -> transport success -> durable marker
+  -> ACKNOWLEDGED -> wake`. Unknown transport or marker outcomes become
+  non-executable and never forge an ACK. Task 2 replaces this one-shot seam with
+  the bounded DNS retry coordinator.
 - Before channel/worker startup, enumerate all `RECEIVED` candidates, derive
   marker presence only through the strict private-file gate, reconcile every
   candidate under the live bridge lease, then recover `CLAIMED` / `RUNNING`.

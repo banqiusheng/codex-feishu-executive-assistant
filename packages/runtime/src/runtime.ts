@@ -1401,7 +1401,8 @@ export async function startExecutiveRuntime(
           }
           let sending;
           try {
-            sending = activeStore.beginNextTaskAcknowledgement({
+            sending = activeStore.beginTaskAcknowledgement({
+              taskId,
               owner: instanceId,
               now: now(),
             });

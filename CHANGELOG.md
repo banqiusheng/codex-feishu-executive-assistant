@@ -12,7 +12,7 @@
 
 ### Fixed
 
-- 修复 ACK 数据库门禁落地后 runtime 仍只写文件 marker、未推进数据库 ACK，导致所有新任务收到接单回复却永远无法 claim 的回归；生产顺序现为 store 选择 FIFO 头并持久 `SENDING`、发送成功、耐久 marker、数据库 `ACKNOWLEDGED`、最后 wake。全局唯一约束禁止两个不同任务同时 `SENDING`，启动时通过受限 marker 文件校验逐项对账，冲突状态进入人工确认，未知发送/marker 结果不伪造成功且不启动 Codex。
+- 修复 ACK 数据库门禁落地后 runtime 仍只写文件 marker、未推进数据库 ACK，导致所有新任务收到接单回复却永远无法 claim 的回归；生产顺序现为 runtime 以当前 taskId 要求 store 在同一事务核对 FIFO 头并持久 `SENDING`、发送成功、耐久 marker、数据库 `ACKNOWLEDGED`、最后 wake，taskId 不匹配时零写入且不发送。全局单 `SENDING` 约束通过 append-only 迁移 004 修正，不改写已记录 checksum 的迁移 003；启动时通过受限 marker 文件校验逐项对账，冲突状态进入人工确认，未知发送/marker 结果不伪造成功且不启动 Codex。
 - 修复 LaunchAgent 接到真实消息后，runtime 直接执行 `#!/usr/bin/env node` 的 Codex 脚本、却把子进程 `PATH` 固定为不含安装 Node 的系统目录，导致 Codex 在产生首个 JSONL 事件前以 127 退出：运行配置现在保留并验证安装时记录的 Node 绝对路径，由该 Node 直接启动固定 Codex 脚本，同时继续使用不含秘密和私有飞书 CLI 的精简环境；doctor 的 Codex 登录与插件检查也复用同一启动方式，并新增真实 shebang 进程回归。重复安装会原子刷新已漂移的非秘密 Node/Codex 路径；本版本只接受经安装器验证的 `#!/usr/bin/env node` Codex 入口，原生或未知入口明确停止。
 - 修复重复安装时旧 LaunchAgent 仍处于 launchd `removing` 过渡窗口，紧接执行 `bootstrap` 会返回 `Input/output error`：安装器现在等待同一服务确认卸载，再只对该次卸载后的精确过渡期 EIO 做有限重试；新安装或其他错误仍然 fail closed，并在启动前后核验服务状态。
 - 修复专用 `CODEX_HOME` 中已经安装同一官方 `openai-primary-runtime` 来源的旧版 Presentations 时，安装器把正常版本漂移误判为来源异常：现在直接从官方 marketplace 清单和插件 manifest 读取当前版本，仅允许数字版本严格向前升级；升级前把旧 cache 完整复制到权限 `0700` 的私有隔离区，官方安装失败或升级后精确复核失败时恢复旧 cache，来源、身份、版本方向或缓存结构不明时仍然拒绝覆盖。

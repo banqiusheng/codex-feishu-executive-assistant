@@ -145,7 +145,7 @@ function acknowledge(store: JobStore, taskId: string, now: Date): void {
     true,
   );
   expect(
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now }),
+    store.beginTaskAcknowledgement({ taskId, owner: "instance-a", now }),
   ).toMatchObject({ state: "SENDING", attemptCount: 1 });
   expect(
     store.finishTaskAcknowledgement({
@@ -238,7 +238,11 @@ describe("task acknowledgement ledger", () => {
     ).toBe(true);
     expect(store.claimNextTask("instance-a", at(12), 1_000)).toBeNull();
     expect(
-      store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(13) }),
+      store.beginTaskAcknowledgement({
+        taskId: first.taskId,
+        owner: "instance-a",
+        now: at(13),
+      }),
     ).toMatchObject({ taskId: first.taskId, state: "SENDING" });
     store.finishTaskAcknowledgement({
       taskId: first.taskId,
@@ -257,13 +261,21 @@ describe("task acknowledgement ledger", () => {
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
 
     expect(() =>
-      store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(10) }),
+      store.beginTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(10),
+      }),
     ).toThrowError(/bridge_runtime_lease_is_not_live/);
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
     expect(
-      store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(11) }),
+      store.beginTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(11),
+      }),
     ).toMatchObject({ state: "SENDING", attemptCount: 1 });
     expect(
       store.finishTaskAcknowledgement({
@@ -275,8 +287,48 @@ describe("task acknowledgement ledger", () => {
       }),
     ).toMatchObject({ state: "RETRYABLE_DNS" });
     expect(
-      store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(13) }),
+      store.beginTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(13),
+      }),
     ).toMatchObject({ state: "SENDING", attemptCount: 2 });
+  });
+
+  it("leaves every acknowledgement unchanged when the expected task is not the FIFO head", async () => {
+    const { runtimeDir, store } = await storeFixture();
+    const first = store.ingestEvent(event(1), workspace(runtimeDir));
+    const second = store.ingestEvent(event(2), workspace(runtimeDir));
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
+
+    expect(
+      store.beginTaskAcknowledgement({
+        taskId: second.taskId,
+        owner: "instance-a",
+        now: at(11),
+      }),
+    ).toBeNull();
+    expect(store.getTaskAcknowledgement(first.taskId)).toMatchObject({
+      state: "NOT_ATTEMPTED",
+      attemptCount: 0,
+    });
+    expect(store.getTaskAcknowledgement(second.taskId)).toMatchObject({
+      state: "NOT_ATTEMPTED",
+      attemptCount: 0,
+    });
+    expect(
+      store.beginTaskAcknowledgement({
+        taskId: first.taskId,
+        owner: "instance-a",
+        now: at(12),
+      }),
+    ).toMatchObject({
+      taskId: first.taskId,
+      state: "SENDING",
+      attemptCount: 1,
+    });
   });
 
   it("enforces one global SENDING acknowledgement at the database layer", async () => {
@@ -302,7 +354,8 @@ describe("task acknowledgement ledger", () => {
     );
 
     expect(
-      store.beginNextTaskAcknowledgement({
+      store.beginTaskAcknowledgement({
+        taskId,
         owner: "instance-b",
         now: at(11),
       }),
@@ -312,7 +365,8 @@ describe("task acknowledgement ledger", () => {
       attemptCount: 0,
     });
     expect(() =>
-      store.beginNextTaskAcknowledgement({
+      store.beginTaskAcknowledgement({
+        taskId,
         owner: "instance-a",
         now: at(21),
       }),
@@ -330,7 +384,8 @@ describe("task acknowledgement ledger", () => {
       true,
     );
     expect(
-      store.beginNextTaskAcknowledgement({
+      store.beginTaskAcknowledgement({
+        taskId,
         owner: "instance-a",
         now: at(11),
       }),
@@ -369,15 +424,15 @@ describe("task acknowledgement ledger", () => {
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
     const getter = vi.fn(() => "instance-a");
-    const accessor = { now: at(11) };
+    const accessor = { taskId, now: at(11) };
     Object.defineProperty(accessor, "owner", {
       enumerable: true,
       get: getter,
     });
     expect(() =>
-      store.beginNextTaskAcknowledgement(
+      store.beginTaskAcknowledgement(
         accessor as unknown as Parameters<
-          JobStore["beginNextTaskAcknowledgement"]
+          JobStore["beginTaskAcknowledgement"]
         >[0],
       ),
     ).toThrowError(/task_acknowledgement_input_must_be_own_data_properties/);
@@ -386,14 +441,18 @@ describe("task acknowledgement ledger", () => {
     const ownKeys = vi.fn<() => ArrayLike<string | symbol>>(() => []);
     const get = vi.fn();
     expect(() =>
-      store.beginNextTaskAcknowledgement(
-        new Proxy({ owner: "instance-a", now: at(11) }, { ownKeys, get }),
+      store.beginTaskAcknowledgement(
+        new Proxy(
+          { taskId, owner: "instance-a", now: at(11) },
+          { ownKeys, get },
+        ),
       ),
     ).toThrowError(/task_acknowledgement_input_must_be_own_data_properties/);
     expect(ownKeys).not.toHaveBeenCalled();
     expect(get).not.toHaveBeenCalled();
 
-    store.beginNextTaskAcknowledgement({
+    store.beginTaskAcknowledgement({
+      taskId,
       owner: "instance-a",
       now: at(11),
     });
@@ -457,7 +516,11 @@ describe("task acknowledgement ledger", () => {
         failureClass: null,
       }),
     ).toBeNull();
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(12) });
+    store.beginTaskAcknowledgement({
+      taskId,
+      owner: "instance-a",
+      now: at(12),
+    });
     expect(() =>
       store.finishTaskAcknowledgement({
         taskId,
@@ -500,7 +563,11 @@ describe("task acknowledgement ledger", () => {
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(11) });
+    store.beginTaskAcknowledgement({
+      taskId: acknowledged.taskId,
+      owner: "instance-a",
+      now: at(11),
+    });
     store.finishTaskAcknowledgement({
       taskId: acknowledged.taskId,
       owner: "instance-a",
@@ -513,7 +580,11 @@ describe("task acknowledgement ledger", () => {
       .prepare("UPDATE tasks SET state = 'CLAIMED' WHERE id = ?")
       .run(acknowledged.taskId);
     database.close();
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(13) });
+    store.beginTaskAcknowledgement({
+      taskId: recoverable.taskId,
+      owner: "instance-a",
+      now: at(13),
+    });
     store.finishTaskAcknowledgement({
       taskId: recoverable.taskId,
       owner: "instance-a",
@@ -529,7 +600,11 @@ describe("task acknowledgement ledger", () => {
         markerPresent: false,
       }),
     ).toMatchObject({ state: "RETRYABLE_DNS" });
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(15) });
+    store.beginTaskAcknowledgement({
+      taskId: recoverable.taskId,
+      owner: "instance-a",
+      now: at(15),
+    });
     store.finishTaskAcknowledgement({
       taskId: recoverable.taskId,
       owner: "instance-a",
@@ -542,7 +617,11 @@ describe("task acknowledgement ledger", () => {
       .prepare("UPDATE tasks SET state = 'CLAIMED' WHERE id = ?")
       .run(recoverable.taskId);
     database.close();
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(17) });
+    store.beginTaskAcknowledgement({
+      taskId: sending.taskId,
+      owner: "instance-a",
+      now: at(17),
+    });
     database = new Database(filename);
     database
       .prepare("DELETE FROM task_acknowledgements WHERE task_id = ?")
@@ -626,7 +705,11 @@ describe("task acknowledgement ledger", () => {
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(11) });
+    store.beginTaskAcknowledgement({
+      taskId,
+      owner: "instance-a",
+      now: at(11),
+    });
     store.finishTaskAcknowledgement({
       taskId,
       owner: "instance-a",

@@ -10,7 +10,7 @@ import {
 import { invalidateTaskActions } from "./tasks.js";
 import {
   RuntimeStateError,
-  type BeginNextTaskAcknowledgementInput,
+  type BeginTaskAcknowledgementInput,
   type FinishTaskAcknowledgementInput,
   type ReconcileTaskAcknowledgementInput,
   type TaskAcknowledgementFailureClass,
@@ -280,13 +280,13 @@ export function listTaskAcknowledgementRecoveryCandidates(
   }
 }
 
-export function beginNextTaskAcknowledgement(
+export function beginTaskAcknowledgement(
   database: Database.Database,
   instanceId: string,
-  inputValue: BeginNextTaskAcknowledgementInput,
+  inputValue: BeginTaskAcknowledgementInput,
 ): TaskAcknowledgementRecord | null {
-  const input = ownSnapshot(inputValue, ["owner", "now"]);
-  if (!safeText(input.owner))
+  const input = ownSnapshot(inputValue, ["taskId", "owner", "now"]);
+  if (!safeText(input.taskId) || !safeText(input.owner))
     throw new RuntimeStateError("task_acknowledgement_input_is_invalid");
   const now = snapshotDate(input.now as Date);
   if (input.owner !== instanceId) return null;
@@ -297,6 +297,7 @@ export function beginNextTaskAcknowledgement(
         const next = earliestReceived(database);
         if (
           next === null ||
+          next.taskId !== input.taskId ||
           next.acknowledgement === null ||
           (next.acknowledgement.state !== "NOT_ATTEMPTED" &&
             next.acknowledgement.state !== "RETRYABLE_DNS")
@@ -306,9 +307,9 @@ export function beginNextTaskAcknowledgement(
           .prepare(
             `UPDATE task_acknowledgements SET state = 'SENDING', attempt_count = attempt_count + 1, last_failure_class = NULL, updated_at = ? WHERE task_id = ? AND state = ?`,
           )
-          .run(now.iso, next.taskId, next.acknowledgement.state).changes;
+          .run(now.iso, input.taskId, next.acknowledgement.state).changes;
         return changed === 1
-          ? findAcknowledgement(database, next.taskId)
+          ? findAcknowledgement(database, input.taskId as string)
           : null;
       })
       .immediate();

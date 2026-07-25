@@ -92,7 +92,8 @@ async function storeFixture(
     ).toBe(true);
     if (options.startTask !== false) {
       expect(
-        store.beginNextTaskAcknowledgement({
+        store.beginTaskAcknowledgement({
+          taskId,
           owner: "instance-a",
           now: at(1),
         }),

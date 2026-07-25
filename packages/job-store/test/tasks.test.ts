@@ -430,7 +430,11 @@ function claimAndRun(store: JobStore, taskId: string): void {
     store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
   ).toBe(true);
   expect(
-    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(10) }),
+    store.beginTaskAcknowledgement({
+      taskId,
+      owner: "instance-a",
+      now: at(10),
+    }),
   ).toMatchObject({ taskId, state: "SENDING" });
   expect(
     store.finishTaskAcknowledgement({
@@ -453,14 +457,15 @@ function claimAndRun(store: JobStore, taskId: string): void {
   ).toBe("RUNNING");
 }
 
-function acknowledgeNext(store: JobStore, now: Date): void {
-  const acknowledgement = store.beginNextTaskAcknowledgement({
+function acknowledgeNext(store: JobStore, taskId: string, now: Date): void {
+  const acknowledgement = store.beginTaskAcknowledgement({
+    taskId,
     owner: "instance-a",
     now,
   });
   expect(acknowledgement).not.toBeNull();
   store.finishTaskAcknowledgement({
-    taskId: acknowledgement!.taskId,
+    taskId,
     owner: "instance-a",
     now,
     state: "ACKNOWLEDGED",
@@ -477,7 +482,7 @@ describe("task lifecycle", () => {
       expect(
         first.acquireRuntimeLease("bridge", "instance-a", at(10), 100),
       ).toBe(true);
-      acknowledgeNext(first, at(10));
+      acknowledgeNext(first, taskId, at(10));
       expect(first.claimNextTask("instance-a", at(11), 1_000)?.state).toBe(
         "CLAIMED",
       );
@@ -537,7 +542,7 @@ describe("task lifecycle", () => {
     expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 100)).toBe(
       true,
     );
-    acknowledgeNext(store, at(10));
+    acknowledgeNext(store, taskId, at(10));
     expect(store.claimNextTask("instance-a", at(11), 1_000)?.state).toBe(
       "CLAIMED",
     );
@@ -735,7 +740,7 @@ describe("task lifecycle", () => {
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
     ).toBe(true);
-    acknowledgeNext(store, at(10));
+    acknowledgeNext(store, taskId, at(10));
     expect(store.claimNextTask("instance-a", at(11), 100)).not.toBeNull();
     expect(
       store.markRunning({
@@ -860,7 +865,7 @@ describe("recovery and replacement", () => {
       expect(
         store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
       ).toBe(true);
-      acknowledgeNext(store, at(10));
+      acknowledgeNext(store, taskId, at(10));
       expect(store.claimNextTask("instance-a", at(11), 1_000)).not.toBeNull();
       if (state === "RUNNING") {
         expect(

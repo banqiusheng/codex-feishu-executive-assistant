@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -679,7 +680,7 @@ describe("openJobStore", () => {
       verificationDb
         .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
         .get(),
-    ).toEqual({ count: 3 });
+    ).toEqual({ count: 4 });
     verificationDb.close();
   });
 
@@ -746,7 +747,77 @@ describe("openJobStore", () => {
       verification
         .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
         .get(),
-    ).toEqual({ count: 3 });
+    ).toEqual({ count: 4 });
+    verification.close();
+  });
+
+  it("upgrades a database with the predecessor migration 003 checksum through append-only migration 004", async () => {
+    const runtimeDir = createRuntimeDirectory();
+    const filename = tempDb(runtimeDir);
+    const predecessorMigrations = join(runtimeDir, "predecessor-migrations");
+    const currentMigrations = migrationDirectoryForModuleUrl(import.meta.url);
+    mkdirSync(predecessorMigrations, { mode: 0o700 });
+    for (const migration of [
+      "001_initial.sql",
+      "002_task_leases_and_control_outcomes.sql",
+    ]) {
+      writeFileSync(
+        join(predecessorMigrations, migration),
+        readFileSync(join(currentMigrations, migration), "utf8"),
+        { mode: 0o600 },
+      );
+    }
+    const predecessorMigration003 = readFileSync(
+      join(
+        dirname(currentMigrations),
+        "test",
+        "fixtures",
+        "003_task_acknowledgements_predecessor.sql",
+      ),
+      "utf8",
+    );
+    expect(
+      createHash("sha256").update(predecessorMigration003).digest("hex"),
+    ).toBe("75b43d38bb30ea4cfe31047a90637c1945170f2e781c18163f569250f36991db");
+    writeFileSync(
+      join(predecessorMigrations, "003_task_acknowledgements.sql"),
+      predecessorMigration003,
+      { mode: 0o600 },
+    );
+
+    const lock = await acquireLock(runtimeDir);
+    const predecessor = openJobStoreWithMigrationDirectory(
+      { filename, instanceId: "instance-a", lock },
+      predecessorMigrations,
+      (path) => new Database(path),
+    );
+    predecessor.close();
+
+    const upgraded = openJobStore({
+      filename,
+      instanceId: "instance-a",
+      lock,
+    });
+    openStores.push(upgraded);
+    const verification = new Database(filename, { readonly: true });
+    expect(
+      verification
+        .prepare(
+          "SELECT version, name FROM schema_migrations WHERE version >= 3 ORDER BY version",
+        )
+        .all(),
+    ).toEqual([
+      { version: 3, name: "003_task_acknowledgements.sql" },
+      {
+        version: 4,
+        name: "004_single_inflight_task_acknowledgement.sql",
+      },
+    ]);
+    expect(
+      verification
+        .prepare("PRAGMA index_info(one_inflight_task_acknowledgement)")
+        .all(),
+    ).toEqual([{ seqno: 0, cid: 1, name: "state" }]);
     verification.close();
   });
 

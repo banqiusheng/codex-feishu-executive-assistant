@@ -194,8 +194,8 @@ export interface JobStore {
   getTaskAcknowledgement(taskId: string): TaskAcknowledgementRecord | null;
   getNextTaskAcknowledgementCandidate(): TaskAcknowledgementRecord | null;
   listTaskAcknowledgementRecoveryCandidates(): readonly TaskAcknowledgementRecoveryCandidate[];
-  beginNextTaskAcknowledgement(
-    input: BeginNextTaskAcknowledgementInput,
+  beginTaskAcknowledgement(
+    input: BeginTaskAcknowledgementInput,
   ): TaskAcknowledgementRecord | null;
   finishTaskAcknowledgement(
     input: FinishTaskAcknowledgementInput,
@@ -265,7 +265,8 @@ export type TaskAcknowledgementRecoveryCandidate = Readonly<{
   taskId: string;
   workspacePath: string;
 }>;
-export type BeginNextTaskAcknowledgementInput = Readonly<{
+export type BeginTaskAcknowledgementInput = Readonly<{
+  taskId: string;
   owner: string;
   now: Date;
 }>;
@@ -359,8 +360,8 @@ export type JobStoreOperations = Readonly<{
   getTaskAcknowledgement(taskId: string): TaskAcknowledgementRecord | null;
   getNextTaskAcknowledgementCandidate(): TaskAcknowledgementRecord | null;
   listTaskAcknowledgementRecoveryCandidates(): readonly TaskAcknowledgementRecoveryCandidate[];
-  beginNextTaskAcknowledgement(
-    input: BeginNextTaskAcknowledgementInput,
+  beginTaskAcknowledgement(
+    input: BeginTaskAcknowledgementInput,
   ): TaskAcknowledgementRecord | null;
   finishTaskAcknowledgement(
     input: FinishTaskAcknowledgementInput,
@@ -463,10 +464,10 @@ export class SqliteJobStore implements JobStore {
   listTaskAcknowledgementRecoveryCandidates(): readonly TaskAcknowledgementRecoveryCandidate[] {
     return this.#operations.listTaskAcknowledgementRecoveryCandidates();
   }
-  beginNextTaskAcknowledgement(
-    input: BeginNextTaskAcknowledgementInput,
+  beginTaskAcknowledgement(
+    input: BeginTaskAcknowledgementInput,
   ): TaskAcknowledgementRecord | null {
-    return this.#operations.beginNextTaskAcknowledgement(input);
+    return this.#operations.beginTaskAcknowledgement(input);
   }
   finishTaskAcknowledgement(
     input: FinishTaskAcknowledgementInput,
