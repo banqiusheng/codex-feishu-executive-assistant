@@ -2,6 +2,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  cpSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +11,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,6 +54,22 @@ function runZsh(
   });
 }
 
+function copyMinimalInstallDelivery(root: string): string {
+  for (const entry of [
+    "dependencies.lock.json",
+    "config",
+    "launchd",
+    "skills/executive-assistant",
+    "LICENSES/visual-first-ppt-MIT.txt",
+    "scripts/install",
+    "scripts/install-support.mjs",
+    "scripts/doctor-feishu-network.mjs",
+  ]) {
+    cpSync(join(repositoryRoot, entry), join(root, entry), { recursive: true });
+  }
+  return join(root, "scripts", "install");
+}
+
 afterEach(() => {
   while (temporaryRoots.length > 0) {
     const candidate = temporaryRoots.pop();
@@ -84,6 +103,66 @@ describe("lean delivery surface", () => {
     const stat = lstatSync(feishuNetworkDoctorPath);
     expect(stat.isFile()).toBe(true);
     expect(stat.isSymbolicLink()).toBe(false);
+  });
+
+  it("rejects a missing or symlinked Feishu helper before verify-only can write installation state", () => {
+    for (const mode of ["missing", "symlink"] as const) {
+      const root = temporaryHome();
+      const localInstall = copyMinimalInstallDelivery(root);
+      const helper = join(root, "scripts", "doctor-feishu-network.mjs");
+      if (mode === "missing") {
+        rmSync(helper);
+      } else {
+        rmSync(helper);
+        symlinkSync(
+          join(repositoryRoot, "scripts", "doctor-feishu-network.mjs"),
+          helper,
+        );
+      }
+      const result = spawnSync("/bin/zsh", [localInstall, "--verify-only"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          ASSISTANT_TEST_MODE: "1",
+        },
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "飞书网络 doctor helper 缺失或不是可信普通文件",
+      );
+      expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
+    }
+  });
+
+  it("does not invoke an opener for plan, verify-only, or test-mode doctor", () => {
+    const root = temporaryHome();
+    const fakeBin = join(root, "bin");
+    const logPath = join(root, "open.log");
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "open"),
+      `#!${process.execPath}\nimport fs from "node:fs";\nfs.appendFileSync(process.env.OPEN_CALL_LOG, "open\\n"); process.exit(99);\n`,
+      { mode: 0o500 },
+    );
+    chmodSync(join(fakeBin, "open"), 0o500);
+    for (const [script, args] of [
+      [installPath, ["--plan"]],
+      [installPath, ["--verify-only"]],
+      [doctorPath, ["--help"]],
+    ] as const) {
+      const result = runZsh(script, args, {
+        HOME: root,
+        ASSISTANT_TEST_MODE: "1",
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        OPEN_CALL_LOG: logPath,
+      });
+      expect(result.status).toBe(0);
+    }
+    expect(existsSync(logPath)).toBe(false);
+    expect(readFileSync(installPath, "utf8")).not.toContain("/usr/bin/open");
+    expect(readFileSync(doctorPath, "utf8")).not.toContain("/usr/bin/open");
   });
 
   it("blocks apply mode before any Keychain launchctl build or directory side effect in tests", () => {

@@ -55,6 +55,8 @@ doctor 还会在不读取 App Secret、Bot/User Token 或调用写接口的前�
 业务调用成功、配对完成或 24 小时可用；安装器也会核验该 helper 是普通非符号链接交付文件。
 网络 child 在五秒到期时会强制终止；其输出、stderr、退出状态与 JSON schema 任一不可信时，
 doctor 只给出固定失败分类，不回显子进程内容。
+当前交付回归还验证 helper 缺失或符号链接时 `--verify-only` 会在写入前停止，并验证 `--plan`、
+`--verify-only` 与 doctor 测试模式不会调用浏览器 opener；OAuth 的 apply-only 授权打开流程仍属后续范围。
 
 也可以直接把下面这句话交给 Codex：
 
