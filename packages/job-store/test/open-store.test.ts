@@ -679,11 +679,11 @@ describe("openJobStore", () => {
       verificationDb
         .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
         .get(),
-    ).toEqual({ count: 2 });
+    ).toEqual({ count: 3 });
     verificationDb.close();
   });
 
-  it("forwards a real v1-only database to v2 while preserving controls with pending defaulted false", async () => {
+  it("forwards a real v1-only database through all migrations while preserving controls with pending defaulted false", async () => {
     const runtimeDir = createRuntimeDirectory();
     const filename = tempDb(runtimeDir);
     const v1Migrations = join(runtimeDir, "v1-migrations");
@@ -746,7 +746,7 @@ describe("openJobStore", () => {
       verification
         .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
         .get(),
-    ).toEqual({ count: 2 });
+    ).toEqual({ count: 3 });
     verification.close();
   });
 

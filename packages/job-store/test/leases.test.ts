@@ -84,6 +84,23 @@ async function stores(): Promise<{
   return { filename, runtimeDir, first, second };
 }
 
+function acknowledgeNext(store: JobStore, now: Date): void {
+  const acknowledgement = store.beginNextTaskAcknowledgement({
+    owner: "instance-a",
+    now,
+  });
+  expect(acknowledgement).not.toBeNull();
+  expect(
+    store.finishTaskAcknowledgement({
+      taskId: acknowledgement!.taskId,
+      owner: "instance-a",
+      now,
+      state: "ACKNOWLEDGED",
+      failureClass: null,
+    }),
+  ).toMatchObject({ state: "ACKNOWLEDGED" });
+}
+
 describe("runtime leases", () => {
   it("excludes a second owner, treats equality as live, and permits strict-expiry takeover", async () => {
     const { first, second } = await stores();
@@ -161,6 +178,7 @@ describe("task claiming", () => {
     expect(
       first.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
+    acknowledgeNext(first, at(10));
 
     const firstClaim = first.claimNextTask("instance-a", at(11), 1_000);
     const peerClaim = peer.claimNextTask("instance-a", at(11), 1_000);
@@ -180,6 +198,7 @@ describe("task claiming", () => {
       expect(
         first.acquireRuntimeLease("bridge", "instance-a", at(1_000), 1_000),
       ).toBe(true);
+      acknowledgeNext(first, at(1_000));
 
       const claimed = first.claimNextTask("instance-a", at(1_001), 1_000);
       const expected = new Date(receivedAt).toISOString();
@@ -251,6 +270,7 @@ describe("task claiming", () => {
     expect(
       first.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
+    acknowledgeNext(first, at(10));
     expect(second.claimNextTask("instance-b", at(11), 1_000)).toBeNull();
 
     const claimed = first.claimNextTask("instance-a", at(11), 1_000);
@@ -273,6 +293,7 @@ describe("task claiming", () => {
     expect(
       first.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
     ).toBe(true);
+    acknowledgeNext(first, at(10));
 
     const claimed = first.claimNextTask("instance-a", at(11), 1_000);
     expect(claimed?.id).toBe(earlierId);

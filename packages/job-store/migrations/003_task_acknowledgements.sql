@@ -25,7 +25,7 @@ CREATE INDEX task_acknowledgements_recovery_order
   ON task_acknowledgements(state, created_at, task_id);
 
 CREATE UNIQUE INDEX one_inflight_task_acknowledgement
-  ON task_acknowledgements(task_id)
+  ON task_acknowledgements(state)
   WHERE state = 'SENDING';
 
 CREATE TRIGGER task_acknowledgements_legal_state_transition

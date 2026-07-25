@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 import type { InboundEvent } from "@executive-assistant/contracts";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   acquireDatabaseFileLock,
@@ -86,6 +86,60 @@ function inspect<T>(filename: string, query: string): readonly T[] {
   }
 }
 
+function mutate(
+  filename: string,
+  sql: string,
+  ...parameters: readonly unknown[]
+): void {
+  const database = new Database(filename);
+  try {
+    database.prepare(sql).run(...parameters);
+  } finally {
+    database.close();
+  }
+}
+
+function seedAcknowledgementState(
+  filename: string,
+  taskId: string,
+  state:
+    | "NOT_ATTEMPTED"
+    | "SENDING"
+    | "RETRYABLE_DNS"
+    | "ACKNOWLEDGED"
+    | "AMBIGUOUS"
+    | "FAILED_DEFINITE",
+): void {
+  if (state === "NOT_ATTEMPTED") return;
+  mutate(
+    filename,
+    `UPDATE task_acknowledgements
+        SET state = 'SENDING', attempt_count = 1, updated_at = ?
+      WHERE task_id = ?`,
+    at(10).toISOString(),
+    taskId,
+  );
+  if (state === "SENDING") return;
+  const failureClass =
+    state === "RETRYABLE_DNS"
+      ? "DNS_UNAVAILABLE"
+      : state === "AMBIGUOUS"
+        ? "RESULT_AMBIGUOUS"
+        : state === "FAILED_DEFINITE"
+          ? "REMOTE_REJECTED"
+          : null;
+  mutate(
+    filename,
+    `UPDATE task_acknowledgements
+        SET state = ?, last_failure_class = ?, updated_at = ?
+      WHERE task_id = ?`,
+    state,
+    failureClass,
+    at(11).toISOString(),
+    taskId,
+  );
+}
+
 function acknowledge(store: JobStore, taskId: string, now: Date): void {
   expect(store.acquireRuntimeLease("bridge", "instance-a", now, 10_000)).toBe(
     true,
@@ -147,12 +201,14 @@ describe("task acknowledgement ledger", () => {
     const { filename, runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
     const database = new Database(filename);
-    database.prepare("DELETE FROM task_acknowledgements WHERE task_id = ?").run(taskId);
+    database
+      .prepare("DELETE FROM task_acknowledgements WHERE task_id = ?")
+      .run(taskId);
     database.close();
 
-    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000)).toBe(
-      true,
-    );
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
     expect(store.claimNextTask("instance-a", at(11), 1_000)).toBeNull();
   });
 
@@ -177,9 +233,9 @@ describe("task acknowledgement ledger", () => {
       .run(at(10).toISOString(), second.taskId);
     database.close();
 
-    expect(store.acquireRuntimeLease("bridge", "instance-a", at(11), 1_000)).toBe(
-      true,
-    );
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(11), 1_000),
+    ).toBe(true);
     expect(store.claimNextTask("instance-a", at(12), 1_000)).toBeNull();
     expect(
       store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(13) }),
@@ -191,7 +247,9 @@ describe("task acknowledgement ledger", () => {
       state: "ACKNOWLEDGED",
       failureClass: null,
     });
-    expect(store.claimNextTask("instance-a", at(15), 1_000)?.id).toBe(first.taskId);
+    expect(store.claimNextTask("instance-a", at(15), 1_000)?.id).toBe(
+      first.taskId,
+    );
   });
 
   it("begins only recoverable acknowledgement attempts under the live bridge lease", async () => {
@@ -201,9 +259,9 @@ describe("task acknowledgement ledger", () => {
     expect(() =>
       store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(10) }),
     ).toThrowError(/bridge_runtime_lease_is_not_live/);
-    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000)).toBe(
-      true,
-    );
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
     expect(
       store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(11) }),
     ).toMatchObject({ state: "SENDING", attemptCount: 1 });
@@ -221,12 +279,175 @@ describe("task acknowledgement ledger", () => {
     ).toMatchObject({ state: "SENDING", attemptCount: 2 });
   });
 
+  it("enforces one global SENDING acknowledgement at the database layer", async () => {
+    const { filename, runtimeDir, store } = await storeFixture();
+    const first = store.ingestEvent(event(1), workspace(runtimeDir));
+    const second = store.ingestEvent(event(2), workspace(runtimeDir));
+
+    seedAcknowledgementState(filename, first.taskId, "SENDING");
+    expect(() =>
+      seedAcknowledgementState(filename, second.taskId, "SENDING"),
+    ).toThrowError(/UNIQUE constraint failed/);
+    expect(store.getTaskAcknowledgement(second.taskId)).toMatchObject({
+      state: "NOT_ATTEMPTED",
+      attemptCount: 0,
+    });
+  });
+
+  it("fences wrong and stale acknowledgement owners without changing the row", async () => {
+    const { runtimeDir, store } = await storeFixture();
+    const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
+    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 10)).toBe(
+      true,
+    );
+
+    expect(
+      store.beginNextTaskAcknowledgement({
+        owner: "instance-b",
+        now: at(11),
+      }),
+    ).toBeNull();
+    expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+      state: "NOT_ATTEMPTED",
+      attemptCount: 0,
+    });
+    expect(() =>
+      store.beginNextTaskAcknowledgement({
+        owner: "instance-a",
+        now: at(21),
+      }),
+    ).toThrowError(/bridge_runtime_lease_is_not_live/);
+    expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+      state: "NOT_ATTEMPTED",
+      attemptCount: 0,
+    });
+  });
+
+  it("fences wrong-owner and stale finalization CAS attempts", async () => {
+    const { runtimeDir, store } = await storeFixture();
+    const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
+    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 100)).toBe(
+      true,
+    );
+    expect(
+      store.beginNextTaskAcknowledgement({
+        owner: "instance-a",
+        now: at(11),
+      }),
+    ).toMatchObject({ taskId, state: "SENDING" });
+
+    expect(
+      store.finishTaskAcknowledgement({
+        taskId,
+        owner: "instance-b",
+        now: at(12),
+        state: "ACKNOWLEDGED",
+        failureClass: null,
+      }),
+    ).toBeNull();
+    expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+      state: "SENDING",
+    });
+    expect(() =>
+      store.finishTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(111),
+        state: "ACKNOWLEDGED",
+        failureClass: null,
+      }),
+    ).toThrowError(/bridge_runtime_lease_is_not_live/);
+    expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+      state: "SENDING",
+    });
+  });
+
+  it("rejects hostile acknowledgement inputs and raw failure detail before property access", async () => {
+    const { runtimeDir, store } = await storeFixture();
+    const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
+    const getter = vi.fn(() => "instance-a");
+    const accessor = { now: at(11) };
+    Object.defineProperty(accessor, "owner", {
+      enumerable: true,
+      get: getter,
+    });
+    expect(() =>
+      store.beginNextTaskAcknowledgement(
+        accessor as unknown as Parameters<
+          JobStore["beginNextTaskAcknowledgement"]
+        >[0],
+      ),
+    ).toThrowError(/task_acknowledgement_input_must_be_own_data_properties/);
+    expect(getter).not.toHaveBeenCalled();
+
+    const ownKeys = vi.fn<() => ArrayLike<string | symbol>>(() => []);
+    const get = vi.fn();
+    expect(() =>
+      store.beginNextTaskAcknowledgement(
+        new Proxy({ owner: "instance-a", now: at(11) }, { ownKeys, get }),
+      ),
+    ).toThrowError(/task_acknowledgement_input_must_be_own_data_properties/);
+    expect(ownKeys).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+
+    store.beginNextTaskAcknowledgement({
+      owner: "instance-a",
+      now: at(11),
+    });
+    expect(() =>
+      store.finishTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(12),
+        state: "FAILED_DEFINITE",
+        failureClass: "REMOTE_REJECTED",
+        rawError: "customer.example/private-route",
+      } as unknown as Parameters<JobStore["finishTaskAcknowledgement"]>[0]),
+    ).toThrowError(/task_acknowledgement_input_must_be_own_data_properties/);
+    expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+      state: "SENDING",
+      lastFailureClass: null,
+    });
+  });
+
+  it("enumerates every RECEIVED reconciliation candidate in global FIFO order", async () => {
+    const { filename, runtimeDir, store } = await storeFixture();
+    const later = store.ingestEvent(event(2), workspace(runtimeDir));
+    const earlier = store.ingestEvent(event(1), workspace(runtimeDir));
+    mutate(
+      filename,
+      "UPDATE tasks SET created_at = ? WHERE id = ?",
+      at(2).toISOString(),
+      later.taskId,
+    );
+    mutate(
+      filename,
+      "UPDATE tasks SET created_at = ? WHERE id = ?",
+      at(1).toISOString(),
+      earlier.taskId,
+    );
+
+    expect(store.listTaskAcknowledgementRecoveryCandidates()).toEqual([
+      {
+        taskId: earlier.taskId,
+        workspacePath: store.getTask(earlier.taskId)?.workspacePath,
+      },
+      {
+        taskId: later.taskId,
+        workspacePath: store.getTask(later.taskId)?.workspacePath,
+      },
+    ]);
+  });
+
   it("allows only the confirmed SENDING finalization transitions", async () => {
     const { runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
-    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000)).toBe(
-      true,
-    );
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
     expect(
       store.finishTaskAcknowledgement({
         taskId,
@@ -246,6 +467,28 @@ describe("task acknowledgement ledger", () => {
         failureClass: "REMOTE_REJECTED",
       }),
     ).toThrowError(/task_acknowledgement_input_is_invalid/);
+    expect(
+      store.finishTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(14),
+        state: "ACKNOWLEDGED",
+        failureClass: null,
+      }),
+    ).toMatchObject({ state: "ACKNOWLEDGED" });
+    expect(
+      store.finishTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(15),
+        state: "ACKNOWLEDGED",
+        failureClass: null,
+      }),
+    ).toBeNull();
+    expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+      state: "ACKNOWLEDGED",
+      attemptCount: 1,
+    });
   });
 
   it("reconciles restart states conservatively from a durable marker", async () => {
@@ -254,40 +497,143 @@ describe("task acknowledgement ledger", () => {
     const recoverable = store.ingestEvent(event(2), workspace(runtimeDir));
     const sending = store.ingestEvent(event(3), workspace(runtimeDir));
     const marker = store.ingestEvent(event(4), workspace(runtimeDir));
-    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000)).toBe(
-      true,
-    );
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
     store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(11) });
-    store.finishTaskAcknowledgement({ taskId: acknowledged.taskId, owner: "instance-a", now: at(12), state: "ACKNOWLEDGED", failureClass: null });
+    store.finishTaskAcknowledgement({
+      taskId: acknowledged.taskId,
+      owner: "instance-a",
+      now: at(12),
+      state: "ACKNOWLEDGED",
+      failureClass: null,
+    });
     let database = new Database(filename);
-    database.prepare("UPDATE tasks SET state = 'CLAIMED' WHERE id = ?").run(acknowledged.taskId);
+    database
+      .prepare("UPDATE tasks SET state = 'CLAIMED' WHERE id = ?")
+      .run(acknowledged.taskId);
     database.close();
     store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(13) });
-    store.finishTaskAcknowledgement({ taskId: recoverable.taskId, owner: "instance-a", now: at(14), state: "RETRYABLE_DNS", failureClass: "DNS_UNAVAILABLE" });
-    expect(store.reconcileTaskAcknowledgement({ taskId: recoverable.taskId, owner: "instance-a", now: at(14), markerPresent: false })).toMatchObject({ state: "RETRYABLE_DNS" });
+    store.finishTaskAcknowledgement({
+      taskId: recoverable.taskId,
+      owner: "instance-a",
+      now: at(14),
+      state: "RETRYABLE_DNS",
+      failureClass: "DNS_UNAVAILABLE",
+    });
+    expect(
+      store.reconcileTaskAcknowledgement({
+        taskId: recoverable.taskId,
+        owner: "instance-a",
+        now: at(14),
+        markerPresent: false,
+      }),
+    ).toMatchObject({ state: "RETRYABLE_DNS" });
     store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(15) });
-    store.finishTaskAcknowledgement({ taskId: recoverable.taskId, owner: "instance-a", now: at(16), state: "ACKNOWLEDGED", failureClass: null });
+    store.finishTaskAcknowledgement({
+      taskId: recoverable.taskId,
+      owner: "instance-a",
+      now: at(16),
+      state: "ACKNOWLEDGED",
+      failureClass: null,
+    });
     database = new Database(filename);
-    database.prepare("UPDATE tasks SET state = 'CLAIMED' WHERE id = ?").run(recoverable.taskId);
+    database
+      .prepare("UPDATE tasks SET state = 'CLAIMED' WHERE id = ?")
+      .run(recoverable.taskId);
     database.close();
     store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(17) });
     database = new Database(filename);
-    database.prepare("DELETE FROM task_acknowledgements WHERE task_id = ?").run(marker.taskId);
+    database
+      .prepare("DELETE FROM task_acknowledgements WHERE task_id = ?")
+      .run(marker.taskId);
     database.close();
 
-    expect(store.reconcileTaskAcknowledgement({ taskId: marker.taskId, owner: "instance-a", now: at(20), markerPresent: true })).toMatchObject({ state: "ACKNOWLEDGED" });
-    expect(store.reconcileTaskAcknowledgement({ taskId: sending.taskId, owner: "instance-a", now: at(20), markerPresent: false })).toBeNull();
-    expect(store.getTask(sending.taskId)).toMatchObject({ state: "INTERRUPTED_REQUIRES_CONFIRMATION" });
+    expect(
+      store.reconcileTaskAcknowledgement({
+        taskId: marker.taskId,
+        owner: "instance-a",
+        now: at(20),
+        markerPresent: true,
+      }),
+    ).toMatchObject({ state: "ACKNOWLEDGED" });
+    expect(
+      store.reconcileTaskAcknowledgement({
+        taskId: sending.taskId,
+        owner: "instance-a",
+        now: at(20),
+        markerPresent: false,
+      }),
+    ).toBeNull();
+    expect(store.getTask(sending.taskId)).toMatchObject({
+      state: "INTERRUPTED_REQUIRES_CONFIRMATION",
+    });
   });
+
+  it.each([
+    [null, false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    [null, true, "ACKNOWLEDGED", "RECEIVED"],
+    ["NOT_ATTEMPTED", false, "NOT_ATTEMPTED", "RECEIVED"],
+    ["NOT_ATTEMPTED", true, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["RETRYABLE_DNS", false, "RETRYABLE_DNS", "RECEIVED"],
+    ["RETRYABLE_DNS", true, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["SENDING", false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["SENDING", true, "ACKNOWLEDGED", "RECEIVED"],
+    ["ACKNOWLEDGED", false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["ACKNOWLEDGED", true, "ACKNOWLEDGED", "RECEIVED"],
+    ["AMBIGUOUS", false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["AMBIGUOUS", true, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["FAILED_DEFINITE", false, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+    ["FAILED_DEFINITE", true, null, "INTERRUPTED_REQUIRES_CONFIRMATION"],
+  ] as const)(
+    "reconciles state %s with marker=%s to acknowledgement=%s task=%s",
+    async (
+      state,
+      markerPresent,
+      expectedAcknowledgement,
+      expectedTaskState,
+    ) => {
+      const { filename, runtimeDir, store } = await storeFixture();
+      const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
+      if (state === null) {
+        mutate(
+          filename,
+          "DELETE FROM task_acknowledgements WHERE task_id = ?",
+          taskId,
+        );
+      } else {
+        seedAcknowledgementState(filename, taskId, state);
+      }
+      expect(
+        store.acquireRuntimeLease("bridge", "instance-a", at(20), 1_000),
+      ).toBe(true);
+
+      const result = store.reconcileTaskAcknowledgement({
+        taskId,
+        owner: "instance-a",
+        now: at(21),
+        markerPresent,
+      });
+
+      expect(result?.state ?? null).toBe(expectedAcknowledgement);
+      expect(store.getTask(taskId)?.state).toBe(expectedTaskState);
+    },
+  );
 
   it("persists only classified acknowledgement failures", async () => {
     const { filename, runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
-    expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000)).toBe(
-      true,
-    );
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(10), 1_000),
+    ).toBe(true);
     store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(11) });
-    store.finishTaskAcknowledgement({ taskId, owner: "instance-a", now: at(12), state: "FAILED_DEFINITE", failureClass: "LOCAL_EVIDENCE_FAILED" });
+    store.finishTaskAcknowledgement({
+      taskId,
+      owner: "instance-a",
+      now: at(12),
+      state: "FAILED_DEFINITE",
+      failureClass: "LOCAL_EVIDENCE_FAILED",
+    });
     const persisted = JSON.stringify(
       inspect(filename, "SELECT * FROM task_acknowledgements"),
     );

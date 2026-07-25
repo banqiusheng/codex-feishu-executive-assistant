@@ -35,6 +35,11 @@
 - Modify: `packages/job-store/src/index.ts`
 - Modify: `packages/job-store/test/events.test.ts`
 - Modify: `packages/job-store/test/tasks.test.ts`
+- Modify: `packages/job-store/test/actions.test.ts`
+- Modify: `packages/job-store/test/leases.test.ts`
+- Modify: `packages/job-store/test/open-store.test.ts`
+- Modify: `packages/runtime/src/runtime.ts`
+- Modify: `packages/runtime/test/runtime.e2e.test.ts`
 - Modify: `README.md`
 - Modify: `CHANGELOG.md`
 
@@ -47,7 +52,8 @@ Add tests that prove:
 3. A legacy task with no row is not claimable.
 4. `claimNextTask` selects only `RECEIVED + ACKNOWLEDGED`.
 5. The oldest safe ACK candidate is selected FIFO.
-6. `beginTaskAcknowledgement` requires the live bridge lease, accepts only
+6. `beginNextTaskAcknowledgement` selects the global FIFO head inside its
+   immediate transaction, requires the live bridge lease, accepts only
    `NOT_ATTEMPTED` or `RETRYABLE_DNS`, increments `attemptCount`, and persists
    `SENDING`.
 7. Finalization accepts only the exact transitions in the confirmed state
@@ -98,10 +104,16 @@ CREATE TABLE task_acknowledgements (
 
 CREATE INDEX task_acknowledgements_recovery_order
   ON task_acknowledgements(state, created_at, task_id);
+
+CREATE UNIQUE INDEX one_inflight_task_acknowledgement
+  ON task_acknowledgements(state)
+  WHERE state = 'SENDING';
 ```
 
 Do not backfill historical tasks. The absence of a row is intentionally
-ambiguous.
+ambiguous. The partial unique index is deliberately unique on the constant
+filtered state, not `task_id`, so two different tasks cannot both be
+`SENDING`.
 
 **Step 3: Add strict ACK store operations**
 
@@ -134,7 +146,8 @@ type TaskAcknowledgementRecord = Readonly<{
 
 Add `getTaskAcknowledgement(taskId)`,
 `getNextTaskAcknowledgementCandidate()`,
-`beginTaskAcknowledgement({ taskId, owner, now })`,
+`listTaskAcknowledgementRecoveryCandidates()`,
+`beginNextTaskAcknowledgement({ owner, now })`,
 `finishTaskAcknowledgement({ taskId, owner, now, state, failureClass })`, and
 `reconcileTaskAcknowledgement({ taskId, owner, now, markerPresent })` to
 `JobStore` and `SqliteJobStore`.
@@ -146,6 +159,13 @@ immediate transaction. `finishTaskAcknowledgement` may finalize only a current
 the task to a safe non-executable terminal/recovery state and invalidate pending
 task actions through existing task lifecycle helpers.
 
+**Audited safety clarification (2026-07-25):** the store-selected
+`beginNextTaskAcknowledgement` replaces the earlier caller-selected
+`beginTaskAcknowledgement`. Selection and `NOT_ATTEMPTED` / `RETRYABLE_DNS` to
+`SENDING` transition occur in the same immediate transaction, so a caller
+cannot name a later task and bypass the global FIFO head. All downstream
+callers use this store-selected contract.
+
 **Step 4: Wire atomic task creation and claim/recovery**
 
 - Insert `NOT_ATTEMPTED` in the same transaction as each new root or replacement
@@ -153,6 +173,14 @@ task actions through existing task lifecycle helpers.
 - Join `task_acknowledgements` in `claimNextTask` and require
   `state = 'ACKNOWLEDGED'`.
 - Keep the runtime file gate even after adding the database gate.
+- Keep the existing one-shot production path runnable in this slice:
+  `beginNext -> transport success -> durable marker -> ACKNOWLEDGED -> wake`.
+  Unknown transport or marker outcomes become non-executable and never forge
+  an ACK. Task 2 replaces this one-shot seam with the bounded DNS retry
+  coordinator.
+- Before channel/worker startup, enumerate all `RECEIVED` candidates, derive
+  marker presence only through the strict private-file gate, reconcile every
+  candidate under the live bridge lease, then recover `CLAIMED` / `RUNNING`.
 - Replace broad startup interruption of `RECEIVED` tasks with ACK-aware
   reconciliation; continue interrupting expired `CLAIMED` / `RUNNING` tasks.
 
@@ -524,4 +552,3 @@ Using the pushed public `main` and existing private Keychain/config only:
 Real replay is a post-push acceptance gate. If it requires the user's visible
 browser click or Feishu message, report the exact waiting action rather than
 claiming completion.
-

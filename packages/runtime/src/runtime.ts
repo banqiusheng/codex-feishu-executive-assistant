@@ -578,6 +578,14 @@ export async function startExecutiveRuntime(
     if (!store.acquireRuntimeLease("bridge", instanceId, now(), LEASE_TTL_MS)) {
       throw new Error("RUNTIME_LEASE_UNAVAILABLE");
     }
+    for (const candidate of store.listTaskAcknowledgementRecoveryCandidates()) {
+      store.reconcileTaskAcknowledgement({
+        taskId: candidate.taskId,
+        owner: instanceId,
+        now: now(),
+        markerPresent: await taskWasAcknowledged(candidate.workspacePath),
+      });
+    }
     store.recoverOnStartup(now());
     const boundPresidentOpenId =
       config.presidentOpenId ?? persistedPairing?.presidentOpenId ?? null;
@@ -1387,47 +1395,93 @@ export async function startExecutiveRuntime(
       gateway: Object.freeze({
         async sendSystemReply(taskId: string, body: SystemText) {
           const route = taskRoutes.get(taskId);
-          if (!route) return Object.freeze({ state: "FAILED" as const });
+          const activeStore = store;
+          if (!route || !activeStore) {
+            return Object.freeze({ state: "FAILED" as const });
+          }
+          let sending;
           try {
-            const remote = await dependencies.transport.sendText(
+            sending = activeStore.beginNextTaskAcknowledgement({
+              owner: instanceId,
+              now: now(),
+            });
+          } catch {
+            return Object.freeze({ state: "FAILED" as const });
+          }
+          if (sending?.taskId !== taskId) {
+            return Object.freeze({ state: "FAILED" as const });
+          }
+          const markAmbiguous = (): void => {
+            try {
+              activeStore.finishTaskAcknowledgement({
+                taskId,
+                owner: instanceId,
+                now: now(),
+                state: "AMBIGUOUS",
+                failureClass: "RESULT_AMBIGUOUS",
+              });
+            } catch {
+              // The persisted SENDING row remains fail-closed for startup.
+            }
+          };
+          let remote: Awaited<ReturnType<RuntimeTransport["sendText"]>>;
+          try {
+            remote = await dependencies.transport.sendText(
               Object.freeze({
                 chatId: route.chatId,
                 text: body.value,
                 replyToMessageId: route.messageId,
               }),
             );
-            const task = store?.getTask(taskId);
-            if (task === null || task === undefined) {
+          } catch {
+            markAmbiguous();
+            return Object.freeze({ state: "FAILED" as const });
+          }
+          const task = activeStore.getTask(taskId);
+          if (task === null) {
+            markAmbiguous();
+            return Object.freeze({ state: "FAILED" as const });
+          }
+          const acknowledgementPath = join(
+            task.workspacePath,
+            ACKNOWLEDGEMENT_FILE,
+          );
+          try {
+            await writePrivateJson(
+              acknowledgementPath,
+              Object.freeze({
+                version: 1,
+                acknowledgedAt: now().toISOString(),
+              }),
+            );
+          } catch (cause) {
+            if (
+              !(
+                cause instanceof Error &&
+                "code" in cause &&
+                cause.code === "EEXIST" &&
+                (await taskWasAcknowledged(task.workspacePath))
+              )
+            ) {
+              markAmbiguous();
               return Object.freeze({ state: "FAILED" as const });
             }
-            const acknowledgementPath = join(
-              task.workspacePath,
-              ACKNOWLEDGEMENT_FILE,
-            );
-            try {
-              await writePrivateJson(
-                acknowledgementPath,
-                Object.freeze({
-                  version: 1,
-                  acknowledgedAt: now().toISOString(),
-                }),
-              );
-            } catch (cause) {
-              if (
-                !(
-                  cause instanceof Error &&
-                  "code" in cause &&
-                  cause.code === "EEXIST" &&
-                  (await taskWasAcknowledged(task.workspacePath))
-                )
-              ) {
-                return Object.freeze({ state: "FAILED" as const });
-              }
+          }
+          try {
+            const acknowledged = activeStore.finishTaskAcknowledgement({
+              taskId,
+              owner: instanceId,
+              now: now(),
+              state: "ACKNOWLEDGED",
+              failureClass: null,
+            });
+            if (acknowledged?.state !== "ACKNOWLEDGED") {
+              return Object.freeze({ state: "FAILED" as const });
             }
-            return replyResult(remote);
           } catch {
             return Object.freeze({ state: "FAILED" as const });
           }
+          return replyResult(remote);
         },
         async sendControlReply(controlEventId: string, body: SystemText) {
           const route = controlRoutes.get(controlEventId);
@@ -1470,6 +1524,7 @@ export async function startExecutiveRuntime(
         record() {},
       }),
     });
+    wakeWorker();
 
     heartbeat = setInterval(() => {
       if (closing || !store) return;

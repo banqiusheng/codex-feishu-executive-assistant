@@ -177,9 +177,11 @@ class ImmediateRunner implements CodexRunner {
   constructor(
     private readonly threadId = "018f7d72-7a2b-7f45-8a12-8e20b8426a21",
     private readonly createResultFile = false,
+    private readonly beforeStart?: (input: CodexRunInput) => Promise<void>,
   ) {}
 
   async start(input: CodexRunInput): Promise<CodexRunHandle> {
+    await this.beforeStart?.(input);
     this.starts.push(input);
     if (this.createResultFile) {
       const outputPath = join(input.workspace, "董事会简报.txt");
@@ -553,6 +555,62 @@ describe("executive runtime offline integration", () => {
     }
   });
 
+  it("writes the durable marker and database ACK before waking Codex", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const markersObservedAtStart: string[] = [];
+    const runner = new ImmediateRunner(
+      "018f7d72-7a2b-7f45-8a12-8e20b8426a21",
+      false,
+      async (input) => {
+        markersObservedAtStart.push(
+          await readFile(join(input.workspace, "acknowledged.json"), "utf8"),
+        );
+      },
+    );
+    const startsObservedDuringSend: number[] = [];
+    transport.beforeTextReply = (reply) => {
+      if (reply.text === "收到，我开始处理") {
+        startsObservedDuringSend.push(runner.starts.length);
+      }
+    };
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-durable-ack-instance",
+    });
+    let taskId = "";
+    try {
+      await transport.emitMessage(message(40, "验证持久 ACK 顺序"));
+      await runtime.waitForIdle();
+      expect(runner.starts).toHaveLength(1);
+      taskId = runner.starts[0]?.taskId ?? "";
+      expect(startsObservedDuringSend).toEqual([0]);
+      expect(markersObservedAtStart).toHaveLength(1);
+      expect(markersObservedAtStart[0]).toContain('"version":1');
+    } finally {
+      await runtime.close();
+    }
+
+    const lock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const store = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "runtime-durable-ack-inspector",
+      lock,
+    });
+    try {
+      expect(store.getTaskAcknowledgement(taskId)).toMatchObject({
+        state: "ACKNOWLEDGED",
+        attemptCount: 1,
+        lastFailureClass: null,
+      });
+    } finally {
+      store.close();
+      await lock.release();
+    }
+  });
+
   it("never executes a persisted task whose acknowledgement failed", async () => {
     const config = await fixtureConfig();
     const transport = new FakeTransport();
@@ -831,6 +889,16 @@ describe("executive runtime offline integration", () => {
       },
       workspace,
     );
+    expect(
+      store.acquireRuntimeLease("bridge", "seed-instance", new Date(), 60_000),
+    ).toBe(true);
+    expect(
+      store.beginNextTaskAcknowledgement({
+        owner: "seed-instance",
+        now: new Date(),
+      }),
+    ).toMatchObject({ taskId, state: "SENDING" });
+    store.releaseRuntimeLease("bridge", "seed-instance");
     store.close();
     await lock.release();
 
@@ -847,6 +915,89 @@ describe("executive runtime offline integration", () => {
       expect(runtime.getTask(taskId)?.state).toBe(
         "INTERRUPTED_REQUIRES_CONFIRMATION",
       );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("reconciles a trusted ACK marker before startup scheduling and resumes the task once", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const taskId = randomUUID();
+    const workspace = join(config.paths.jobsRoot, taskId);
+    await mkdir(workspace, { mode: 0o700 });
+    const receivedAt = new Date().toISOString();
+    await writeFile(
+      join(workspace, "input.json"),
+      `${JSON.stringify({
+        version: 1,
+        prompt: "恢复已确认接单的任务",
+        chatId: "oc_synthetic_private_chat",
+        messageId: "pre-crash-ack-message",
+        eventId: "pre-crash-ack-event",
+        receivedAt,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const lock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const store = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "seed-ack-instance",
+      lock,
+    });
+    store.ingestEvent(
+      {
+        appId: config.appId,
+        tenantKey: TENANT_KEY,
+        eventId: "pre-crash-ack-event",
+        messageId: "pre-crash-ack-message",
+        senderOpenId: "ou_synthetic_president",
+        chatId: "oc_synthetic_private_chat",
+        chatType: "p2p",
+        eventType: "im.message.receive_v1",
+        receivedAt,
+        payloadRef: `sha256:${"b".repeat(64)}`,
+      },
+      workspace,
+    );
+    expect(
+      store.acquireRuntimeLease(
+        "bridge",
+        "seed-ack-instance",
+        new Date(),
+        60_000,
+      ),
+    ).toBe(true);
+    expect(
+      store.beginNextTaskAcknowledgement({
+        owner: "seed-ack-instance",
+        now: new Date(),
+      }),
+    ).toMatchObject({ taskId, state: "SENDING" });
+    await writeFile(
+      join(workspace, "acknowledged.json"),
+      `${JSON.stringify({
+        version: 1,
+        acknowledgedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    store.releaseRuntimeLease("bridge", "seed-ack-instance");
+    store.close();
+    await lock.release();
+
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "reconcile-ack-instance",
+    });
+    try {
+      await runtime.waitForIdle();
+      expect(runner.starts.map((start) => start.taskId)).toEqual([taskId]);
+      expect(runtime.getTask(taskId)?.state).toBe("SUCCEEDED");
     } finally {
       await runtime.close();
     }

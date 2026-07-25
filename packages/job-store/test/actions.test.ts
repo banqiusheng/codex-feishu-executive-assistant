@@ -92,6 +92,21 @@ async function storeFixture(
     ).toBe(true);
     if (options.startTask !== false) {
       expect(
+        store.beginNextTaskAcknowledgement({
+          owner: "instance-a",
+          now: at(1),
+        }),
+      ).toMatchObject({ taskId, state: "SENDING" });
+      expect(
+        store.finishTaskAcknowledgement({
+          taskId,
+          owner: "instance-a",
+          now: at(1),
+          state: "ACKNOWLEDGED",
+          failureClass: null,
+        }),
+      ).toMatchObject({ state: "ACKNOWLEDGED" });
+      expect(
         store.claimNextTask("instance-a", at(2), options.taskTtlMs ?? 3_600_000)
           ?.id,
       ).toBe(taskId);

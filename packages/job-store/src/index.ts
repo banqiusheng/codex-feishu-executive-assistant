@@ -42,6 +42,7 @@ export {
   type TaskRecord,
   type TaskAcknowledgementFailureClass,
   type TaskAcknowledgementRecord,
+  type TaskAcknowledgementRecoveryCandidate,
   type TaskAcknowledgementState,
   type TouchTaskInput,
 } from "./types.js";

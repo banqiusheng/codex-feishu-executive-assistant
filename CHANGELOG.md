@@ -6,12 +6,13 @@
 
 ### Added
 
-- 新增校验和迁移的任务 ACK 账本，并将数据库任务 claim 收紧为只允许持久 `ACKNOWLEDGED` 行；本安全切片不代表 runtime retry、doctor、OAuth 或真实 E2E 已完成。
-- 规格确认后新增 ACK 安全恢复与零复制授权的可执行实现计划：按持久 ACK 门禁、单 FIFO 协调器、无凭据网络 doctor、浏览器直接授权、全量门禁与公开 `main` 推送五个切片推进，并固定每个切片先红测、独立复核和不泄露临时授权数据的要求。当前仍未改变公开运行行为。
-- 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim，并要求安装器从锁定 CLI 的结构化输出取得授权地址后直接调用 macOS 浏览器。当前提交仅完成书面设计门禁，尚未修改运行时或安装行为。
+- 新增校验和迁移的任务 ACK 账本，将数据库任务 claim 收紧为只允许持久 `ACKNOWLEDGED` 行，并接通单次新消息的发送、私有 marker、数据库 ACK、worker wake 与启动对账；本安全切片不代表 DNS retry、doctor、OAuth、marker v2 或真实 E2E 已完成。
+- 规格确认后新增 ACK 安全恢复与零复制授权的可执行实现计划：按持久 ACK 门禁、单 FIFO 协调器、无凭据网络 doctor、浏览器直接授权、全量门禁与公开 `main` 推送五个切片推进，并固定每个切片先红测、独立复核和不泄露临时授权数据的要求。
+- 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim，并要求安装器从锁定 CLI 的结构化输出取得授权地址后直接调用 macOS 浏览器。
 
 ### Fixed
 
+- 修复 ACK 数据库门禁落地后 runtime 仍只写文件 marker、未推进数据库 ACK，导致所有新任务收到接单回复却永远无法 claim 的回归；生产顺序现为 store 选择 FIFO 头并持久 `SENDING`、发送成功、耐久 marker、数据库 `ACKNOWLEDGED`、最后 wake。全局唯一约束禁止两个不同任务同时 `SENDING`，启动时通过受限 marker 文件校验逐项对账，冲突状态进入人工确认，未知发送/marker 结果不伪造成功且不启动 Codex。
 - 修复 LaunchAgent 接到真实消息后，runtime 直接执行 `#!/usr/bin/env node` 的 Codex 脚本、却把子进程 `PATH` 固定为不含安装 Node 的系统目录，导致 Codex 在产生首个 JSONL 事件前以 127 退出：运行配置现在保留并验证安装时记录的 Node 绝对路径，由该 Node 直接启动固定 Codex 脚本，同时继续使用不含秘密和私有飞书 CLI 的精简环境；doctor 的 Codex 登录与插件检查也复用同一启动方式，并新增真实 shebang 进程回归。重复安装会原子刷新已漂移的非秘密 Node/Codex 路径；本版本只接受经安装器验证的 `#!/usr/bin/env node` Codex 入口，原生或未知入口明确停止。
 - 修复重复安装时旧 LaunchAgent 仍处于 launchd `removing` 过渡窗口，紧接执行 `bootstrap` 会返回 `Input/output error`：安装器现在等待同一服务确认卸载，再只对该次卸载后的精确过渡期 EIO 做有限重试；新安装或其他错误仍然 fail closed，并在启动前后核验服务状态。
 - 修复专用 `CODEX_HOME` 中已经安装同一官方 `openai-primary-runtime` 来源的旧版 Presentations 时，安装器把正常版本漂移误判为来源异常：现在直接从官方 marketplace 清单和插件 manifest 读取当前版本，仅允许数字版本严格向前升级；升级前把旧 cache 完整复制到权限 `0700` 的私有隔离区，官方安装失败或升级后精确复核失败时恢复旧 cache，来源、身份、版本方向或缓存结构不明时仍然拒绝覆盖。

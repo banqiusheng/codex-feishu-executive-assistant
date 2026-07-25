@@ -186,6 +186,31 @@ describe("JobStore.ingestEvent", () => {
     ).toEqual([{ events: 0, tasks: 0 }]);
   });
 
+  it("rolls the inbound event and task back when acknowledgement insertion fails", async () => {
+    const { filename, runtimeDir, store } = await openStore();
+    const workspacePath = createWorkspace(runtimeDir);
+    const setup = new Database(filename);
+    setup.exec(`
+      CREATE TRIGGER test_fail_acknowledgement_insert
+      BEFORE INSERT ON task_acknowledgements
+      BEGIN SELECT RAISE(ABORT, 'synthetic acknowledgement insert failure'); END;
+    `);
+    setup.close();
+
+    expect(() => store.ingestEvent(event(), workspacePath)).toThrowError(
+      new RuntimeStateError("inbound_event_persistence_failed"),
+    );
+    expect(
+      inspect<{ events: number; tasks: number; acknowledgements: number }>(
+        filename,
+        `SELECT
+           (SELECT COUNT(*) FROM inbound_events) AS events,
+           (SELECT COUNT(*) FROM tasks) AS tasks,
+           (SELECT COUNT(*) FROM task_acknowledgements) AS acknowledgements`,
+      ),
+    ).toEqual([{ events: 0, tasks: 0, acknowledgements: 0 }]);
+  });
+
   it("persists hashes instead of raw sender and chat identifiers", async () => {
     const { filename, runtimeDir, store } = await openStore();
     const workspacePath = createWorkspace(runtimeDir);

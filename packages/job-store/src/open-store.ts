@@ -16,7 +16,14 @@ import {
   startReconciliation,
 } from "./actions.js";
 import { cancelActiveTask } from "./control-events.js";
-import { beginNextTaskAcknowledgement, finishTaskAcknowledgement, getNextTaskAcknowledgementCandidate, getTaskAcknowledgement, reconcileTaskAcknowledgement } from "./acknowledgements.js";
+import {
+  beginNextTaskAcknowledgement,
+  finishTaskAcknowledgement,
+  getNextTaskAcknowledgementCandidate,
+  getTaskAcknowledgement,
+  listTaskAcknowledgementRecoveryCandidates,
+  reconcileTaskAcknowledgement,
+} from "./acknowledgements.js";
 import { ingestEvent } from "./events.js";
 import { attachDatabaseFileLock, detachDatabaseFileLock } from "./file-lock.js";
 import { acquireRuntimeLease, releaseRuntimeLease } from "./leases.js";
@@ -228,11 +235,18 @@ export function openJobStoreWithMigrationDirectory(
           releaseRuntimeLease(storeDatabase, instanceId, name, owner),
         claimNextTask: (owner, now, ttlMs) =>
           claimNextTask(storeDatabase, instanceId, owner, now, ttlMs),
-        getTaskAcknowledgement: (taskId) => getTaskAcknowledgement(storeDatabase, taskId),
-        getNextTaskAcknowledgementCandidate: () => getNextTaskAcknowledgementCandidate(storeDatabase),
-        beginNextTaskAcknowledgement: (input) => beginNextTaskAcknowledgement(storeDatabase, instanceId, input),
-        finishTaskAcknowledgement: (input) => finishTaskAcknowledgement(storeDatabase, instanceId, input),
-        reconcileTaskAcknowledgement: (input) => reconcileTaskAcknowledgement(storeDatabase, instanceId, input),
+        getTaskAcknowledgement: (taskId) =>
+          getTaskAcknowledgement(storeDatabase, taskId),
+        getNextTaskAcknowledgementCandidate: () =>
+          getNextTaskAcknowledgementCandidate(storeDatabase),
+        listTaskAcknowledgementRecoveryCandidates: () =>
+          listTaskAcknowledgementRecoveryCandidates(storeDatabase),
+        beginNextTaskAcknowledgement: (input) =>
+          beginNextTaskAcknowledgement(storeDatabase, instanceId, input),
+        finishTaskAcknowledgement: (input) =>
+          finishTaskAcknowledgement(storeDatabase, instanceId, input),
+        reconcileTaskAcknowledgement: (input) =>
+          reconcileTaskAcknowledgement(storeDatabase, instanceId, input),
         getTask: (taskId) => getTask(storeDatabase, taskId),
         markRunning: (input) => markRunning(storeDatabase, instanceId, input),
         touchTask: (input) => touchTask(storeDatabase, instanceId, input),
