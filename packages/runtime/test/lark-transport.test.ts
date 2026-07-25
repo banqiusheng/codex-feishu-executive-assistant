@@ -19,6 +19,29 @@ class FakeLarkChannel {
   errorHandler: ((error: Error) => void) | undefined;
   connectCalls = 0;
   disconnectCalls = 0;
+  sendCalls = 0;
+  rawReplyCalls: unknown[] = [];
+  rawReplyFailure: unknown;
+  rawReplyResult: unknown = {
+    code: 0,
+    msg: "success",
+    data: { message_id: "fixture-ack-reply" },
+  };
+  readonly rawClient = {
+    im: {
+      v1: {
+        message: {
+          reply: async (input: unknown) => {
+            this.rawReplyCalls.push(input);
+            if (this.rawReplyFailure !== undefined) {
+              throw this.rawReplyFailure;
+            }
+            return this.rawReplyResult;
+          },
+        },
+      },
+    },
+  };
 
   on(name: string, handler: unknown): () => void {
     if (name === "message") {
@@ -48,6 +71,7 @@ class FakeLarkChannel {
   }
 
   async send(): Promise<Readonly<{ messageId: string }>> {
+    this.sendCalls += 1;
     return Object.freeze({ messageId: "fixture-reply" });
   }
 
@@ -99,6 +123,78 @@ function normalizedMessage(
 }
 
 describe("built-in Lark transport tenant binding", () => {
+  it("sends acceptance ACK through one raw reply and never channel.send", async () => {
+    const channel = new FakeLarkChannel();
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+
+    await expect(
+      transport.sendAcknowledgement({
+        chatId: "oc_fixture_private_chat",
+        text: "收到，我开始处理",
+        replyToMessageId: "message-fixture",
+      }),
+    ).resolves.toEqual({ messageId: "fixture-ack-reply" });
+
+    expect(channel.sendCalls).toBe(0);
+    expect(channel.rawReplyCalls).toEqual([
+      {
+        data: {
+          content: '{"text":"收到，我开始处理"}',
+          msg_type: "text",
+        },
+        path: { message_id: "message-fixture" },
+      },
+    ]);
+  });
+
+  it("never retries or falls back to channel.send after raw ACK failure", async () => {
+    const channel = new FakeLarkChannel();
+    channel.rawReplyFailure = new Error("synthetic raw reply failure");
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+
+    await expect(
+      transport.sendAcknowledgement({
+        chatId: "oc_fixture_private_chat",
+        text: "收到，我开始处理",
+        replyToMessageId: "message-fixture",
+      }),
+    ).rejects.toThrow("synthetic raw reply failure");
+
+    expect(channel.rawReplyCalls).toHaveLength(1);
+    expect(channel.sendCalls).toBe(0);
+  });
+
+  it("rejects a non-own-data raw success result without fallback", async () => {
+    const channel = new FakeLarkChannel();
+    channel.rawReplyResult = Object.create({
+      code: 0,
+      data: { message_id: "fixture-ack-reply" },
+    });
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+
+    await expect(
+      transport.sendAcknowledgement({
+        chatId: "oc_fixture_private_chat",
+        text: "收到，我开始处理",
+        replyToMessageId: "message-fixture",
+      }),
+    ).rejects.toThrow("LARK_ACKNOWLEDGEMENT_FAILED");
+    expect(channel.rawReplyCalls).toHaveLength(1);
+    expect(channel.sendCalls).toBe(0);
+  });
+
   it("binds only from the correct unexpired private pairing message and replays it once", async () => {
     const channel = new FakeLarkChannel();
     const transport = createBuiltInLarkTransport({

@@ -60,6 +60,8 @@ export type RuntimeTextReply = Readonly<{
   replyToMessageId: string;
 }>;
 
+export type RuntimeAcknowledgement = RuntimeTextReply;
+
 export type RuntimeFileReply = Readonly<{
   chatId: string;
   path: string;
@@ -101,6 +103,9 @@ export interface RuntimeTransport {
   sendText(
     reply: RuntimeTextReply,
   ): Promise<void | Readonly<{ messageId: string }>>;
+  sendAcknowledgement(
+    acknowledgement: RuntimeAcknowledgement,
+  ): Promise<Readonly<{ messageId: string }>>;
   sendFile(
     reply: RuntimeFileReply,
   ): Promise<void | Readonly<{ messageId: string }>>;
@@ -168,6 +173,10 @@ export type RuntimeDependencies = Readonly<{
   larkRunnerFactory: MvpLarkCliRunnerFactory;
   now?: () => Date;
   instanceId?: string;
+  acknowledgementDelay?: (
+    milliseconds: number,
+    signal: AbortSignal,
+  ) => Promise<void>;
 }>;
 
 export interface BotSecretProvider {

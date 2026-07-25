@@ -10,6 +10,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 
 import {
   MVP_CAPABILITIES,
@@ -22,6 +23,7 @@ import {
   type MvpDispatchAction,
   type MvpLarkCliRunner,
   type MvpProviderResult,
+  parseStrictJsonText,
 } from "@executive-assistant/action-gateway";
 import {
   startChannel,
@@ -49,6 +51,15 @@ import {
 import { decideIngress } from "../../bridge/src/security/ingress-guard.js";
 import type { AccessPolicy } from "../../bridge/src/security/policy.js";
 import { openSessionStore, type SessionStore } from "./session-store.js";
+import {
+  readAcknowledgementMarker,
+  writeAcknowledgementMarker,
+} from "./acknowledgement-file.js";
+import {
+  createAckCoordinator,
+  sleepForAcknowledgement,
+  type AcknowledgementRoute,
+} from "./ack-coordinator.js";
 import type {
   CodexRunEvent,
   CodexRunHandle,
@@ -67,7 +78,6 @@ const MAX_RESULT_FILES = 10;
 const MAX_RESULT_MANIFEST_BYTES = 64 * 1024;
 const MAX_RESULT_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_RESULT_TOTAL_BYTES = 50 * 1024 * 1024;
-const ACKNOWLEDGEMENT_FILE = "acknowledged.json";
 
 type TaskInput = Readonly<{
   version: 1;
@@ -296,39 +306,24 @@ async function readPairingState(
 }
 
 async function readTaskInput(workspacePath: string): Promise<TaskInput> {
-  const bytes = await readFile(join(workspacePath, "input.json"));
-  return taskInput(JSON.parse(bytes.toString("utf8")) as unknown);
-}
-
-async function taskWasAcknowledged(workspacePath: string): Promise<boolean> {
-  const path = join(workspacePath, ACKNOWLEDGEMENT_FILE);
-  try {
-    const metadata = await lstat(path);
-    if (
-      metadata.isSymbolicLink() ||
-      !metadata.isFile() ||
-      metadata.size <= 0 ||
-      metadata.size > 4 * 1024 ||
-      (metadata.mode & 0o777) !== PRIVATE_FILE_MODE ||
-      (typeof process.getuid === "function" &&
-        metadata.uid !== process.getuid()) ||
-      (await realpath(path)) !== path
-    ) {
-      return false;
-    }
-    const value = JSON.parse(
-      (await readFile(path)).toString("utf8"),
-    ) as unknown;
-    return (
-      isRecord(value) &&
-      Reflect.ownKeys(value).length === 2 &&
-      value.version === 1 &&
-      typeof value.acknowledgedAt === "string" &&
-      Number.isFinite(Date.parse(value.acknowledgedAt))
-    );
-  } catch {
-    return false;
+  const path = join(workspacePath, "input.json");
+  const metadata = await lstat(path);
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isFile() ||
+    metadata.size <= 0 ||
+    metadata.size > MAX_PROMPT_LENGTH + 4 * 1024 ||
+    (metadata.mode & 0o777) !== PRIVATE_FILE_MODE ||
+    (typeof process.getuid === "function" &&
+      metadata.uid !== process.getuid()) ||
+    (await realpath(path)) !== path
+  ) {
+    throw new Error("TASK_INPUT_INVALID");
   }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(
+    await readFile(path),
+  );
+  return taskInput(parseStrictJsonText(text));
 }
 
 function confirmationValue(value: unknown): Readonly<{
@@ -558,7 +553,58 @@ export async function startExecutiveRuntime(
   let store: JobStore | undefined;
   let channel: BridgeChannel | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
+  let startupLeaseHeartbeat: NodeJS.Timeout | undefined;
+  let acknowledgementCoordinator:
+    | ReturnType<typeof createAckCoordinator>
+    | undefined;
   try {
+    store = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId,
+      lock,
+    });
+    if (!store.acquireRuntimeLease("bridge", instanceId, now(), LEASE_TTL_MS)) {
+      throw new Error("RUNTIME_LEASE_UNAVAILABLE");
+    }
+    const taskRoutes = new Map<string, ReplyRoute>();
+    const legacyAcknowledgementTasks = new Set<string>();
+    for (const candidate of store.listTaskAcknowledgementRecoveryCandidates()) {
+      const before = store.getTaskAcknowledgement(candidate.taskId);
+      const marker = await readAcknowledgementMarker(
+        candidate.workspacePath,
+        candidate.taskId,
+        Object.freeze({ allowLegacyV1: before === null }),
+      );
+      if (marker?.version === 1) {
+        legacyAcknowledgementTasks.add(candidate.taskId);
+      }
+      const reconciled = store.reconcileTaskAcknowledgement({
+        taskId: candidate.taskId,
+        owner: instanceId,
+        now: now(),
+        markerPresent: marker !== null,
+      });
+      if (
+        reconciled?.state === "NOT_ATTEMPTED" ||
+        reconciled?.state === "RETRYABLE_DNS" ||
+        reconciled?.state === "ACKNOWLEDGED"
+      ) {
+        const input = await readTaskInput(candidate.workspacePath);
+        taskRoutes.set(
+          candidate.taskId,
+          Object.freeze({ chatId: input.chatId, messageId: input.messageId }),
+        );
+      }
+    }
+    store.recoverOnStartup(now());
+    startupLeaseHeartbeat = setInterval(() => {
+      try {
+        store?.acquireRuntimeLease("bridge", instanceId, now(), LEASE_TTL_MS);
+      } catch {
+        // The post-resolution lease check below remains the startup gate.
+      }
+    }, LEASE_REFRESH_MS);
+    startupLeaseHeartbeat.unref();
     const tenantKey = await dependencies.transport.resolveTenantKey(
       Object.freeze({
         expectedTenantKey: persistedPairing?.tenantKey ?? config.tenantKey,
@@ -570,23 +616,11 @@ export async function startExecutiveRuntime(
         pairingExpiresAt: config.pairing.expiresAt,
       }),
     );
-    store = openJobStore({
-      filename: config.paths.databasePath,
-      instanceId,
-      lock,
-    });
+    clearInterval(startupLeaseHeartbeat);
+    startupLeaseHeartbeat = undefined;
     if (!store.acquireRuntimeLease("bridge", instanceId, now(), LEASE_TTL_MS)) {
-      throw new Error("RUNTIME_LEASE_UNAVAILABLE");
+      throw new Error("RUNTIME_LEASE_LOST");
     }
-    for (const candidate of store.listTaskAcknowledgementRecoveryCandidates()) {
-      store.reconcileTaskAcknowledgement({
-        taskId: candidate.taskId,
-        owner: instanceId,
-        now: now(),
-        markerPresent: await taskWasAcknowledged(candidate.workspacePath),
-      });
-    }
-    store.recoverOnStartup(now());
     const boundPresidentOpenId =
       config.presidentOpenId ?? persistedPairing?.presidentOpenId ?? null;
     const boundPresidentChatId =
@@ -621,7 +655,6 @@ export async function startExecutiveRuntime(
       ),
     });
     const staged = new Map<string, TaskInput>();
-    const taskRoutes = new Map<string, ReplyRoute>();
     const controlRoutes = new Map<string, ReplyRoute>();
     const pendingActions = new Map<string, PendingAction>();
     const pendingActionByTask = new Map<string, string>();
@@ -799,7 +832,15 @@ export async function startExecutiveRuntime(
     const processTask = async (task: TaskRecord): Promise<void> => {
       if (!store) throw new Error("RUNTIME_CLOSED");
       const input = await readTaskInput(task.workspacePath);
-      if (!(await taskWasAcknowledged(task.workspacePath))) {
+      if (
+        (await readAcknowledgementMarker(
+          task.workspacePath,
+          task.id,
+          Object.freeze({
+            allowLegacyV1: legacyAcknowledgementTasks.has(task.id),
+          }),
+        )) === null
+      ) {
         await markFailed(task);
         return;
       }
@@ -1093,6 +1134,52 @@ export async function startExecutiveRuntime(
         });
     };
 
+    const activeStore = store;
+    const loadAcknowledgementRoute = async (
+      taskId: string,
+    ): Promise<AcknowledgementRoute> => {
+      const existing = taskRoutes.get(taskId);
+      if (existing) {
+        return Object.freeze({ taskId, ...existing });
+      }
+      const task = activeStore.getTask(taskId);
+      if (task === null) throw new Error("ACKNOWLEDGEMENT_ROUTE_UNAVAILABLE");
+      const input = await readTaskInput(task.workspacePath);
+      const route = Object.freeze({
+        chatId: input.chatId,
+        messageId: input.messageId,
+      });
+      taskRoutes.set(taskId, route);
+      return Object.freeze({ taskId, ...route });
+    };
+
+    acknowledgementCoordinator = createAckCoordinator({
+      store: activeStore,
+      owner: instanceId,
+      now,
+      delay: dependencies.acknowledgementDelay ?? sleepForAcknowledgement,
+      loadRoute: loadAcknowledgementRoute,
+      async send(route) {
+        return dependencies.transport.sendAcknowledgement(
+          Object.freeze({
+            chatId: route.chatId,
+            text: "收到，我开始处理",
+            replyToMessageId: route.messageId,
+          }),
+        );
+      },
+      async writeMarker(taskId, acknowledgedAt) {
+        const task = activeStore.getTask(taskId);
+        if (task === null) throw new Error("ACKNOWLEDGEMENT_TASK_UNAVAILABLE");
+        await writeAcknowledgementMarker(
+          task.workspacePath,
+          taskId,
+          acknowledgedAt,
+        );
+      },
+      wakeWorker,
+    });
+
     const runtimePorts: AssistantChannelDependencies = Object.freeze({
       ingressGuard(
         metadata: Parameters<AssistantChannelDependencies["ingressGuard"]>[0],
@@ -1325,6 +1412,16 @@ export async function startExecutiveRuntime(
             const accepted = store.ingestEvent(event, workspacePath);
             if (accepted.duplicate) {
               await rm(workspacePath, { recursive: true, force: false });
+              const original = store.getTask(accepted.taskId);
+              if (original === null) throw new Error("TASK_DUPLICATE_INVALID");
+              const originalInput = await readTaskInput(original.workspacePath);
+              taskRoutes.set(
+                accepted.taskId,
+                Object.freeze({
+                  chatId: originalInput.chatId,
+                  messageId: originalInput.messageId,
+                }),
+              );
             } else {
               taskRoutes.set(
                 accepted.taskId,
@@ -1334,6 +1431,7 @@ export async function startExecutiveRuntime(
                 }),
               );
             }
+            acknowledgementCoordinator?.wake();
             return accepted;
           } finally {
             staged.delete(key);
@@ -1395,94 +1493,11 @@ export async function startExecutiveRuntime(
       gateway: Object.freeze({
         async sendSystemReply(taskId: string, body: SystemText) {
           const route = taskRoutes.get(taskId);
-          const activeStore = store;
-          if (!route || !activeStore) {
+          if (!route || !store || body.value !== "收到，我开始处理") {
             return Object.freeze({ state: "FAILED" as const });
           }
-          let sending;
-          try {
-            sending = activeStore.beginTaskAcknowledgement({
-              taskId,
-              owner: instanceId,
-              now: now(),
-            });
-          } catch {
-            return Object.freeze({ state: "FAILED" as const });
-          }
-          if (sending?.taskId !== taskId) {
-            return Object.freeze({ state: "FAILED" as const });
-          }
-          const markAmbiguous = (): void => {
-            try {
-              activeStore.finishTaskAcknowledgement({
-                taskId,
-                owner: instanceId,
-                now: now(),
-                state: "AMBIGUOUS",
-                failureClass: "RESULT_AMBIGUOUS",
-              });
-            } catch {
-              // The persisted SENDING row remains fail-closed for startup.
-            }
-          };
-          let remote: Awaited<ReturnType<RuntimeTransport["sendText"]>>;
-          try {
-            remote = await dependencies.transport.sendText(
-              Object.freeze({
-                chatId: route.chatId,
-                text: body.value,
-                replyToMessageId: route.messageId,
-              }),
-            );
-          } catch {
-            markAmbiguous();
-            return Object.freeze({ state: "FAILED" as const });
-          }
-          const task = activeStore.getTask(taskId);
-          if (task === null) {
-            markAmbiguous();
-            return Object.freeze({ state: "FAILED" as const });
-          }
-          const acknowledgementPath = join(
-            task.workspacePath,
-            ACKNOWLEDGEMENT_FILE,
-          );
-          try {
-            await writePrivateJson(
-              acknowledgementPath,
-              Object.freeze({
-                version: 1,
-                acknowledgedAt: now().toISOString(),
-              }),
-            );
-          } catch (cause) {
-            if (
-              !(
-                cause instanceof Error &&
-                "code" in cause &&
-                cause.code === "EEXIST" &&
-                (await taskWasAcknowledged(task.workspacePath))
-              )
-            ) {
-              markAmbiguous();
-              return Object.freeze({ state: "FAILED" as const });
-            }
-          }
-          try {
-            const acknowledged = activeStore.finishTaskAcknowledgement({
-              taskId,
-              owner: instanceId,
-              now: now(),
-              state: "ACKNOWLEDGED",
-              failureClass: null,
-            });
-            if (acknowledged?.state !== "ACKNOWLEDGED") {
-              return Object.freeze({ state: "FAILED" as const });
-            }
-          } catch {
-            return Object.freeze({ state: "FAILED" as const });
-          }
-          return replyResult(remote);
+          acknowledgementCoordinator?.wake();
+          return Object.freeze({ state: "SUCCEEDED" as const });
         },
         async sendControlReply(controlEventId: string, body: SystemText) {
           const route = controlRoutes.get(controlEventId);
@@ -1504,7 +1519,7 @@ export async function startExecutiveRuntime(
       }),
       scheduler: Object.freeze({
         wake() {
-          wakeWorker();
+          acknowledgementCoordinator?.wake();
         },
       }),
     });
@@ -1525,7 +1540,7 @@ export async function startExecutiveRuntime(
         record() {},
       }),
     });
-    wakeWorker();
+    await acknowledgementCoordinator.start();
 
     heartbeat = setInterval(() => {
       if (closing || !store) return;
@@ -1552,6 +1567,7 @@ export async function startExecutiveRuntime(
     return Object.freeze({
       instanceId,
       async waitForIdle(): Promise<void> {
+        await acknowledgementCoordinator?.waitForIdle();
         while (drainPromise) {
           const current = drainPromise;
           await current;
@@ -1572,6 +1588,7 @@ export async function startExecutiveRuntime(
             pending.markReady();
             settlePendingAction(pending, "CANCELLED");
           }
+          await acknowledgementCoordinator?.stop();
           await channel?.disconnect();
           await activeRun?.handle.stop();
           await Promise.allSettled([...confirmationOperations.values()]);
@@ -1585,7 +1602,9 @@ export async function startExecutiveRuntime(
       },
     });
   } catch (cause) {
+    if (startupLeaseHeartbeat) clearInterval(startupLeaseHeartbeat);
     if (heartbeat) clearInterval(heartbeat);
+    await acknowledgementCoordinator?.stop().catch(() => undefined);
     if (channel) {
       await channel.disconnect().catch(() => undefined);
     } else {

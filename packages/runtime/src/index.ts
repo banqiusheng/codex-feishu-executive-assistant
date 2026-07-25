@@ -24,6 +24,7 @@ export type {
   ExecutiveRuntime,
   ProductionRuntimeDependencies,
   RuntimeConfirmationCard,
+  RuntimeAcknowledgement,
   RuntimeConfig,
   RuntimeDependencies,
   RuntimeExecutables,

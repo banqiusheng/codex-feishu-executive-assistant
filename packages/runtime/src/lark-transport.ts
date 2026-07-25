@@ -13,9 +13,11 @@ import type {
   TrustedCardEvidence,
 } from "@executive-assistant/bridge";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { types as utilTypes } from "node:util";
 
 import type {
   RuntimeConfirmationCard,
+  RuntimeAcknowledgement,
   RuntimeFileReply,
   RuntimeTenantBindingRequest,
   RuntimeTextReply,
@@ -36,6 +38,34 @@ const MAX_BUFFERED_MESSAGES = 32;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function rawReplyMessageId(value: unknown): string | null {
+  try {
+    if (!isRecord(value) || utilTypes.isProxy(value)) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const code = descriptors.code;
+    const data = descriptors.data;
+    if (
+      code === undefined ||
+      !("value" in code) ||
+      code.value !== 0 ||
+      data === undefined ||
+      !("value" in data) ||
+      !isRecord(data.value) ||
+      utilTypes.isProxy(data.value)
+    ) {
+      return null;
+    }
+    const messageId = Object.getOwnPropertyDescriptor(data.value, "message_id");
+    return messageId !== undefined &&
+      "value" in messageId &&
+      isExactIdentifier(messageId.value)
+      ? messageId.value
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function isExactIdentifier(value: unknown): value is string {
@@ -499,6 +529,18 @@ export function createBuiltInLarkTransport(
         { replyTo: reply.replyToMessageId },
       );
       return Object.freeze({ messageId: result.messageId });
+    },
+    async sendAcknowledgement(acknowledgement: RuntimeAcknowledgement) {
+      const result = await channel.rawClient.im.v1.message.reply({
+        data: {
+          content: JSON.stringify({ text: acknowledgement.text }),
+          msg_type: "text",
+        },
+        path: { message_id: acknowledgement.replyToMessageId },
+      });
+      const messageId = rawReplyMessageId(result);
+      if (messageId === null) throw new Error("LARK_ACKNOWLEDGEMENT_FAILED");
+      return Object.freeze({ messageId });
     },
     async sendFile(reply: RuntimeFileReply) {
       const result = await channel.send(

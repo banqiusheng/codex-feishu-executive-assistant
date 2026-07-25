@@ -197,10 +197,10 @@ function validFinalization(
   return (
     (state === "ACKNOWLEDGED" && failureClass === null) ||
     (state === "RETRYABLE_DNS" && failureClass === "DNS_UNAVAILABLE") ||
-    (state === "AMBIGUOUS" && failureClass === "RESULT_AMBIGUOUS") ||
-    (state === "FAILED_DEFINITE" &&
-      (failureClass === "REMOTE_REJECTED" ||
-        failureClass === "LOCAL_EVIDENCE_FAILED"))
+    (state === "AMBIGUOUS" &&
+      (failureClass === "RESULT_AMBIGUOUS" ||
+        failureClass === "LOCAL_EVIDENCE_FAILED")) ||
+    (state === "FAILED_DEFINITE" && failureClass === "REMOTE_REJECTED")
   );
 }
 

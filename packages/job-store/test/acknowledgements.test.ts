@@ -159,6 +159,71 @@ function acknowledge(store: JobStore, taskId: string, now: Date): void {
 }
 
 describe("task acknowledgement ledger", () => {
+  it("maps local evidence failure only to AMBIGUOUS and remote rejection only to FAILED_DEFINITE", async () => {
+    const { store, runtimeDir } = await storeFixture();
+    const localEvidence = store.ingestEvent(event(901), workspace(runtimeDir));
+    expect(
+      store.acquireRuntimeLease("bridge", "instance-a", at(0), 60_000),
+    ).toBe(true);
+    expect(
+      store.beginTaskAcknowledgement({
+        taskId: localEvidence.taskId,
+        owner: "instance-a",
+        now: at(1),
+      }),
+    ).toMatchObject({ state: "SENDING" });
+    expect(
+      store.finishTaskAcknowledgement({
+        taskId: localEvidence.taskId,
+        owner: "instance-a",
+        now: at(2),
+        state: "AMBIGUOUS",
+        failureClass: "LOCAL_EVIDENCE_FAILED",
+      }),
+    ).toMatchObject({
+      state: "AMBIGUOUS",
+      lastFailureClass: "LOCAL_EVIDENCE_FAILED",
+    });
+
+    const rejected = store.ingestEvent(event(902), workspace(runtimeDir));
+    expect(
+      store.beginTaskAcknowledgement({
+        taskId: rejected.taskId,
+        owner: "instance-a",
+        now: at(3),
+      }),
+    ).toMatchObject({ state: "SENDING" });
+    expect(
+      store.finishTaskAcknowledgement({
+        taskId: rejected.taskId,
+        owner: "instance-a",
+        now: at(4),
+        state: "FAILED_DEFINITE",
+        failureClass: "REMOTE_REJECTED",
+      }),
+    ).toMatchObject({
+      state: "FAILED_DEFINITE",
+      lastFailureClass: "REMOTE_REJECTED",
+    });
+
+    const invalid = store.ingestEvent(event(903), workspace(runtimeDir));
+    expect(
+      store.beginTaskAcknowledgement({
+        taskId: invalid.taskId,
+        owner: "instance-a",
+        now: at(5),
+      }),
+    ).toMatchObject({ state: "SENDING" });
+    expect(() =>
+      store.finishTaskAcknowledgement({
+        taskId: invalid.taskId,
+        owner: "instance-a",
+        now: at(6),
+        state: "FAILED_DEFINITE",
+        failureClass: "LOCAL_EVIDENCE_FAILED",
+      }),
+    ).toThrow(/task_acknowledgement_input_is_invalid/);
+  });
   it("atomically records a NOT_ATTEMPTED row with each new root task", async () => {
     const { filename, runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
@@ -714,7 +779,7 @@ describe("task acknowledgement ledger", () => {
       taskId,
       owner: "instance-a",
       now: at(12),
-      state: "FAILED_DEFINITE",
+      state: "AMBIGUOUS",
       failureClass: "LOCAL_EVIDENCE_FAILED",
     });
     const persisted = JSON.stringify(

@@ -14,6 +14,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -51,6 +52,13 @@ import type {
 
 const roots: string[] = [];
 const TENANT_KEY = "tenant_test_001";
+const testRequire = createRequire(import.meta.url);
+const Database = testRequire(
+  "../../job-store/node_modules/better-sqlite3",
+) as new (filename: string) => {
+  prepare(sql: string): { run(...parameters: unknown[]): unknown };
+  close(): void;
+};
 
 afterEach(async () => {
   for (const root of roots.splice(0)) {
@@ -65,10 +73,14 @@ class FakeTransport implements RuntimeTransport {
     | ((state: LifecycleState, detail?: unknown) => void)
     | undefined;
   readonly textReplies: RuntimeTextReply[] = [];
+  readonly acknowledgementAttempts: RuntimeTextReply[] = [];
   readonly fileReplies: RuntimeFileReply[] = [];
   readonly confirmationCards: RuntimeConfirmationCard[] = [];
   connected = false;
   beforeTextReply: ((reply: RuntimeTextReply) => void) | undefined;
+  beforeAcknowledgement:
+    | ((reply: RuntimeTextReply) => void | Promise<void>)
+    | undefined;
   cardEvidence: TrustedCardEvidence | null = null;
   readonly tenantBindingRequests: RuntimeTenantBindingRequest[] = [];
 
@@ -115,6 +127,14 @@ class FakeTransport implements RuntimeTransport {
     return Object.freeze({
       messageId: `reply-${this.textReplies.length}`,
     });
+  }
+
+  async sendAcknowledgement(
+    reply: RuntimeTextReply,
+  ): Promise<Readonly<{ messageId: string }>> {
+    this.acknowledgementAttempts.push(reply);
+    await this.beforeAcknowledgement?.(reply);
+    return this.sendText(reply);
   }
 
   async sendFile(
@@ -487,6 +507,35 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   throw new Error("condition not reached");
 }
 
+function codedFailure(code: string): Error {
+  const failure = new Error("synthetic acknowledgement failure");
+  Object.defineProperty(failure, "code", {
+    value: code,
+    enumerable: true,
+  });
+  return failure;
+}
+
+class ControlledAcknowledgementDelay {
+  readonly milliseconds: number[] = [];
+  readonly pending: Array<() => void> = [];
+
+  wait = (milliseconds: number, signal: AbortSignal): Promise<void> => {
+    this.milliseconds.push(milliseconds);
+    return new Promise<void>((resolve) => {
+      const finish = (): void => resolve();
+      this.pending.push(finish);
+      signal.addEventListener("abort", finish, { once: true });
+    });
+  };
+
+  releaseNext(): void {
+    const release = this.pending.shift();
+    if (!release) throw new Error("acknowledgement delay missing");
+    release();
+  }
+}
+
 describe("executive runtime offline integration", () => {
   it("accepts a new self-built app config without a manually supplied Tenant Key", async () => {
     const config = await fixtureConfig(true, false);
@@ -588,7 +637,8 @@ describe("executive runtime offline integration", () => {
       taskId = runner.starts[0]?.taskId ?? "";
       expect(startsObservedDuringSend).toEqual([0]);
       expect(markersObservedAtStart).toHaveLength(1);
-      expect(markersObservedAtStart[0]).toContain('"version":1');
+      expect(markersObservedAtStart[0]).toContain('"version":2');
+      expect(markersObservedAtStart[0]).toContain(`"taskId":"${taskId}"`);
     } finally {
       await runtime.close();
     }
@@ -611,12 +661,353 @@ describe("executive runtime offline integration", () => {
     }
   });
 
-  it("does not move an older recoverable task to SENDING for a newer inbound route", async () => {
+  it("persists two messages during DNS outage, then ACKs and runs each once in FIFO order", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const delay = new ControlledAcknowledgementDelay();
+    const failures = [codedFailure("ENOTFOUND"), codedFailure("EAI_AGAIN")];
+    transport.beforeAcknowledgement = () => {
+      const failure = failures.shift();
+      if (failure) throw failure;
+    };
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: delay.wait,
+      now: () => new Date("2026-07-25T00:00:00.000Z"),
+      instanceId: "runtime-dns-fifo-instance",
+    });
+    try {
+      await transport.emitMessage(message(140, "第一条离线任务"));
+      await waitUntil(() => delay.pending.length === 1);
+      await transport.emitMessage(message(141, "第二条离线任务"));
+      expect(runner.starts).toHaveLength(0);
+      await expect(
+        (await import("node:fs/promises")).readdir(config.paths.jobsRoot),
+      ).resolves.toHaveLength(2);
+
+      delay.releaseNext();
+      await waitUntil(() => delay.pending.length === 1);
+      delay.releaseNext();
+      await runtime.waitForIdle();
+
+      expect(delay.milliseconds).toEqual([1_000, 2_000]);
+      expect(transport.acknowledgementAttempts).toHaveLength(4);
+      expect(
+        transport.textReplies.filter(
+          (reply) => reply.text === "收到，我开始处理",
+        ),
+      ).toHaveLength(2);
+      expect(runner.starts.map((start) => start.prompt)).toEqual([
+        expect.stringContaining("第一条离线任务"),
+        expect.stringContaining("第二条离线任务"),
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("keeps an unknown ACK result non-executable and never retries it", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    transport.beforeAcknowledgement = () => {
+      throw codedFailure("ECONNRESET");
+    };
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: async () => undefined,
+      instanceId: "runtime-ambiguous-ack-instance",
+    });
+    try {
+      await transport.emitMessage(message(142, "不确定 ACK 不得执行"));
+      await runtime.waitForIdle();
+      expect(transport.acknowledgementAttempts).toHaveLength(1);
+      expect(runner.starts).toHaveLength(0);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("restores the original route for a duplicate while one coordinator owns DNS recovery", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const delay = new ControlledAcknowledgementDelay();
+    let firstAttempt = true;
+    transport.beforeAcknowledgement = () => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        throw codedFailure("ENOTFOUND");
+      }
+    };
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: delay.wait,
+      instanceId: "runtime-duplicate-coordinator-instance",
+    });
+    const duplicate = message(143, "重复投递只恢复原任务");
+    try {
+      await transport.emitMessage(duplicate);
+      await waitUntil(() => delay.pending.length === 1);
+      await transport.emitMessage(duplicate);
+      expect(
+        await (await import("node:fs/promises")).readdir(config.paths.jobsRoot),
+      ).toHaveLength(1);
+
+      delay.releaseNext();
+      await runtime.waitForIdle();
+
+      expect(transport.acknowledgementAttempts).toHaveLength(2);
+      expect(
+        transport.textReplies.filter(
+          (reply) => reply.text === "收到，我开始处理",
+        ),
+      ).toHaveLength(1);
+      expect(runner.starts).toHaveLength(1);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("restarts from persisted RETRYABLE_DNS without a new user message", async () => {
+    const config = await fixtureConfig();
+    const firstTransport = new FakeTransport();
+    const firstRunner = new ImmediateRunner();
+    const delay = new ControlledAcknowledgementDelay();
+    firstTransport.beforeAcknowledgement = () => {
+      throw codedFailure("EAI_AGAIN");
+    };
+    const firstRuntime = await startExecutiveRuntime(config, {
+      transport: firstTransport,
+      runner: firstRunner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: delay.wait,
+      instanceId: "runtime-retryable-first",
+    });
+    await firstTransport.emitMessage(message(144, "重启后恢复接单"));
+    await waitUntil(() => delay.pending.length === 1);
+    expect(firstRunner.starts).toHaveLength(0);
+    await firstRuntime.close();
+
+    const secondTransport = new FakeTransport();
+    const secondRunner = new ImmediateRunner();
+    const secondRuntime = await startExecutiveRuntime(config, {
+      transport: secondTransport,
+      runner: secondRunner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: async () => undefined,
+      now: () => new Date(Date.now() + 120_000),
+      instanceId: "runtime-retryable-second",
+    });
+    try {
+      await secondRuntime.waitForIdle();
+      expect(secondTransport.acknowledgementAttempts).toHaveLength(1);
+      expect(secondRunner.starts).toHaveLength(1);
+      expect(secondRunner.starts[0]?.prompt).toContain("重启后恢复接单");
+    } finally {
+      await secondRuntime.close();
+    }
+  });
+
+  it("interrupts legacy no-row and database-only ACK tasks before any runner start", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const seedLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const seedStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "runtime-inconsistent-seed",
+      lock: seedLock,
+    });
+    expect(
+      seedStore.acquireRuntimeLease(
+        "bridge",
+        "runtime-inconsistent-seed",
+        new Date(),
+        60_000,
+      ),
+    ).toBe(true);
+    const seeded: string[] = [];
+    for (const sequence of [145, 146]) {
+      const taskId = randomUUID();
+      const workspace = join(config.paths.jobsRoot, taskId);
+      await mkdir(workspace, { mode: 0o700 });
+      const receivedAt = new Date(Date.now() + sequence).toISOString();
+      await writeFile(
+        join(workspace, "input.json"),
+        `${JSON.stringify({
+          version: 1,
+          prompt: `不一致任务-${sequence}`,
+          chatId: "oc_synthetic_private_chat",
+          messageId: `inconsistent-message-${sequence}`,
+          eventId: `inconsistent-event-${sequence}`,
+          receivedAt,
+        })}\n`,
+        { mode: 0o600 },
+      );
+      const accepted = seedStore.ingestEvent(
+        {
+          appId: config.appId,
+          tenantKey: TENANT_KEY,
+          eventId: `inconsistent-event-${sequence}`,
+          messageId: `inconsistent-message-${sequence}`,
+          senderOpenId: "ou_synthetic_president",
+          chatId: "oc_synthetic_private_chat",
+          chatType: "p2p",
+          eventType: "im.message.receive_v1",
+          receivedAt,
+          payloadRef: `sha256:${"d".repeat(64)}`,
+        },
+        workspace,
+      );
+      seeded.push(accepted.taskId);
+    }
+    expect(
+      seedStore.beginTaskAcknowledgement({
+        taskId: seeded[0]!,
+        owner: "runtime-inconsistent-seed",
+        now: new Date(),
+      }),
+    ).toMatchObject({ state: "SENDING" });
+    expect(
+      seedStore.finishTaskAcknowledgement({
+        taskId: seeded[0]!,
+        owner: "runtime-inconsistent-seed",
+        now: new Date(),
+        state: "ACKNOWLEDGED",
+        failureClass: null,
+      }),
+    ).toMatchObject({ state: "ACKNOWLEDGED" });
+    seedStore.releaseRuntimeLease("bridge", "runtime-inconsistent-seed");
+    seedStore.close();
+    await seedLock.release();
+    const database = new Database(config.paths.databasePath);
+    database
+      .prepare("DELETE FROM task_acknowledgements WHERE task_id = ?")
+      .run(seeded[1]);
+    database.close();
+
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-inconsistent-recovery",
+    });
+    try {
+      await runtime.waitForIdle();
+      expect(runner.starts).toHaveLength(0);
+      expect(runtime.getTask(seeded[0]!)?.state).toBe(
+        "INTERRUPTED_REQUIRES_CONFIRMATION",
+      );
+      expect(runtime.getTask(seeded[1]!)?.state).toBe(
+        "INTERRUPTED_REQUIRES_CONFIRMATION",
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("allows a task-local legacy v1 marker only for an actual no-row recovery", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const taskId = randomUUID();
+    const workspace = join(config.paths.jobsRoot, taskId);
+    const receivedAt = new Date().toISOString();
+    await mkdir(workspace, { mode: 0o700 });
+    await writeFile(
+      join(workspace, "input.json"),
+      `${JSON.stringify({
+        version: 1,
+        prompt: "历史 v1 安全恢复",
+        chatId: "oc_synthetic_private_chat",
+        messageId: "legacy-v1-message",
+        eventId: "legacy-v1-event",
+        receivedAt,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(workspace, "acknowledged.json"),
+      `${JSON.stringify({
+        version: 1,
+        acknowledgedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const seedLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const seedStore = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "runtime-legacy-v1-seed",
+      lock: seedLock,
+    });
+    const accepted = seedStore.ingestEvent(
+      {
+        appId: config.appId,
+        tenantKey: TENANT_KEY,
+        eventId: "legacy-v1-event",
+        messageId: "legacy-v1-message",
+        senderOpenId: "ou_synthetic_president",
+        chatId: "oc_synthetic_private_chat",
+        chatType: "p2p",
+        eventType: "im.message.receive_v1",
+        receivedAt,
+        payloadRef: `sha256:${"e".repeat(64)}`,
+      },
+      workspace,
+    );
+    seedStore.close();
+    await seedLock.release();
+    const database = new Database(config.paths.databasePath);
+    database
+      .prepare("DELETE FROM task_acknowledgements WHERE task_id = ?")
+      .run(accepted.taskId);
+    database.close();
+
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-legacy-v1-recovery",
+    });
+    try {
+      await runtime.waitForIdle();
+      expect(transport.acknowledgementAttempts).toHaveLength(0);
+      expect(runner.starts.map((start) => start.taskId)).toEqual([
+        accepted.taskId,
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("keeps the older recovered route bound ahead of a newer inbound route", async () => {
     const config = await fixtureConfig();
     await mkdir(config.paths.jobsRoot, { mode: 0o700 });
     const olderTaskId = randomUUID();
     const olderWorkspace = join(config.paths.jobsRoot, olderTaskId);
     await mkdir(olderWorkspace, { mode: 0o700 });
+    await writeFile(
+      join(olderWorkspace, "input.json"),
+      `${JSON.stringify({
+        version: 1,
+        prompt: "较早的可恢复任务",
+        chatId: "oc_synthetic_private_chat",
+        messageId: "older-recoverable-message",
+        eventId: "older-recoverable-event",
+        receivedAt: "2026-07-24T00:00:00.000Z",
+      })}\n`,
+      { mode: 0o600 },
+    );
     const seedLock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
     const seedStore = openJobStore({
       filename: config.paths.databasePath,
@@ -643,19 +1034,40 @@ describe("executive runtime offline integration", () => {
 
     const transport = new FakeTransport();
     const runner = new ImmediateRunner();
+    const delay = new ControlledAcknowledgementDelay();
+    let firstAttempt = true;
+    transport.beforeAcknowledgement = () => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        throw codedFailure("ENOTFOUND");
+      }
+    };
     const runtime = await startExecutiveRuntime(config, {
       transport,
       runner,
       larkRunnerFactory: () => new FakeLarkRunner(),
+      acknowledgementDelay: delay.wait,
       instanceId: "runtime-fifo-guard-instance",
     });
     try {
-      await expect(
-        transport.emitMessage(message(41, "不得借此消息改写旧任务")),
-      ).rejects.toThrow("ASSISTANT_TASK_ACK_FAILED");
-      await runtime.waitForIdle();
-      expect(transport.textReplies).toHaveLength(0);
+      await waitUntil(() => delay.pending.length === 1);
+      await transport.emitMessage(message(41, "较新的排队任务"));
       expect(runner.starts).toHaveLength(0);
+      delay.releaseNext();
+      await runtime.waitForIdle();
+      expect(
+        transport.acknowledgementAttempts.map(
+          (reply) => reply.replyToMessageId,
+        ),
+      ).toEqual([
+        "older-recoverable-message",
+        "older-recoverable-message",
+        "message-41",
+      ]);
+      expect(runner.starts.map((start) => start.prompt)).toEqual([
+        expect.stringContaining("较早的可恢复任务"),
+        expect.stringContaining("较新的排队任务"),
+      ]);
     } finally {
       await runtime.close();
     }
@@ -667,22 +1079,9 @@ describe("executive runtime offline integration", () => {
       lock: inspectLock,
     });
     try {
-      const candidates =
-        inspectStore.listTaskAcknowledgementRecoveryCandidates();
-      expect(candidates).toHaveLength(2);
-      const newer = candidates.find(
-        (candidate) => candidate.taskId !== olderTaskId,
-      );
-      expect(newer).toBeDefined();
       expect(inspectStore.getTaskAcknowledgement(olderTaskId)).toMatchObject({
-        state: "NOT_ATTEMPTED",
-        attemptCount: 0,
-      });
-      expect(
-        inspectStore.getTaskAcknowledgement(newer?.taskId ?? ""),
-      ).toMatchObject({
-        state: "NOT_ATTEMPTED",
-        attemptCount: 0,
+        state: "ACKNOWLEDGED",
+        attemptCount: 2,
       });
     } finally {
       inspectStore.close();
@@ -695,7 +1094,7 @@ describe("executive runtime offline integration", () => {
     const transport = new FakeTransport();
     const runner = new ImmediateRunner();
     let rejectAcknowledgement = true;
-    transport.beforeTextReply = (reply) => {
+    transport.beforeAcknowledgement = (reply) => {
       if (reply.text === "收到，我开始处理" && rejectAcknowledgement) {
         throw new Error("synthetic acknowledgement failure");
       }
@@ -707,9 +1106,7 @@ describe("executive runtime offline integration", () => {
       instanceId: "runtime-ack-instance",
     });
     try {
-      await expect(
-        transport.emitMessage(message(3, "这条任务的接单回复会失败")),
-      ).rejects.toThrow("ASSISTANT_TASK_ACK_FAILED");
+      await transport.emitMessage(message(3, "这条任务的接单回复会失败"));
       await runtime.waitForIdle();
       expect(runner.starts).toHaveLength(0);
 
@@ -1058,7 +1455,8 @@ describe("executive runtime offline integration", () => {
     await writeFile(
       join(workspace, "acknowledged.json"),
       `${JSON.stringify({
-        version: 1,
+        version: 2,
+        taskId,
         acknowledgedAt: new Date().toISOString(),
       })}\n`,
       { mode: 0o600 },

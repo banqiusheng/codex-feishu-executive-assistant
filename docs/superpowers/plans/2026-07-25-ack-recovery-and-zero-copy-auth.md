@@ -318,6 +318,37 @@ Expected first result: FAIL on the new recovery assertions.
 
 Do not patch `packages/bridge/vendor`; the runtime adapter owns the recovery.
 
+**Audited safety clarification (2026-07-25):**
+
+- Acceptance ACKs use a dedicated `RuntimeTransport.sendAcknowledgement` path.
+  The built-in Lark transport calls the locked channel's
+  `rawClient.im.v1.message.reply` exactly once and validates the success
+  result; it never calls the channel outbound sender, so the ACK path has no
+  outbound retry or reply-to-create fallback. Text, file, card, control,
+  progress, and final replies keep their existing transport paths.
+- `TaskSink.ingest` and bridge scheduler wake only enqueue/wake the coordinator
+  and return. They never wait through ACK backoff and never wake the worker.
+  This keeps the transport delivery tail free to persist later messages during
+  a DNS outage.
+- New markers use exact task-bound schema
+  `{version:2, taskId, acknowledgedAt}`, strict fatal-UTF-8 JSON parsing,
+  canonical timestamps, same-directory `0600` temp files, fsync, atomic
+  no-overwrite linking, and directory fsync. A remote success followed by
+  marker failure finalizes `AMBIGUOUS + LOCAL_EVIDENCE_FAILED`; only
+  `REMOTE_REJECTED` may pair with `FAILED_DEFINITE`. Legacy v1 is accepted only
+  for an actual no-row historical recovery and never as evidence for a new
+  task.
+- DNS classification reads only the unknown value's own data `code` and
+  accepts exact `ENOTFOUND` / `EAI_AGAIN`. Proxy, accessor, inherited,
+  wrapped/cause, timeout, disconnect, remote, and unknown values are never
+  retryable. Retry state restores `attemptCount` and `updatedAt`; timers are
+  cancellable and never the fact source.
+- Startup finishes the ACK truth table and restores safe private routes before
+  channel startup. Channel startup is followed by one coordinator start.
+  Duplicate delivery reloads the original accepted task input and wakes that
+  same coordinator. Shutdown stops the coordinator before disconnecting the
+  channel or releasing the runtime lease/store.
+
 **Step 5: Run targeted gates and commit**
 
 ```bash
