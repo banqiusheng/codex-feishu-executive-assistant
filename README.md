@@ -53,6 +53,8 @@ doctor 还会在不读取 App Secret、Bot/User Token 或调用写接口的前�
 `feishu-https-rest`：前者只检查固定飞书域名能否解析，后者只检查固定 HTTPS `HEAD` 请求
 能否到达（任意 HTTP 状态都表示网络可达）。这两项只证明网络连通性，不代表飞书权限、API
 业务调用成功、配对完成或 24 小时可用；安装器也会核验该 helper 是普通非符号链接交付文件。
+网络 child 在五秒到期时会强制终止；其输出、stderr、退出状态与 JSON schema 任一不可信时，
+doctor 只给出固定失败分类，不回显子进程内容。
 
 也可以直接把下面这句话交给 Codex：
 

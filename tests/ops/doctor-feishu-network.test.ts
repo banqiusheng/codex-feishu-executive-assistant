@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
   chmodSync,
   mkdtempSync,
@@ -15,6 +16,7 @@ import {
   parseExactProbeReport,
   probeFeishuDns,
   probeFeishuHttpsRest,
+  requestFeishuHttpsStatus,
   runConfiguredFeishuProbes,
   sanitizeProbeEnvironment,
 } from "../../scripts/doctor-feishu-network.mjs";
@@ -29,6 +31,51 @@ function temporaryRoot(): string {
   return root;
 }
 
+function writeDoctorConfig(root: string, configuredNode: string): string {
+  const configPath = join(root, "assistant.json");
+  writeFileSync(
+    configPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      appId: "cli_TEST123456",
+      presidentOpenId: null,
+      presidentChatId: null,
+      pairing: {
+        enabled: true,
+        codeHash: `sha256:${"a".repeat(64)}`,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+      secretRef: {
+        type: "macos-keychain",
+        service: "com.codex-feishu-executive-assistant.bot",
+        account: "cli_TEST123456",
+      },
+      paths: {
+        runtimeRoot: root,
+        larkHome: join(root, "lark"),
+        databasePath: join(root, "assistant.sqlite"),
+        codexHome: join(root, "codex"),
+      },
+      executables: {
+        node: configuredNode,
+        codex: join(root, "missing-codex"),
+        larkCli: join(root, "missing-lark"),
+        runtimeEntry: join(root, "missing-runtime"),
+      },
+      visualFirstPpt: {
+        skillRoot: join(root, "missing-ppt"),
+        presentationsPlugin: {
+          id: "presentations@openai-primary-runtime",
+          version: "test",
+        },
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  chmodSync(configPath, 0o600);
+  return configPath;
+}
+
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -41,7 +88,7 @@ describe("credential-free Feishu network probes", () => {
     const result = await probeFeishuDns({
       lookup: async (...args: unknown[]) => {
         observed.push(args);
-        return [{ address: "203.0.113.19", family: 4 }];
+        return [{ address: "opaque-address-sentinel", family: 4 }];
       },
     });
 
@@ -49,7 +96,7 @@ describe("credential-free Feishu network probes", () => {
     expect(observed).toEqual([
       ["open.feishu.cn", { all: true, verbatim: true }],
     ]);
-    expect(JSON.stringify(result)).not.toContain("203.0.113.19");
+    expect(JSON.stringify(result)).not.toContain("opaque-address-sentinel");
   });
 
   it("uses the fixed HTTPS HEAD probe and accepts every HTTP status", async () => {
@@ -71,6 +118,54 @@ describe("credential-free Feishu network probes", () => {
       ["https://open.feishu.cn/open-apis/"],
       ["https://open.feishu.cn/open-apis/"],
     ]);
+  });
+
+  it("accepts 1xx production HTTPS events exactly once and safely closes upgrade sockets", async () => {
+    for (const statusCode of [100, 101, 199, 204, 599]) {
+      const request = new EventEmitter() as EventEmitter & {
+        destroy: () => void;
+        end: () => void;
+        setTimeout: (_milliseconds: number, callback: () => void) => void;
+      };
+      const socket = { destroy: () => undefined };
+      let responseCallback:
+        | ((response: { statusCode?: number; resume: () => void }) => void)
+        | undefined;
+      let settled = 0;
+      request.destroy = () => undefined;
+      request.setTimeout = () => undefined;
+      request.end = () => {
+        if (statusCode === 101) {
+          request.emit(
+            "upgrade",
+            { statusCode, resume: () => undefined },
+            socket,
+            Buffer.alloc(0),
+          );
+        } else if (statusCode < 200) {
+          request.emit("information", { statusCode, resume: () => undefined });
+        } else {
+          responseCallback?.({ statusCode, resume: () => undefined });
+        }
+        request.emit("error", new Error("must-not-change-settlement"));
+        request.emit("information", {
+          statusCode: 199,
+          resume: () => undefined,
+        });
+      };
+      await expect(
+        requestFeishuHttpsStatus({
+          request: (_endpoint, _options, callback) => {
+            responseCallback = callback;
+            return request;
+          },
+          onSettled: () => {
+            settled += 1;
+          },
+        }),
+      ).resolves.toBe(statusCode);
+      expect(settled).toBe(1);
+    }
   });
 
   it("classifies empty DNS, HTTP errors, and malformed injections without exposing raw failures", async () => {
@@ -253,5 +348,103 @@ describe("credential-free Feishu network probes", () => {
       LANG: "C",
       LC_ALL: "C",
     });
+  });
+
+  it("hard-kills a configured child that ignores SIGTERM within the five-second boundary", () => {
+    const root = temporaryRoot();
+    const fakeNode = join(root, "configured-node.mjs");
+    writeFileSync(
+      fakeNode,
+      `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === "--version") { process.stdout.write("v20.0.0\\n"); process.exit(0); }\nprocess.on("SIGTERM", () => {}); setInterval(() => {}, 1000);\n`,
+      { mode: 0o500 },
+    );
+    chmodSync(fakeNode, 0o500);
+    const startedAt = Date.now();
+    const result = spawnSync(
+      "/bin/zsh",
+      [doctorPath, "--json", "--config", writeDoctorConfig(root, fakeNode)],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+      },
+    );
+    const elapsedMilliseconds = Date.now() - startedAt;
+    const report = JSON.parse(result.stdout) as {
+      checks: Array<{ id: string; status: string; detail: string }>;
+    };
+    expect(elapsedMilliseconds).toBeLessThan(6_500);
+    expect(report.checks.find((check) => check.id === "feishu-dns")).toEqual({
+      id: "feishu-dns",
+      status: "FAIL",
+      detail: "飞书 DNS 不可达。",
+    });
+    expect(
+      report.checks.find((check) => check.id === "feishu-https-rest"),
+    ).toEqual({
+      id: "feishu-https-rest",
+      status: "FAIL",
+      detail: "飞书 HTTPS/REST 不可达。",
+    });
+  });
+
+  it("fails closed for every configured-child process and strict-output boundary", () => {
+    const scenarios = [
+      ["nonzero", 'process.stderr.write("opaque-sentinel"); process.exit(73);'],
+      [
+        "stderr",
+        `process.stderr.write("opaque-sentinel"); process.stdout.write('{"schemaVersion":1,"dns":"PASS","httpsRest":"PASS"}\\n');`,
+      ],
+      ["oversize", 'process.stdout.write("x".repeat(4097));'],
+      ["malformed", 'process.stdout.write("not-json");'],
+      ["invalid-utf8", "process.stdout.write(Buffer.from([255]));"],
+      [
+        "duplicate",
+        `process.stdout.write('{"schemaVersion":1,"dns":"PASS","dns":"DNS_UNAVAILABLE","httpsRest":"PASS"}');`,
+      ],
+      [
+        "extra",
+        `process.stdout.write('{"schemaVersion":1,"dns":"PASS","httpsRest":"PASS","extra":"opaque-sentinel"}');`,
+      ],
+      [
+        "unknown",
+        `process.stdout.write('{"schemaVersion":1,"dns":"UNKNOWN","httpsRest":"PASS"}');`,
+      ],
+      [
+        "wrong-field",
+        `process.stdout.write('{"schemaVersion":1,"dns":"REST_UNREACHABLE","httpsRest":"DNS_UNAVAILABLE"}');`,
+      ],
+    ] as const;
+    for (const [, behavior] of scenarios) {
+      const root = temporaryRoot();
+      const fakeNode = join(root, "configured-node.mjs");
+      writeFileSync(
+        fakeNode,
+        `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === "--version") { process.stdout.write("v20.0.0\\n"); process.exit(0); }\n${behavior}\n`,
+        { mode: 0o500 },
+      );
+      chmodSync(fakeNode, 0o500);
+      const result = spawnSync(
+        "/bin/zsh",
+        [doctorPath, "--json", "--config", writeDoctorConfig(root, fakeNode)],
+        { cwd: repositoryRoot, encoding: "utf8" },
+      );
+      expect(result.stdout).not.toContain("opaque-sentinel");
+      expect(result.stderr).not.toContain("opaque-sentinel");
+      const report = JSON.parse(result.stdout) as {
+        checks: Array<{ id: string; status: string; detail: string }>;
+      };
+      expect(report.checks.find((check) => check.id === "feishu-dns")).toEqual({
+        id: "feishu-dns",
+        status: "FAIL",
+        detail: "飞书 DNS 不可达。",
+      });
+      expect(
+        report.checks.find((check) => check.id === "feishu-https-rest"),
+      ).toEqual({
+        id: "feishu-https-rest",
+        status: "FAIL",
+        detail: "飞书 HTTPS/REST 不可达。",
+      });
+    }
   });
 });

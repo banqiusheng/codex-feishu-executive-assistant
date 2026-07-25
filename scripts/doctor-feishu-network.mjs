@@ -216,17 +216,73 @@ function configuredOptions(options) {
   return snapshot;
 }
 
-async function defaultRequestHead(endpoint) {
+export function requestFeishuHttpsStatus(options = undefined) {
+  const requestFactory = options?.request ?? https.request;
+  const onSettled = options?.onSettled;
+  if (
+    typeof requestFactory !== "function" ||
+    (onSettled !== undefined && typeof onSettled !== "function")
+  ) {
+    return Promise.reject(new Error("request_invalid"));
+  }
   return new Promise((resolve, reject) => {
-    const request = https.request(endpoint, { method: "HEAD" }, (response) => {
-      response.resume();
-      resolve(response.statusCode);
-    });
-    request.once("error", reject);
-    request.setTimeout(HTTPS_TIMEOUT_MS, () =>
-      request.destroy(new Error("timeout")),
-    );
-    request.end();
+    let settled = false;
+    let request;
+    const settle = (statusCode, response, socket) => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (
+          !Number.isInteger(statusCode) ||
+          statusCode < 100 ||
+          statusCode > 599
+        ) {
+          throw new Error("status_invalid");
+        }
+        response?.resume?.();
+        socket?.destroy?.();
+        request?.destroy?.();
+        onSettled?.();
+        resolve(statusCode);
+      } catch {
+        reject(new Error("request_invalid"));
+      }
+    };
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        request?.destroy?.();
+      } catch {
+        // Fail closed without exposing transport errors.
+      }
+      reject(new Error("request_failed"));
+    };
+    try {
+      request = requestFactory(HTTPS_ENDPOINT, { method: "HEAD" }, (response) =>
+        settle(response?.statusCode, response),
+      );
+      if (
+        !request ||
+        typeof request.once !== "function" ||
+        typeof request.setTimeout !== "function" ||
+        typeof request.end !== "function"
+      ) {
+        fail();
+        return;
+      }
+      request.once("information", (response) =>
+        settle(response?.statusCode, response),
+      );
+      request.once("upgrade", (response, socket) =>
+        settle(response?.statusCode, response, socket),
+      );
+      request.once("error", fail);
+      request.setTimeout(HTTPS_TIMEOUT_MS, fail);
+      request.end();
+    } catch {
+      fail();
+    }
   });
 }
 
@@ -252,7 +308,7 @@ export async function probeFeishuDns(options = undefined) {
 export async function probeFeishuHttpsRest(options = undefined) {
   const requestHead =
     options === undefined
-      ? defaultRequestHead
+      ? requestFeishuHttpsStatus
       : injectedOption(options, "requestHead");
   if (requestHead === null || requestHead === undefined)
     return "REST_UNREACHABLE";

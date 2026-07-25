@@ -92,6 +92,7 @@ function run(executable, argv, options = {}) {
   return spawnSync(executable, argv, {
     encoding: options.encoding ?? "utf8",
     timeout: options.timeout ?? 15_000,
+    killSignal: options.killSignal,
     maxBuffer: options.maxBuffer ?? 1024 * 1024,
     env: options.env ?? process.env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -216,6 +217,7 @@ if (
     const networkDoctor = await import(pathToFileURL(helperPath).href);
     const result = run(configuredNode, [helperPath], {
       timeout: 5_000,
+      killSignal: "SIGKILL",
       maxBuffer: 4_096,
       encoding: "buffer",
       env: {
