@@ -29,6 +29,7 @@ export type AckCoordinatorOptions = Readonly<{
   ) => Promise<Readonly<{ messageId: string }>>;
   writeMarker: (taskId: string, acknowledgedAt: Date) => Promise<void>;
   wakeWorker: () => void;
+  tripExecutionBarrier: () => void;
 }>;
 
 export function retryableDnsCode(
@@ -112,6 +113,10 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
   let loopPromise: Promise<void> | undefined;
   const abortController = new AbortController();
   const wokenAcknowledged = new Set<string>();
+  const haltForFinalizationUncertainty = (): "halt" => {
+    options.tripExecutionBarrier();
+    return "halt";
+  };
 
   const finish = (
     taskId: string,
@@ -179,15 +184,25 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
     } catch (cause) {
       try {
         if (retryableDnsCode(cause) !== null) {
-          return finish(candidate.taskId, "RETRYABLE_DNS", "DNS_UNAVAILABLE")
-            ?.state === "RETRYABLE_DNS"
+          const retryable = finish(
+            candidate.taskId,
+            "RETRYABLE_DNS",
+            "DNS_UNAVAILABLE",
+          );
+          return retryable?.state === "RETRYABLE_DNS"
             ? "continue"
-            : "halt";
+            : haltForFinalizationUncertainty();
         }
-        finish(candidate.taskId, "AMBIGUOUS", "RESULT_AMBIGUOUS");
-        return "continue";
+        const ambiguous = finish(
+          candidate.taskId,
+          "AMBIGUOUS",
+          "RESULT_AMBIGUOUS",
+        );
+        return ambiguous?.state === "AMBIGUOUS"
+          ? "continue"
+          : haltForFinalizationUncertainty();
       } catch {
-        return "halt";
+        return haltForFinalizationUncertainty();
       }
     }
 
@@ -196,18 +211,26 @@ export function createAckCoordinator(options: AckCoordinatorOptions): Readonly<{
       await options.writeMarker(candidate.taskId, acknowledgedAt);
     } catch {
       try {
-        finish(candidate.taskId, "AMBIGUOUS", "LOCAL_EVIDENCE_FAILED");
-        return "continue";
+        const ambiguous = finish(
+          candidate.taskId,
+          "AMBIGUOUS",
+          "LOCAL_EVIDENCE_FAILED",
+        );
+        return ambiguous?.state === "AMBIGUOUS"
+          ? "continue"
+          : haltForFinalizationUncertainty();
       } catch {
-        return "halt";
+        return haltForFinalizationUncertainty();
       }
     }
 
     try {
       const acknowledged = finish(candidate.taskId, "ACKNOWLEDGED", null);
-      if (acknowledged?.state !== "ACKNOWLEDGED") return "halt";
+      if (acknowledged?.state !== "ACKNOWLEDGED") {
+        return haltForFinalizationUncertainty();
+      }
     } catch {
-      return "halt";
+      return haltForFinalizationUncertainty();
     }
     if (stopping) return "halt";
     wokenAcknowledged.add(candidate.taskId);

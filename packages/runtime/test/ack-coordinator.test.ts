@@ -43,6 +43,8 @@ class MemoryAckStore implements AckCoordinatorStore {
   readonly rows: MutableAck[];
   readonly events: string[] = [];
   throwOnAcknowledged = false;
+  commitThenThrowOnAcknowledged = false;
+  returnNullOnAcknowledged = false;
 
   constructor(states: readonly TaskAcknowledgementState[] = ["NOT_ATTEMPTED"]) {
     this.rows = states.map((state, index) => ({
@@ -92,7 +94,14 @@ class MemoryAckStore implements AckCoordinatorStore {
       (candidate) => candidate.taskId === input.taskId,
     );
     if (!row || row.state !== "SENDING") return null;
-    if (input.state === "ACKNOWLEDGED" && this.throwOnAcknowledged) {
+    if (input.state === "ACKNOWLEDGED" && this.returnNullOnAcknowledged) {
+      return null;
+    }
+    if (
+      input.state === "ACKNOWLEDGED" &&
+      this.throwOnAcknowledged &&
+      !this.commitThenThrowOnAcknowledged
+    ) {
       throw new Error("synthetic database uncertainty");
     }
     row.state = input.state;
@@ -106,6 +115,13 @@ class MemoryAckStore implements AckCoordinatorStore {
       row.executable = false;
     }
     this.events.push(`finish:${input.state}:${String(input.failureClass)}`);
+    if (
+      input.state === "ACKNOWLEDGED" &&
+      this.throwOnAcknowledged &&
+      this.commitThenThrowOnAcknowledged
+    ) {
+      throw new Error("synthetic commit-then-throw uncertainty");
+    }
     return frozen(row);
   }
 }
@@ -141,6 +157,9 @@ function coordinatorOptions(
     },
     wakeWorker: () => {
       store.events.push("wake");
+    },
+    tripExecutionBarrier: () => {
+      store.events.push("barrier");
     },
     ...overrides,
   };
@@ -303,9 +322,10 @@ describe("single FIFO ACK coordinator", () => {
     },
   );
 
-  it("never retries or wakes when database ACK finalization is uncertain", async () => {
+  it("trips the execution barrier synchronously after commit-then-throw ACK uncertainty", async () => {
     const store = new MemoryAckStore();
     store.throwOnAcknowledged = true;
+    store.commitThenThrowOnAcknowledged = true;
     let sends = 0;
     const coordinator = createAckCoordinator(
       coordinatorOptions(store, {
@@ -320,7 +340,24 @@ describe("single FIFO ACK coordinator", () => {
     await coordinator.waitForIdle();
 
     expect(sends).toBe(1);
+    expect(store.rows[0]?.state).toBe("ACKNOWLEDGED");
+    expect(store.events).toContain("barrier");
+    expect(store.events.indexOf("barrier")).toBe(
+      store.events.indexOf("finish:ACKNOWLEDGED:null") + 1,
+    );
+    expect(store.events).not.toContain("wake");
+  });
+
+  it("trips the execution barrier when ACK finalization returns null", async () => {
+    const store = new MemoryAckStore();
+    store.returnNullOnAcknowledged = true;
+    const coordinator = createAckCoordinator(coordinatorOptions(store));
+
+    await coordinator.start();
+    await coordinator.waitForIdle();
+
     expect(store.rows[0]?.state).toBe("SENDING");
+    expect(store.events).toContain("barrier");
     expect(store.events).not.toContain("wake");
   });
 

@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import type {
   CardActionEvent,
   LarkChannel,
+  LarkChannelOptions,
   NormalizedMessage,
 } from "@larksuiteoapi/node-sdk";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createBuiltInLarkTransport } from "../src/lark-transport.js";
 
@@ -123,6 +124,64 @@ function normalizedMessage(
 }
 
 describe("built-in Lark transport tenant binding", () => {
+  it("installs a fixed no-op SDK logger that cannot expose sensitive arguments", async () => {
+    const channel = new FakeLarkChannel();
+    let channelOptions: LarkChannelOptions | undefined;
+    const consoleOutput: unknown[] = [];
+    const consoleSpies = (
+      ["error", "warn", "info", "debug", "trace"] as const
+    ).map((method) =>
+      vi.spyOn(console, method).mockImplementation((...values: unknown[]) => {
+        consoleOutput.push(...values);
+      }),
+    );
+    let serializationAttempts = 0;
+    const sensitive = Object.freeze({
+      host: "sensitive-host.invalid",
+      path: "/open-apis/im/v1/messages/sensitive-message",
+      toJSON() {
+        serializationAttempts += 1;
+        return "SENSITIVE_SENTINEL";
+      },
+      toString() {
+        serializationAttempts += 1;
+        return "SENSITIVE_SENTINEL";
+      },
+    });
+
+    try {
+      const transport = createBuiltInLarkTransport({
+        appId: "cli_fixture_app",
+        appSecret: "fixture",
+        createChannel: (options) => {
+          channelOptions = options;
+          return channel as unknown as LarkChannel;
+        },
+      });
+
+      const logger = channelOptions?.logger;
+      expect(logger).toBeDefined();
+      await Promise.all(
+        (["error", "warn", "info", "debug", "trace"] as const).map(
+          async (method) => logger?.[method](sensitive, "SENSITIVE_SENTINEL"),
+        ),
+      );
+      await expect(
+        transport.sendAcknowledgement({
+          chatId: "oc_fixture_private_chat",
+          text: "收到，我开始处理",
+          replyToMessageId: "message-fixture",
+        }),
+      ).resolves.toEqual({ messageId: "fixture-ack-reply" });
+
+      expect(consoleOutput).toEqual([]);
+      expect(serializationAttempts).toBe(0);
+      expect(channel.rawReplyCalls).toHaveLength(1);
+    } finally {
+      for (const spy of consoleSpies) spy.mockRestore();
+    }
+  });
+
   it("sends acceptance ACK through one raw reply and never channel.send", async () => {
     const channel = new FakeLarkChannel();
     const transport = createBuiltInLarkTransport({

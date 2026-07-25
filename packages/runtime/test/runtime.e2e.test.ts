@@ -314,6 +314,42 @@ class BlockingStartRunner implements CodexRunner {
   }
 }
 
+class GatedResultRunner implements CodexRunner {
+  readonly starts: CodexRunInput[] = [];
+  private releaseResult: (() => void) | undefined;
+  private readonly resultAllowed = new Promise<void>((resolve) => {
+    this.releaseResult = resolve;
+  });
+
+  complete(): void {
+    this.releaseResult?.();
+  }
+
+  async start(input: CodexRunInput): Promise<CodexRunHandle> {
+    this.starts.push(input);
+    const resultAllowed = this.resultAllowed;
+    return Object.freeze({
+      events: (async function* () {
+        yield Object.freeze({
+          type: "thread.started",
+          thread_id: "018f7d72-7a2b-7f45-8a12-8e20b8426a21",
+        });
+        await resultAllowed;
+      })(),
+      result: resultAllowed.then(() =>
+        Object.freeze({
+          status: "SUCCEEDED" as const,
+          exitCode: 0 as const,
+          signal: null,
+        }),
+      ),
+      stop: async () => {
+        this.releaseResult?.();
+      },
+    });
+  }
+}
+
 class MessageActionRunner implements CodexRunner {
   gatewayResponse: unknown;
 
@@ -505,6 +541,23 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error("condition not reached");
+}
+
+async function settleWithin<T>(
+  operation: Promise<T>,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timeout:${label}`)), 1_000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function codedFailure(code: string): Error {
@@ -1479,6 +1532,178 @@ describe("executive runtime offline integration", () => {
       expect(runtime.getTask(taskId)?.state).toBe("SUCCEEDED");
     } finally {
       await runtime.close();
+    }
+  });
+
+  it("advances from a recovered ACK head to the next queued task without new inbound traffic", async () => {
+    const config = await fixtureConfig();
+    await mkdir(config.paths.jobsRoot, { mode: 0o700 });
+    const lock = await acquireDatabaseFileLock(config.paths.runtimeRoot);
+    const store = openJobStore({
+      filename: config.paths.databasePath,
+      instanceId: "seed-two-recovered-acks",
+      lock,
+    });
+    expect(
+      store.acquireRuntimeLease(
+        "bridge",
+        "seed-two-recovered-acks",
+        new Date(),
+        60_000,
+      ),
+    ).toBe(true);
+    const taskIds: string[] = [];
+    for (const sequence of [151, 152]) {
+      const taskId = randomUUID();
+      const workspace = join(config.paths.jobsRoot, taskId);
+      const receivedAt = new Date(Date.now() + sequence).toISOString();
+      await mkdir(workspace, { mode: 0o700 });
+      await writeFile(
+        join(workspace, "input.json"),
+        `${JSON.stringify({
+          version: 1,
+          prompt: `恢复队列任务-${sequence}`,
+          chatId: "oc_synthetic_private_chat",
+          messageId: `recovered-progress-message-${sequence}`,
+          eventId: `recovered-progress-event-${sequence}`,
+          receivedAt,
+        })}\n`,
+        { mode: 0o600 },
+      );
+      const accepted = store.ingestEvent(
+        {
+          appId: config.appId,
+          tenantKey: TENANT_KEY,
+          eventId: `recovered-progress-event-${sequence}`,
+          messageId: `recovered-progress-message-${sequence}`,
+          senderOpenId: "ou_synthetic_president",
+          chatId: "oc_synthetic_private_chat",
+          chatType: "p2p",
+          eventType: "im.message.receive_v1",
+          receivedAt,
+          payloadRef: `sha256:${"f".repeat(64)}`,
+        },
+        workspace,
+      );
+      taskIds.push(accepted.taskId);
+    }
+    expect(
+      store.beginTaskAcknowledgement({
+        taskId: taskIds[0]!,
+        owner: "seed-two-recovered-acks",
+        now: new Date(),
+      }),
+    ).toMatchObject({ state: "SENDING" });
+    await writeFile(
+      join(config.paths.jobsRoot, taskIds[0]!, "acknowledged.json"),
+      `${JSON.stringify({
+        version: 2,
+        taskId: taskIds[0],
+        acknowledgedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    store.releaseRuntimeLease("bridge", "seed-two-recovered-acks");
+    store.close();
+    await lock.release();
+
+    const transport = new FakeTransport();
+    const runner = new ImmediateRunner();
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-two-recovered-acks",
+    });
+    try {
+      await runtime.waitForIdle();
+      expect(runner.starts.map((start) => start.taskId)).toEqual(taskIds);
+      expect(
+        transport.acknowledgementAttempts.map(
+          (attempt) => attempt.replyToMessageId,
+        ),
+      ).toEqual(["recovered-progress-message-152"]);
+      expect(taskIds.map((taskId) => runtime.getTask(taskId)?.state)).toEqual([
+        "SUCCEEDED",
+        "SUCCEEDED",
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("blocks later execution after ACK finalization commits and then throws", async () => {
+    const config = await fixtureConfig();
+    const transport = new FakeTransport();
+    const runner = new GatedResultRunner();
+    let faultArmed = false;
+    let uncertaintyObserved = false;
+    const runtime = await startExecutiveRuntime(config, {
+      transport,
+      runner,
+      larkRunnerFactory: () => new FakeLarkRunner(),
+      instanceId: "runtime-commit-then-throw",
+      decorateAcknowledgementStore(store) {
+        return Object.freeze({
+          getNextTaskAcknowledgementCandidate: () =>
+            store.getNextTaskAcknowledgementCandidate(),
+          beginTaskAcknowledgement: (input) =>
+            store.beginTaskAcknowledgement(input),
+          finishTaskAcknowledgement: (input) => {
+            const result = store.finishTaskAcknowledgement(input);
+            if (faultArmed && input.state === "ACKNOWLEDGED") {
+              faultArmed = false;
+              uncertaintyObserved = true;
+              throw new Error("synthetic commit-then-throw uncertainty");
+            }
+            return result;
+          },
+        });
+      },
+    });
+    try {
+      await transport.emitMessage(message(153, "先运行的阻塞任务"));
+      await waitUntil(() => runner.starts.length === 1);
+      faultArmed = true;
+
+      await transport.emitMessage(message(154, "不应在本进程启动的后一任务"));
+      await waitUntil(() => uncertaintyObserved);
+      runner.complete();
+      await settleWithin(
+        runtime.waitForIdle().catch(() => undefined),
+        "barrier-runtime-idle",
+      );
+
+      expect(runner.starts).toHaveLength(1);
+      expect(
+        transport.acknowledgementAttempts.map(
+          (attempt) => attempt.replyToMessageId,
+        ),
+      ).toEqual(["message-153", "message-154"]);
+    } finally {
+      await settleWithin(runtime.close(), "barrier-runtime-close");
+    }
+
+    const restartTransport = new FakeTransport();
+    const restartRunner = new ImmediateRunner();
+    const restarted = await settleWithin(
+      startExecutiveRuntime(config, {
+        transport: restartTransport,
+        runner: restartRunner,
+        larkRunnerFactory: () => new FakeLarkRunner(),
+        instanceId: "runtime-after-commit-then-throw",
+      }),
+      "barrier-runtime-restart",
+    );
+    try {
+      await settleWithin(restarted.waitForIdle(), "barrier-restart-idle");
+      expect(restartRunner.starts).toHaveLength(1);
+      expect(restartRunner.starts[0]?.prompt).toContain(
+        "不应在本进程启动的后一任务",
+      );
+      expect(restartTransport.acknowledgementAttempts).toHaveLength(0);
+    } finally {
+      await settleWithin(restarted.close(), "barrier-restart-close");
     }
   });
 });

@@ -6,7 +6,7 @@ import type {
   TrustedCardEvidence,
 } from "@executive-assistant/bridge";
 import type { MvpLarkCliRunner } from "@executive-assistant/action-gateway";
-import type { TaskRecord } from "@executive-assistant/job-store";
+import type { JobStore, TaskRecord } from "@executive-assistant/job-store";
 
 export type RuntimePairingConfig = Readonly<{
   enabled: boolean;
@@ -160,6 +160,13 @@ export type MvpLarkCliRunnerFactory = (
   taskDirectory: string,
 ) => MvpLarkCliRunner;
 
+export type RuntimeAcknowledgementStore = Pick<
+  JobStore,
+  | "getNextTaskAcknowledgementCandidate"
+  | "beginTaskAcknowledgement"
+  | "finishTaskAcknowledgement"
+>;
+
 export interface ExecutiveRuntime {
   readonly instanceId: string;
   waitForIdle(): Promise<void>;
@@ -177,6 +184,9 @@ export type RuntimeDependencies = Readonly<{
     milliseconds: number,
     signal: AbortSignal,
   ) => Promise<void>;
+  decorateAcknowledgementStore?: (
+    store: RuntimeAcknowledgementStore,
+  ) => RuntimeAcknowledgementStore;
 }>;
 
 export interface BotSecretProvider {

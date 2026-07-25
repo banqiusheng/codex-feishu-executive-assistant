@@ -35,6 +35,14 @@ export type BuiltInLarkTransportOptions = Readonly<{
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const IDENTIFIER_MAX_LENGTH = 512;
 const MAX_BUFFERED_MESSAGES = 32;
+const ignoreLarkSdkLog = (): void => undefined;
+const SILENT_LARK_SDK_LOGGER = Object.freeze({
+  error: ignoreLarkSdkLog,
+  warn: ignoreLarkSdkLog,
+  info: ignoreLarkSdkLog,
+  debug: ignoreLarkSdkLog,
+  trace: ignoreLarkSdkLog,
+});
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -296,6 +304,7 @@ export function createBuiltInLarkTransport(
     transport: "websocket",
     includeRawEvent: true,
     source: "executive-assistant-runtime",
+    logger: SILENT_LARK_SDK_LOGGER,
     policy: {
       dmMode: "open",
       requireMention: true,

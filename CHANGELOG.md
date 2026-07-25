@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- 修复 ACK 协调器首轮复审发现的三处运行时安全缺口：内置 Lark channel 现在固定使用忽略全部参数的静默 SDK logger，避免默认 logger 输出请求主机、路径或消息标识；任何 ACK 数据库 finalization 返回空值或抛错都会在同一事件循环触发进程级执行屏障，worker 在每次 claim 和 runner 启动前复核屏障，commit 后抛错也不会让同进程的后一任务启动；worker drain 结束后会安全唤醒 ACK coordinator，使“重启头任务已由 marker 对账、后一任务尚未 ACK”的队列无需新入站消息也能继续推进。回归覆盖真实 SQLite 先提交后抛错、同进程禁止执行、重启按证据恢复，以及双任务重启队列进度。
 - 修复 ACK 数据库门禁落地后 runtime 仍只写文件 marker、未推进数据库 ACK，导致所有新任务收到接单回复却永远无法 claim 的回归；生产顺序现为 runtime 以当前 taskId 要求 store 在同一事务核对 FIFO 头并持久 `SENDING`、发送成功、耐久 marker、数据库 `ACKNOWLEDGED`、最后 wake，taskId 不匹配时零写入且不发送。全局单 `SENDING` 约束通过 append-only 迁移 004 修正，不改写已记录 checksum 的迁移 003；启动时通过受限 marker 文件校验逐项对账，冲突状态进入人工确认，未知发送/marker 结果不伪造成功且不启动 Codex。
 - 修复 LaunchAgent 接到真实消息后，runtime 直接执行 `#!/usr/bin/env node` 的 Codex 脚本、却把子进程 `PATH` 固定为不含安装 Node 的系统目录，导致 Codex 在产生首个 JSONL 事件前以 127 退出：运行配置现在保留并验证安装时记录的 Node 绝对路径，由该 Node 直接启动固定 Codex 脚本，同时继续使用不含秘密和私有飞书 CLI 的精简环境；doctor 的 Codex 登录与插件检查也复用同一启动方式，并新增真实 shebang 进程回归。重复安装会原子刷新已漂移的非秘密 Node/Codex 路径；本版本只接受经安装器验证的 `#!/usr/bin/env node` Codex 入口，原生或未知入口明确停止。
 - 修复重复安装时旧 LaunchAgent 仍处于 launchd `removing` 过渡窗口，紧接执行 `bootstrap` 会返回 `Input/output error`：安装器现在等待同一服务确认卸载，再只对该次卸载后的精确过渡期 EIO 做有限重试；新安装或其他错误仍然 fail closed，并在启动前后核验服务状态。

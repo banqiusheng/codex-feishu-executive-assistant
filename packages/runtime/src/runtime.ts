@@ -663,6 +663,7 @@ export async function startExecutiveRuntime(
     let drainPromise: Promise<void> | undefined;
     let lastError: unknown;
     let closing = false;
+    let executionBarrierTripped = false;
 
     const renewLease = (): void => {
       if (
@@ -844,6 +845,7 @@ export async function startExecutiveRuntime(
         await markFailed(task);
         return;
       }
+      if (executionBarrierTripped) return;
       if (store.getTask(task.id)?.state === "CANCELLED") return;
       const priorSessionId = sessionStore.get(input.chatId);
       const runInput = priorSessionId
@@ -962,6 +964,10 @@ export async function startExecutiveRuntime(
       }
 
       let handle: CodexRunHandle;
+      if (executionBarrierTripped) {
+        await gateway?.close().catch(() => undefined);
+        return;
+      }
       try {
         handle = await dependencies.runner.start(runInput);
       } catch (cause) {
@@ -1110,10 +1116,12 @@ export async function startExecutiveRuntime(
 
     const drain = async (): Promise<void> => {
       if (!store) return;
-      while (!closing) {
+      while (!closing && !executionBarrierTripped) {
         renewLease();
+        if (executionBarrierTripped) return;
         const task = store.claimNextTask(instanceId, now(), LEASE_TTL_MS);
         if (task === null) return;
+        if (executionBarrierTripped) return;
         try {
           await processTask(task);
         } catch (cause) {
@@ -1131,6 +1139,9 @@ export async function startExecutiveRuntime(
         })
         .finally(() => {
           drainPromise = undefined;
+          if (!closing && !executionBarrierTripped && lastError === undefined) {
+            acknowledgementCoordinator?.wake();
+          }
         });
     };
 
@@ -1154,7 +1165,8 @@ export async function startExecutiveRuntime(
     };
 
     acknowledgementCoordinator = createAckCoordinator({
-      store: activeStore,
+      store:
+        dependencies.decorateAcknowledgementStore?.(activeStore) ?? activeStore,
       owner: instanceId,
       now,
       delay: dependencies.acknowledgementDelay ?? sleepForAcknowledgement,
@@ -1178,6 +1190,10 @@ export async function startExecutiveRuntime(
         );
       },
       wakeWorker,
+      tripExecutionBarrier() {
+        executionBarrierTripped = true;
+        lastError ??= new Error("ACKNOWLEDGEMENT_FINALIZATION_UNCERTAIN");
+      },
     });
 
     const runtimePorts: AssistantChannelDependencies = Object.freeze({
@@ -1567,11 +1583,12 @@ export async function startExecutiveRuntime(
     return Object.freeze({
       instanceId,
       async waitForIdle(): Promise<void> {
-        await acknowledgementCoordinator?.waitForIdle();
-        while (drainPromise) {
+        while (true) {
+          await acknowledgementCoordinator?.waitForIdle();
           const current = drainPromise;
-          await current;
-          if (drainPromise === current) break;
+          if (current) await current;
+          await acknowledgementCoordinator?.waitForIdle();
+          if (drainPromise === undefined) break;
         }
         if (lastError) throw lastError;
       },
