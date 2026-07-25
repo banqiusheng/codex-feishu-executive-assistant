@@ -136,7 +136,7 @@ describe("lean delivery surface", () => {
     }
   });
 
-  it("does not invoke an opener for plan, verify-only, or test-mode doctor", () => {
+  it("does not invoke an opener for plan, verify-only, or the normal test-mode doctor path", () => {
     const root = temporaryHome();
     const fakeBin = join(root, "bin");
     const logPath = join(root, "open.log");
@@ -150,7 +150,6 @@ describe("lean delivery surface", () => {
     for (const [script, args] of [
       [installPath, ["--plan"]],
       [installPath, ["--verify-only"]],
-      [doctorPath, ["--help"]],
     ] as const) {
       const result = runZsh(script, args, {
         HOME: root,
@@ -160,6 +159,68 @@ describe("lean delivery surface", () => {
       });
       expect(result.status).toBe(0);
     }
+    const fakeNode = join(root, "configured-node.mjs");
+    const configPath = join(root, "assistant.json");
+    writeFileSync(
+      fakeNode,
+      `#!${process.execPath}\nif (process.argv[2] === "--version") process.stdout.write("v20.0.0\\n");\n`,
+      { mode: 0o500 },
+    );
+    chmodSync(fakeNode, 0o500);
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        appId: "cli_TEST123456",
+        presidentOpenId: null,
+        presidentChatId: null,
+        pairing: {
+          enabled: true,
+          codeHash: `sha256:${"a".repeat(64)}`,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+        secretRef: {
+          type: "macos-keychain",
+          service: "com.codex-feishu-executive-assistant.bot",
+          account: "cli_TEST123456",
+        },
+        paths: {
+          runtimeRoot: root,
+          larkHome: join(root, "lark"),
+          databasePath: join(root, "missing.sqlite"),
+          codexHome: join(root, "codex"),
+        },
+        executables: {
+          node: fakeNode,
+          codex: join(root, "missing-codex"),
+          larkCli: join(root, "missing-lark"),
+          runtimeEntry: join(root, "missing-runtime"),
+        },
+        visualFirstPpt: {
+          skillRoot: join(root, "missing-ppt"),
+          presentationsPlugin: {
+            id: "presentations@openai-primary-runtime",
+            version: "test",
+          },
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    chmodSync(configPath, 0o600);
+    const doctorResult = runZsh(
+      doctorPath,
+      ["--json", "--config", configPath],
+      {
+        HOME: root,
+        ASSISTANT_TEST_MODE: "1",
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        OPEN_CALL_LOG: logPath,
+      },
+    );
+    const doctorReport = JSON.parse(doctorResult.stdout) as {
+      checks: Array<{ id: string }>;
+    };
+    expect(doctorReport.checks.some((check) => check.id === "node")).toBe(true);
     expect(existsSync(logPath)).toBe(false);
     expect(readFileSync(installPath, "utf8")).not.toContain("/usr/bin/open");
     expect(readFileSync(doctorPath, "utf8")).not.toContain("/usr/bin/open");

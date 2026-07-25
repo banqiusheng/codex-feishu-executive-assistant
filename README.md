@@ -57,6 +57,7 @@ doctor 还会在不读取 App Secret、Bot/User Token 或调用写接口的前�
 doctor 只给出固定失败分类，不回显子进程内容。
 当前交付回归还验证 helper 缺失或符号链接时 `--verify-only` 会在写入前停止，并验证 `--plan`、
 `--verify-only` 与 doctor 测试模式不会调用浏览器 opener；OAuth 的 apply-only 授权打开流程仍属后续范围。
+该 doctor 回归使用最小合法配置运行正常 JSON 检查路径，而不是帮助参数的早退路径。
 
 也可以直接把下面这句话交给 Codex：
 
