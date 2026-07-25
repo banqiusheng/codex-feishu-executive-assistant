@@ -239,6 +239,130 @@ function ensurePresentations(
   );
 }
 
+function prepareFakeLaunchctl(mode: string) {
+  const root = makeTemporaryRoot("assistant-launchd-reload.");
+  const fakeLaunchctlPath = join(root, "fake-launchctl.mjs");
+  const logPath = join(root, "launchctl.log");
+  const statePath = join(root, "launchctl-state.json");
+  const plistPath = join(root, "assistant.plist");
+  writeFileSync(plistPath, '<?xml version="1.0"?><plist></plist>\n');
+  writeFileSync(
+    fakeLaunchctlPath,
+    `#!/usr/bin/env node
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+const logPath = process.env.FAKE_LAUNCHCTL_LOG;
+const statePath = process.env.FAKE_LAUNCHCTL_STATE;
+const mode = process.env.FAKE_LAUNCHCTL_MODE;
+const state = fs.existsSync(statePath)
+  ? JSON.parse(fs.readFileSync(statePath, "utf8"))
+  : {
+      bootedOut: false,
+      bootstrapAttempts: 0,
+      loaded: mode !== "fresh-eio",
+      removalPolls: 0,
+      removing: false,
+    };
+fs.appendFileSync(logPath, \`\${args.join(" ")}\\n\`);
+
+if (args[0] === "print") {
+  if (
+    mode === "initial-state-unknown" &&
+    !state.bootedOut &&
+    state.bootstrapAttempts === 0
+  ) {
+    process.exit(5);
+  }
+  if (state.loaded) process.exit(0);
+  if (!state.removing) process.exit(113);
+  if (mode === "removal-state-unknown") process.exit(5);
+  state.removalPolls += 1;
+  if (mode !== "removal-timeout" && state.removalPolls > 2) {
+    state.removing = false;
+  }
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  if (state.removing) process.exit(0);
+  process.exit(113);
+}
+
+if (args[0] === "bootout") {
+  state.bootedOut = true;
+  state.loaded = false;
+  state.removing = true;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  if (mode === "bootout-nonzero-transition") process.exit(5);
+  process.exit(0);
+}
+
+if (args[0] === "bootstrap") {
+  state.bootstrapAttempts += 1;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  if (
+    (mode === "transition-eio" && state.bootstrapAttempts === 1) ||
+    mode === "eio-exhausted"
+  ) {
+    process.stderr.write("localized launchd status 5\\n");
+    process.exit(5);
+  }
+  if (mode === "fresh-eio") {
+    process.stderr.write("Bootstrap failed: 5: Input/output error\\n");
+    process.exit(5);
+  }
+  if (mode === "non-eio-bootstrap") {
+    process.stderr.write("different bootstrap failure\\n");
+    process.exit(64);
+  }
+  if (mode === "bootstrap-ambiguous") {
+    state.loaded = true;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    process.exit(5);
+  }
+  if (mode === "post-bootstrap-missing") process.exit(0);
+  state.loaded = true;
+  state.removing = false;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  process.exit(0);
+}
+
+if (args[0] === "kickstart") {
+  process.exit(mode === "kickstart-failure" ? 69 : 0);
+}
+process.exit(64);
+`,
+    { mode: 0o700 },
+  );
+  chmodSync(fakeLaunchctlPath, 0o700);
+  return {
+    env: {
+      ...process.env,
+      ASSISTANT_TEST_MODE: "1",
+      FAKE_LAUNCHCTL_LOG: logPath,
+      FAKE_LAUNCHCTL_MODE: mode,
+      FAKE_LAUNCHCTL_STATE: statePath,
+    },
+    fakeLaunchctlPath,
+    logPath,
+    plistPath,
+    statePath,
+  };
+}
+
+function reloadLaunchd(fixture: ReturnType<typeof prepareFakeLaunchctl>) {
+  return spawnSync(
+    process.execPath,
+    [
+      installSupportPath,
+      "reload-launchd",
+      fixture.fakeLaunchctlPath,
+      "gui/501",
+      "com.codex-feishu.executive-assistant",
+      fixture.plistPath,
+    ],
+    { encoding: "utf8", env: fixture.env },
+  );
+}
+
 describe("installer compatibility support", () => {
   it("derives the expected version from the unique official marketplace source", () => {
     const root = makeTemporaryRoot("assistant-presentations-contract.");
@@ -467,5 +591,138 @@ describe("installer compatibility support", () => {
       `<string>${repositoryPath.replace("&", "&amp;")}</string>`,
     );
     expect(rendered).not.toMatch(/__[A-Z0-9_]+__/);
+  });
+
+  it("waits for a removed LaunchAgent and retries only its transition EIO", () => {
+    const fixture = prepareFakeLaunchctl("transition-eio");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      action: "reloaded",
+      bootedOut: true,
+      bootstrapAttempts: 2,
+    });
+    expect(readFileSync(fixture.logPath, "utf8").trim().split("\n")).toEqual([
+      "print gui/501/com.codex-feishu.executive-assistant",
+      "bootout gui/501/com.codex-feishu.executive-assistant",
+      "print gui/501/com.codex-feishu.executive-assistant",
+      "print gui/501/com.codex-feishu.executive-assistant",
+      "print gui/501/com.codex-feishu.executive-assistant",
+      `bootstrap gui/501 ${fixture.plistPath}`,
+      "print gui/501/com.codex-feishu.executive-assistant",
+      `bootstrap gui/501 ${fixture.plistPath}`,
+      "print gui/501/com.codex-feishu.executive-assistant",
+      "kickstart -k gui/501/com.codex-feishu.executive-assistant",
+    ]);
+  });
+
+  it("does not retry a bootstrap EIO when no prior service was removed", () => {
+    const fixture = prepareFakeLaunchctl("fresh-eio");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_bootstrap_failed");
+    expect(readFileSync(fixture.logPath, "utf8").trim().split("\n")).toEqual([
+      "print gui/501/com.codex-feishu.executive-assistant",
+      `bootstrap gui/501 ${fixture.plistPath}`,
+      "print gui/501/com.codex-feishu.executive-assistant",
+    ]);
+  });
+
+  it("fails closed before bootstrap if launchd never finishes removal", () => {
+    const fixture = prepareFakeLaunchctl("removal-timeout");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_bootout_timeout");
+    expect(readFileSync(fixture.logPath, "utf8")).not.toContain("bootstrap");
+  });
+
+  it("rejects an unknown initial launchd state instead of treating it as absent", () => {
+    const fixture = prepareFakeLaunchctl("initial-state-unknown");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_initial_state_unavailable");
+    expect(readFileSync(fixture.logPath, "utf8").trim()).toBe(
+      "print gui/501/com.codex-feishu.executive-assistant",
+    );
+  });
+
+  it("rejects an unknown removal poll state before bootstrap", () => {
+    const fixture = prepareFakeLaunchctl("removal-state-unknown");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_removal_state_unavailable");
+    expect(readFileSync(fixture.logPath, "utf8")).not.toContain("bootstrap");
+  });
+
+  it("accepts a nonzero bootout only after print confirms status 113", () => {
+    const fixture = prepareFakeLaunchctl("bootout-nonzero-transition");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      action: "reloaded",
+      bootedOut: true,
+    });
+  });
+
+  it("does not retry a non-EIO bootstrap failure after removal", () => {
+    const fixture = prepareFakeLaunchctl("non-eio-bootstrap");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_bootstrap_failed");
+    expect(
+      readFileSync(fixture.logPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.startsWith("bootstrap ")),
+    ).toHaveLength(1);
+  });
+
+  it("limits a removal-transition EIO to three bootstrap attempts", () => {
+    const fixture = prepareFakeLaunchctl("eio-exhausted");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_bootstrap_failed");
+    expect(
+      readFileSync(fixture.logPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.startsWith("bootstrap ")),
+    ).toHaveLength(3);
+  });
+
+  it("fails closed if a failed bootstrap nevertheless leaves a loaded service", () => {
+    const fixture = prepareFakeLaunchctl("bootstrap-ambiguous");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_bootstrap_ambiguous");
+  });
+
+  it("verifies the service is loaded after a successful bootstrap", () => {
+    const fixture = prepareFakeLaunchctl("post-bootstrap-missing");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "launchd_post_bootstrap_verification_failed",
+    );
+  });
+
+  it("propagates a kickstart failure without claiming success", () => {
+    const fixture = prepareFakeLaunchctl("kickstart-failure");
+    const result = reloadLaunchd(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd_kickstart_failed");
   });
 });

@@ -43,6 +43,8 @@ App Secret 仍只在 macOS Keychain 的安全提示中输入。
 如果专用 `CODEX_HOME` 已有来自同一官方 marketplace 的旧版 Presentations，
 安装器会先把旧 cache 保存到权限 `0700` 的私有隔离区，再执行官方升级并精确复核；
 来源不明、版本倒退或缓存身份异常时仍会停止，不会覆盖。
+重复安装时，安装器会等待旧 LaunchAgent 完成卸载，再注册新服务；仅在确认刚刚卸载过
+同一服务且 launchd 返回过渡期 I/O 错误时进行有限重试，其他失败仍会立即停止。
 
 也可以直接把下面这句话交给 Codex：
 

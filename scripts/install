@@ -1158,11 +1158,14 @@ typeset minimal_path="${node_executable:h}:${codex_executable:h}:/opt/homebrew/b
 /usr/bin/plutil -lint "${plist_path}" >/dev/null || die "渲染后的 LaunchAgent plist 无效。"
 
 readonly launch_domain="gui/$(/usr/bin/id -u)"
-if /bin/launchctl print "${launch_domain}/${LAUNCHD_LABEL}" >/dev/null 2>&1; then
-  /bin/launchctl bootout "${launch_domain}/${LAUNCHD_LABEL}" >/dev/null
-fi
-/bin/launchctl bootstrap "${launch_domain}" "${plist_path}"
-/bin/launchctl kickstart -k "${launch_domain}/${LAUNCHD_LABEL}"
+typeset launchd_reload_result
+launchd_reload_result="$(
+  "${node_executable}" "${INSTALL_SUPPORT}" reload-launchd \
+    "/bin/launchctl" \
+    "${launch_domain}" \
+    "${LAUNCHD_LABEL}" \
+    "${plist_path}"
+)" || die "LaunchAgent 卸载或重新注册失败；请运行只读 doctor 获取状态。"
 note "单一 LaunchAgent 已注册并请求启动。"
 
 print -r -- ""

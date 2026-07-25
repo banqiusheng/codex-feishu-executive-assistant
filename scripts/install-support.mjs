@@ -22,6 +22,7 @@ import { spawnSync } from "node:child_process";
 
 const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime";
 const MARKETPLACE_NAME = "openai-primary-runtime";
+const LAUNCHD_LABEL = "com.codex-feishu.executive-assistant";
 const VERSION_PATTERN = /^[0-9]+(?:\.[0-9]+)+$/;
 
 function fail(code) {
@@ -590,6 +591,127 @@ function renderLaunchd([
   }
 }
 
+function runLaunchctl(launchctlExecutable, args) {
+  const result = spawnSync(launchctlExecutable, args, {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) fail("launchctl_unavailable");
+  return result;
+}
+
+function sleepSync(milliseconds) {
+  if (milliseconds <= 0) return;
+  Atomics.wait(
+    new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)),
+    0,
+    0,
+    milliseconds,
+  );
+}
+
+function isRemovalTransitionEio(result) {
+  return result.status === 5;
+}
+
+function classifyLaunchdPrint(result, unavailableCode) {
+  if (result.status === 0) return "loaded";
+  if (result.status === 113) return "absent";
+  fail(unavailableCode);
+}
+
+function reloadLaunchd([
+  launchctlExecutable,
+  launchDomain,
+  launchdLabel,
+  plistPath,
+]) {
+  assertAbsolutePath(launchctlExecutable, "invalid_launchctl_executable");
+  assertRegularFile(launchctlExecutable, "launchctl_unavailable");
+  assertRegularFile(plistPath, "launchd_plist_unavailable");
+  if (!/^gui\/(?:0|[1-9][0-9]*)$/.test(launchDomain)) {
+    fail("invalid_launchd_domain");
+  }
+  if (launchdLabel !== LAUNCHD_LABEL) fail("invalid_launchd_label");
+
+  const serviceTarget = `${launchDomain}/${launchdLabel}`;
+  const testMode = process.env.ASSISTANT_TEST_MODE === "1";
+  const pollDelayMilliseconds = testMode ? 0 : 250;
+  const removalPollLimit = testMode ? 6 : 40;
+  const bootstrapAttemptLimit = 3;
+  let bootedOut = false;
+
+  const initialState = classifyLaunchdPrint(
+    runLaunchctl(launchctlExecutable, ["print", serviceTarget]),
+    "launchd_initial_state_unavailable",
+  );
+  if (initialState === "loaded") {
+    runLaunchctl(launchctlExecutable, ["bootout", serviceTarget]);
+    bootedOut = true;
+
+    let removed = false;
+    for (let poll = 0; poll < removalPollLimit; poll += 1) {
+      const currentState = classifyLaunchdPrint(
+        runLaunchctl(launchctlExecutable, ["print", serviceTarget]),
+        "launchd_removal_state_unavailable",
+      );
+      if (currentState === "absent") {
+        removed = true;
+        break;
+      }
+      if (poll + 1 < removalPollLimit) sleepSync(pollDelayMilliseconds);
+    }
+    if (!removed) fail("launchd_bootout_timeout");
+  }
+
+  let bootstrapAttempts = 0;
+  for (;;) {
+    bootstrapAttempts += 1;
+    const bootstrap = runLaunchctl(launchctlExecutable, [
+      "bootstrap",
+      launchDomain,
+      plistPath,
+    ]);
+    if (bootstrap.status === 0) break;
+
+    const stateAfterFailure = classifyLaunchdPrint(
+      runLaunchctl(launchctlExecutable, ["print", serviceTarget]),
+      "launchd_post_failure_state_unavailable",
+    );
+    if (stateAfterFailure === "loaded") {
+      fail("launchd_bootstrap_ambiguous");
+    }
+    if (
+      !bootedOut ||
+      bootstrapAttempts >= bootstrapAttemptLimit ||
+      !isRemovalTransitionEio(bootstrap)
+    ) {
+      fail("launchd_bootstrap_failed");
+    }
+    sleepSync(pollDelayMilliseconds);
+  }
+
+  const loadedState = classifyLaunchdPrint(
+    runLaunchctl(launchctlExecutable, ["print", serviceTarget]),
+    "launchd_post_bootstrap_state_unavailable",
+  );
+  if (loadedState !== "loaded") {
+    fail("launchd_post_bootstrap_verification_failed");
+  }
+  const kickstart = runLaunchctl(launchctlExecutable, [
+    "kickstart",
+    "-k",
+    serviceTarget,
+  ]);
+  if (kickstart.status !== 0) fail("launchd_kickstart_failed");
+
+  return {
+    action: bootedOut ? "reloaded" : "loaded",
+    bootedOut,
+    bootstrapAttempts,
+  };
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   switch (command) {
@@ -623,6 +745,11 @@ async function main() {
     case "render-launchd": {
       assertArgumentCount(args, 11);
       renderLaunchd(args);
+      return;
+    }
+    case "reload-launchd": {
+      assertArgumentCount(args, 4);
+      process.stdout.write(`${JSON.stringify(reloadLaunchd(args))}\n`);
       return;
     }
     default:
