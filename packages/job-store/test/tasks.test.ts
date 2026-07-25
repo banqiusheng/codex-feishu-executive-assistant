@@ -429,6 +429,18 @@ function claimAndRun(store: JobStore, taskId: string): void {
   expect(
     store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
   ).toBe(true);
+  expect(
+    store.beginNextTaskAcknowledgement({ owner: "instance-a", now: at(10) }),
+  ).toMatchObject({ taskId, state: "SENDING" });
+  expect(
+    store.finishTaskAcknowledgement({
+      taskId,
+      owner: "instance-a",
+      now: at(10),
+      state: "ACKNOWLEDGED",
+      failureClass: null,
+    }),
+  ).toMatchObject({ state: "ACKNOWLEDGED" });
   expect(store.claimNextTask("instance-a", at(11), 1_000)?.id).toBe(taskId);
   expect(
     store.markRunning({
@@ -441,6 +453,21 @@ function claimAndRun(store: JobStore, taskId: string): void {
   ).toBe("RUNNING");
 }
 
+function acknowledgeNext(store: JobStore, now: Date): void {
+  const acknowledgement = store.beginNextTaskAcknowledgement({
+    owner: "instance-a",
+    now,
+  });
+  expect(acknowledgement).not.toBeNull();
+  store.finishTaskAcknowledgement({
+    taskId: acknowledgement!.taskId,
+    owner: "instance-a",
+    now,
+    state: "ACKNOWLEDGED",
+    failureClass: null,
+  });
+}
+
 describe("task lifecycle", () => {
   it.each(["mark", "touch", "finish"] as const)(
     "fences stale owner %s after bridge takeover without mutating the task",
@@ -450,6 +477,7 @@ describe("task lifecycle", () => {
       expect(
         first.acquireRuntimeLease("bridge", "instance-a", at(10), 100),
       ).toBe(true);
+      acknowledgeNext(first, at(10));
       expect(first.claimNextTask("instance-a", at(11), 1_000)?.state).toBe(
         "CLAIMED",
       );
@@ -504,11 +532,12 @@ describe("task lifecycle", () => {
   );
 
   it("blocks touch when the owner's bridge lease expired without takeover", async () => {
-    const { runtimeDir, store } = await storeFixture();
+    const { filename, runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
     expect(store.acquireRuntimeLease("bridge", "instance-a", at(10), 100)).toBe(
       true,
     );
+    acknowledgeNext(store, at(10));
     expect(store.claimNextTask("instance-a", at(11), 1_000)?.state).toBe(
       "CLAIMED",
     );
@@ -706,6 +735,7 @@ describe("task lifecycle", () => {
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
     ).toBe(true);
+    acknowledgeNext(store, at(10));
     expect(store.claimNextTask("instance-a", at(11), 100)).not.toBeNull();
     expect(
       store.markRunning({
@@ -822,7 +852,7 @@ describe("recovery and replacement", () => {
     ).toEqual([{ reasonCode: "task_lease_expired_invalidated" }]);
   });
 
-  it.each(["RECEIVED", "CLAIMED", "RUNNING"] as const)(
+  it.each(["CLAIMED", "RUNNING"] as const)(
     "interrupts %s on startup in one frozen summary",
     async (state) => {
       const { filename, runtimeDir, store } = await storeFixture();
@@ -830,9 +860,8 @@ describe("recovery and replacement", () => {
       expect(
         store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
       ).toBe(true);
-      if (state !== "RECEIVED") {
-        expect(store.claimNextTask("instance-a", at(11), 1_000)).not.toBeNull();
-      }
+      acknowledgeNext(store, at(10));
+      expect(store.claimNextTask("instance-a", at(11), 1_000)).not.toBeNull();
       if (state === "RUNNING") {
         expect(
           store.markRunning({
@@ -1099,12 +1128,17 @@ describe("recovery and replacement", () => {
   });
 
   it("creates one identity-bound replacement and returns its immutable replay", async () => {
-    const { runtimeDir, store } = await storeFixture();
+    const { filename, runtimeDir, store } = await storeFixture();
     const { taskId } = store.ingestEvent(event(), workspace(runtimeDir));
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
     ).toBe(true);
-    store.recoverOnStartup(at(20));
+    mutate(
+      filename,
+      `UPDATE tasks SET state = 'INTERRUPTED_REQUIRES_CONFIRMATION',
+       recovery_disposition = 'REQUIRES_CONFIRMATION' WHERE id = ?`,
+      taskId,
+    );
     const replacementPath = workspace(runtimeDir);
 
     const created = store.createReplacementTask(
@@ -1143,7 +1177,12 @@ describe("recovery and replacement", () => {
     expect(
       store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
     ).toBe(true);
-    store.recoverOnStartup(at(20));
+    mutate(
+      filename,
+      `UPDATE tasks SET state = 'INTERRUPTED_REQUIRES_CONFIRMATION',
+       recovery_disposition = 'REQUIRES_CONFIRMATION' WHERE id = ?`,
+      taskId,
+    );
     mutate(
       filename,
       "UPDATE tasks SET recovery_disposition = 'RESUME_APPROVED' WHERE id = ?",
@@ -1162,7 +1201,12 @@ describe("recovery and replacement", () => {
       expect(
         store.acquireRuntimeLease("bridge", "instance-a", at(10), 10_000),
       ).toBe(true);
-      store.recoverOnStartup(at(20));
+      mutate(
+        filename,
+        `UPDATE tasks SET state = 'INTERRUPTED_REQUIRES_CONFIRMATION',
+         recovery_disposition = 'REQUIRES_CONFIRMATION' WHERE id = ?`,
+        taskId,
+      );
       const replacementPath = workspace(runtimeDir);
       const replacement = store.createReplacementTask(
         taskId,

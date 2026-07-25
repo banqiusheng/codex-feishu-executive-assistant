@@ -360,19 +360,15 @@ export function claimNextTask(
           .all() as TaskRow[];
         for (const row of activeRows) taskRecord(row);
         if (activeRows.length > 0) return null;
-        const received = (
-          database
-            .prepare(`${TASK_SELECT} WHERE state = 'RECEIVED'`)
-            .all() as TaskRow[]
-        )
-          .map(taskRecord)
-          .sort((left, right) => {
-            const byTime =
-              Date.parse(left.createdAt) - Date.parse(right.createdAt);
-            return byTime === 0 ? left.id.localeCompare(right.id) : byTime;
-          });
-        const next = received[0];
+        const row = database
+          .prepare(`${TASK_SELECT} WHERE state = 'RECEIVED' ORDER BY created_at, id LIMIT 1`)
+          .get() as TaskRow | undefined;
+        const next = row === undefined ? undefined : taskRecord(row);
         if (next === undefined) return null;
+        const acknowledgement = database
+          .prepare("SELECT state FROM task_acknowledgements WHERE task_id = ?")
+          .get(next.id) as { state: unknown } | undefined;
+        if (acknowledgement?.state !== "ACKNOWLEDGED") return null;
         const changed = database
           .prepare(
             `UPDATE tasks
@@ -690,7 +686,7 @@ export function recoverOnStartup(
         const active = (
           database
             .prepare(
-              `${TASK_SELECT} WHERE state IN ('RECEIVED','CLAIMED','RUNNING')`,
+              `${TASK_SELECT} WHERE state IN ('CLAIMED','RUNNING')`,
             )
             .all() as TaskRow[]
         ).map(taskRecord);
@@ -810,6 +806,13 @@ export function createReplacementTask(
             confirmedAt.iso,
             confirmedAt.iso,
           );
+        database
+          .prepare(
+            `INSERT INTO task_acknowledgements(
+               task_id, state, attempt_count, last_failure_class, created_at, updated_at
+             ) VALUES (?, 'NOT_ATTEMPTED', 0, NULL, ?, ?)`,
+          )
+          .run(workspace.taskId, confirmedAt.iso, confirmedAt.iso);
         const task = findTask(database, workspace.taskId);
         if (task === null)
           throw new RuntimeStateError("task_persistence_failed");

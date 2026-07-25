@@ -253,6 +253,13 @@ export function ingestEvent(
         event.receivedAt,
         event.receivedAt,
       );
+    database
+      .prepare(
+        `INSERT INTO task_acknowledgements(
+           task_id, state, attempt_count, last_failure_class, created_at, updated_at
+         ) VALUES (?, 'NOT_ATTEMPTED', 0, NULL, ?, ?)`,
+      )
+      .run(workspace.taskId, event.receivedAt, event.receivedAt);
     return exactResult(workspace.taskId, false);
   });
 

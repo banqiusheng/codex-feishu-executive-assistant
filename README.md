@@ -70,7 +70,7 @@ App Secret 仍只在 macOS Keychain 的安全提示中输入。
 
 本仓库提供格式、静态检查、类型检查、构建、全量测试、供应链离线回放、安装合同和密钥扫描门禁。公开仓库的 `main` 分支 push 与 Pull Request 会在 macOS GitHub Actions 中重新运行这些检查。
 
-ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认，当前进入测试驱动实现；公开版本的运行时或安装行为尚未改变。
+ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认。持久数据库 ACK 门禁已实现；runtime retry、doctor、OAuth 和真实 E2E 仍待完成，公开版本的运行时或安装行为尚未改变。
 
 真实飞书收发、妙记、日程、通知、PPT 文件回传、Keychain 静默读取、用户授权续期和 LaunchAgent 异常拉起，仍必须在客户 Mac mini 与目标飞书租户中逐项验收。连续 24 小时实机测试通过前，不应把本候选版标记为 `production ready`。
 

@@ -191,6 +191,11 @@ export interface JobStore {
   ): boolean;
   releaseRuntimeLease(name: string, owner: string): boolean;
   claimNextTask(owner: string, now: Date, ttlMs: number): TaskRecord | null;
+  getTaskAcknowledgement(taskId: string): TaskAcknowledgementRecord | null;
+  getNextTaskAcknowledgementCandidate(): TaskAcknowledgementRecord | null;
+  beginNextTaskAcknowledgement(input: BeginNextTaskAcknowledgementInput): TaskAcknowledgementRecord | null;
+  finishTaskAcknowledgement(input: FinishTaskAcknowledgementInput): TaskAcknowledgementRecord | null;
+  reconcileTaskAcknowledgement(input: ReconcileTaskAcknowledgementInput): TaskAcknowledgementRecord | null;
   getTask(taskId: string): TaskRecord | null;
   markRunning(input: MarkRunningInput): TaskRecord | null;
   touchTask(input: TouchTaskInput): TaskRecord | null;
@@ -228,6 +233,13 @@ export type IngestEventResult = Readonly<{
   taskId: string;
   duplicate: boolean;
 }>;
+
+export type TaskAcknowledgementState = "NOT_ATTEMPTED" | "SENDING" | "RETRYABLE_DNS" | "ACKNOWLEDGED" | "AMBIGUOUS" | "FAILED_DEFINITE";
+export type TaskAcknowledgementFailureClass = "DNS_UNAVAILABLE" | "REMOTE_REJECTED" | "RESULT_AMBIGUOUS" | "LOCAL_EVIDENCE_FAILED";
+export type TaskAcknowledgementRecord = Readonly<{ taskId: string; state: TaskAcknowledgementState; attemptCount: number; lastFailureClass: TaskAcknowledgementFailureClass | null; createdAt: string; updatedAt: string }>;
+export type BeginNextTaskAcknowledgementInput = Readonly<{ owner: string; now: Date }>;
+export type FinishTaskAcknowledgementInput = Readonly<{ taskId: string; owner: string; now: Date; state: TaskAcknowledgementState; failureClass: TaskAcknowledgementFailureClass | null }>;
+export type ReconcileTaskAcknowledgementInput = Readonly<{ taskId: string; owner: string; now: Date; markerPresent: boolean }>;
 
 export type TaskRecord = Readonly<{
   id: string;
@@ -302,6 +314,11 @@ export type JobStoreOperations = Readonly<{
   ): boolean;
   releaseRuntimeLease(name: string, owner: string): boolean;
   claimNextTask(owner: string, now: Date, ttlMs: number): TaskRecord | null;
+  getTaskAcknowledgement(taskId: string): TaskAcknowledgementRecord | null;
+  getNextTaskAcknowledgementCandidate(): TaskAcknowledgementRecord | null;
+  beginNextTaskAcknowledgement(input: BeginNextTaskAcknowledgementInput): TaskAcknowledgementRecord | null;
+  finishTaskAcknowledgement(input: FinishTaskAcknowledgementInput): TaskAcknowledgementRecord | null;
+  reconcileTaskAcknowledgement(input: ReconcileTaskAcknowledgementInput): TaskAcknowledgementRecord | null;
   getTask(taskId: string): TaskRecord | null;
   markRunning(input: MarkRunningInput): TaskRecord | null;
   touchTask(input: TouchTaskInput): TaskRecord | null;
@@ -387,6 +404,12 @@ export class SqliteJobStore implements JobStore {
   claimNextTask(owner: string, now: Date, ttlMs: number): TaskRecord | null {
     return this.#operations.claimNextTask(owner, now, ttlMs);
   }
+
+  getTaskAcknowledgement(taskId: string): TaskAcknowledgementRecord | null { return this.#operations.getTaskAcknowledgement(taskId); }
+  getNextTaskAcknowledgementCandidate(): TaskAcknowledgementRecord | null { return this.#operations.getNextTaskAcknowledgementCandidate(); }
+  beginNextTaskAcknowledgement(input: BeginNextTaskAcknowledgementInput): TaskAcknowledgementRecord | null { return this.#operations.beginNextTaskAcknowledgement(input); }
+  finishTaskAcknowledgement(input: FinishTaskAcknowledgementInput): TaskAcknowledgementRecord | null { return this.#operations.finishTaskAcknowledgement(input); }
+  reconcileTaskAcknowledgement(input: ReconcileTaskAcknowledgementInput): TaskAcknowledgementRecord | null { return this.#operations.reconcileTaskAcknowledgement(input); }
 
   getTask(taskId: string): TaskRecord | null {
     return this.#operations.getTask(taskId);
