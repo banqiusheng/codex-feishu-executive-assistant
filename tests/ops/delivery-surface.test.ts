@@ -14,6 +14,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const repositoryRoot = resolve(import.meta.dirname, "../..");
 const installPath = join(repositoryRoot, "scripts/install");
+const installSupportPath = join(
+  repositoryRoot,
+  "scripts",
+  "install-support.mjs",
+);
 const doctorPath = join(repositoryRoot, "scripts/doctor");
 const restartPath = join(repositoryRoot, "scripts/restart");
 const temporaryRoots: string[] = [];
@@ -340,19 +345,29 @@ describe("lean delivery surface", () => {
 
   it("discovers and installs Presentations through the official Codex marketplace", () => {
     const installer = readFileSync(installPath, "utf8");
+    const installSupport = readFileSync(installSupportPath, "utf8");
     const doctor = readFileSync(doctorPath, "utf8");
 
-    expect(installer).toContain(
-      'pluginId === "presentations@openai-primary-runtime"',
+    expect(installSupport).toContain(
+      'const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime"',
     );
+    expect(installer).toContain("plugin marketplace list --json");
     expect(installer).toContain("plugin marketplace add");
-    expect(installer).toContain("presentations@openai-primary-runtime --json");
-    expect(installer).toContain('CODEX_HOME="${codex_home}"');
+    expect(installer).toContain("ensure-presentations");
+    expect(installSupport).toContain('"add",');
+    expect(installSupport).toContain("PRESENTATIONS_PLUGIN_ID");
     expect(installer).not.toMatch(/\/Users\/[^/]+\/\.codex\/plugins\/cache/);
     expect(doctor).toContain(
       'const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime"',
     );
     expect(doctor).toContain("真实 PPT 保持 BLOCKED_CAPABILITY");
+  });
+
+  it("renders launchd without assigning the readonly repository root", () => {
+    const installer = readFileSync(installPath, "utf8");
+
+    expect(installer).toContain('"${INSTALL_SUPPORT}" render-launchd');
+    expect(installer).not.toContain('REPOSITORY_ROOT="${REPOSITORY_ROOT}"');
   });
 
   it("configures and verifies the dedicated Feishu user authorization", () => {

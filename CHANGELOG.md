@@ -6,6 +6,8 @@
 
 ### Fixed
 
+- 修复专用 `CODEX_HOME` 中已经安装同一官方 `openai-primary-runtime` 来源的旧版 Presentations 时，安装器把正常版本漂移误判为来源异常：现在直接从官方 marketplace 清单和插件 manifest 读取当前版本，仅允许数字版本严格向前升级；升级前把旧 cache 完整复制到权限 `0700` 的私有隔离区，官方安装失败或升级后精确复核失败时恢复旧 cache，来源、身份、版本方向或缓存结构不明时仍然拒绝覆盖。
+- 修复 LaunchAgent 渲染阶段把顶层只读 `REPOSITORY_ROOT` 再次作为临时环境变量赋值，导致 zsh 在生成 plist 前中止：渲染器现在通过位置参数接收仓库根，并新增真实 shell 行为回归，确保只读变量保持不变且 XML 正确转义。
 - 修复安装器与只读 doctor 错把 `lark-cli 1.0.72 auth status` 的真实用户身份结构当作旧 `ok` 字段读取：现在同时核验应用层与当前用户的 6 项 MVP 权限、用户身份及令牌有效性；已有有效授权只会通过 `auth check` 计算差额并申请缺失项，不会扩大权限。本次实机重跑预期仅增量申请 `calendar:calendar.event:create` 和 `calendar:calendar.event:update`。
 - 修复安装器把 `visual-first-ppt v0.3.0` 整个仓库放进 Skill 根目录，导致 Codex 找不到根 `SKILL.md`：现在额外锁定并核验 `skills/visual-first-ppt` 子树，只安装该子目录；对安装器早期生成且内容精确匹配的旧布局执行可恢复迁移，旧目录进入权限 `0700` 的私有隔离区，迁移失败会恢复，不直接删除。
 - 移除飞书自建应用安装时手工填写 Tenant Key 的多余门槛；新安装只需要 App ID 和通过 macOS Keychain 输入的 App Secret，企业标识由正确的一次性私聊配对事件自动绑定并持久化，旧的预绑定配置继续兼容；配对码过期或遗失时可重跑安装安全刷新，配对后紧接发送的首条指令也会按序缓冲处理。

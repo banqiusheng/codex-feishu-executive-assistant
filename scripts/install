@@ -12,6 +12,7 @@ readonly CONFIG_TEMPLATE="${REPOSITORY_ROOT}/config/assistant.example.json"
 readonly PLIST_TEMPLATE="${REPOSITORY_ROOT}/launchd/com.codex-feishu.executive-assistant.plist.template"
 readonly EXECUTIVE_SKILL_SOURCE="${REPOSITORY_ROOT}/skills/executive-assistant"
 readonly PPT_LICENSE_NOTICE="${REPOSITORY_ROOT}/LICENSES/visual-first-ppt-MIT.txt"
+readonly INSTALL_SUPPORT="${REPOSITORY_ROOT}/scripts/install-support.mjs"
 readonly LAUNCHD_LABEL="com.codex-feishu.executive-assistant"
 readonly KEYCHAIN_SERVICE="com.codex-feishu-executive-assistant.bot"
 
@@ -102,6 +103,8 @@ done
   die "executive-assistant Skill 缺失。"
 [[ -f "${PPT_LICENSE_NOTICE}" && ! -L "${PPT_LICENSE_NOTICE}" ]] ||
   die "visual-first-ppt 许可证声明缺失或不是可信普通文件。"
+[[ -f "${INSTALL_SUPPORT}" && ! -L "${INSTALL_SUPPORT}" ]] ||
+  die "安装器兼容性支持脚本缺失或不是可信普通文件。"
 
 typeset node_executable="${commands[node]:-}"
 [[ -n "${node_executable}" ]] || die "未找到 Node.js 20 或更高版本。"
@@ -692,39 +695,27 @@ else
   die "visual-first-ppt 已存在但不是当前固定 Skill 或可验证旧布局；安装器不会覆盖。"
 fi
 
-note "从当前 Codex 定位官方 openai-primary-runtime marketplace。"
-typeset current_plugin_json
-current_plugin_json="$(
-  "${codex_executable}" plugin list \
-    --marketplace openai-primary-runtime \
-    --available \
-    --json 2>/dev/null
-)" || die "BLOCKED_CAPABILITY：当前 Codex 无法列出 openai-primary-runtime marketplace。"
+note "从当前 Codex 的官方 marketplace 清单定位 Presentations。"
+typeset current_marketplace_json
+current_marketplace_json="$(
+  "${codex_executable}" plugin marketplace list --json 2>/dev/null
+)" || die "BLOCKED_CAPABILITY：当前 Codex 无法列出官方 marketplace。"
 
 typeset -a presentations_contract
 presentations_contract=("${(@f)$(
-  print -rn -- "${current_plugin_json}" |
+  print -rn -- "${current_marketplace_json}" |
+    "${node_executable}" "${INSTALL_SUPPORT}" presentations-contract |
     "${node_executable}" --input-type=module -e '
-      import path from "node:path";
       let raw = "";
       for await (const chunk of process.stdin) raw += chunk;
       const result = JSON.parse(raw);
-      const entries = [...(result.installed ?? []), ...(result.available ?? [])];
-      const plugin = entries.find(
-        (entry) => entry.pluginId === "presentations@openai-primary-runtime",
-      );
-      const root = plugin?.marketplaceSource?.source;
       if (
-        plugin?.marketplaceName !== "openai-primary-runtime" ||
-        plugin?.marketplaceSource?.sourceType !== "local" ||
-        typeof plugin?.version !== "string" ||
-        plugin.version.length === 0 ||
-        typeof root !== "string" ||
-        !path.isAbsolute(root)
+        typeof result.root !== "string" ||
+        typeof result.version !== "string"
       ) {
         process.exit(2);
       }
-      process.stdout.write(`${root}\n${plugin.version}\n`);
+      process.stdout.write(`${result.root}\n${result.version}\n`);
     '
 )}") || die "BLOCKED_CAPABILITY：当前 Codex 看不到官方 presentations@openai-primary-runtime。"
 (( ${#presentations_contract[@]} == 2 )) ||
@@ -742,49 +733,30 @@ CODEX_HOME="${codex_home}" "${codex_executable}" plugin marketplace add \
   "${presentations_marketplace_root}" >/dev/null ||
   die "BLOCKED_CAPABILITY：无法把官方 primary-runtime marketplace 注册到专用 CODEX_HOME。"
 
-presentations_state() {
-  local plugin_json
-  plugin_json="$(
-    CODEX_HOME="${codex_home}" "${codex_executable}" plugin list \
-      --marketplace openai-primary-runtime \
-      --available \
-      --json 2>/dev/null
-  )" || return 1
-  print -rn -- "${plugin_json}" |
+readonly presentations_quarantine_root="${runtime_root}/quarantine"
+typeset presentations_install_result_json
+presentations_install_result_json="$(
+  "${node_executable}" "${INSTALL_SUPPORT}" ensure-presentations \
+    "${codex_executable}" \
+    "${codex_home}" \
+    "${presentations_marketplace_root}" \
+    "${presentations_plugin_version}" \
+    "${presentations_quarantine_root}"
+)" ||
+  die "BLOCKED_CAPABILITY：专用 CODEX_HOME 中的 Presentations 来源或版本不匹配；安装器不会覆盖。"
+typeset -a presentations_install_result
+presentations_install_result=("${(@f)$(
+  print -rn -- "${presentations_install_result_json}" |
     "${node_executable}" --input-type=module -e '
       let raw = "";
       for await (const chunk of process.stdin) raw += chunk;
-      const [expectedRoot, expectedVersion] = process.argv.slice(1);
       const result = JSON.parse(raw);
-      const entries = [...(result.installed ?? []), ...(result.available ?? [])];
-      const plugin = entries.find(
-        (entry) => entry.pluginId === "presentations@openai-primary-runtime",
-      );
-      if (
-        !plugin ||
-        plugin.marketplaceName !== "openai-primary-runtime" ||
-        plugin.marketplaceSource?.sourceType !== "local" ||
-        plugin.marketplaceSource?.source !== expectedRoot ||
-        plugin.version !== expectedVersion
-      ) {
-        process.exit(2);
-      }
-      process.stdout.write(
-        plugin.installed === true && plugin.enabled === true ? "ready" : "install",
-      );
-    ' "${presentations_marketplace_root}" "${presentations_plugin_version}"
-}
-
-typeset presentations_install_state
-presentations_install_state="$(presentations_state)" ||
-  die "BLOCKED_CAPABILITY：专用 CODEX_HOME 中的 Presentations 来源或版本不匹配；安装器不会覆盖。"
-if [[ "${presentations_install_state}" == "install" ]]; then
-  CODEX_HOME="${codex_home}" "${codex_executable}" plugin add \
-    presentations@openai-primary-runtime --json >/dev/null ||
-    die "BLOCKED_CAPABILITY：官方 Presentations 插件安装失败。"
+      process.stdout.write(`${result.action}\n${result.backupPath ?? ""}\n`);
+    '
+)}") || die "BLOCKED_CAPABILITY：Presentations 安装结果无法验证。"
+if [[ "${presentations_install_result[1]:-}" == "upgraded" ]]; then
+  note "已把旧版官方 Presentations 保存到 0700 可恢复隔离目录后完成升级。"
 fi
-[[ "$(presentations_state)" == "ready" ]] ||
-  die "BLOCKED_CAPABILITY：Presentations 未能在专用 CODEX_HOME 中启用。"
 note "Presentations ${presentations_plugin_version} 已由 Codex 官方 marketplace 安装并启用。"
 
 if [[ -f "${codex_home}/skills/.system/imagegen/SKILL.md" &&
@@ -1169,51 +1141,19 @@ readonly plist_path="${launch_agents_dir}/${LAUNCHD_LABEL}.plist"
 /bin/mkdir -p "${launch_agents_dir}"
 
 typeset minimal_path="${node_executable:h}:${codex_executable:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-PLIST_TEMPLATE_PATH="${PLIST_TEMPLATE}" \
-PLIST_PATH="${plist_path}" \
-NODE_EXECUTABLE="${node_executable}" \
-RUNTIME_ENTRY="${runtime_entry}" \
-CONFIG_PATH="${config_path}" \
-REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-CODEX_HOME_PATH="${codex_home}" \
-HOME_PATH="${HOME}" \
-MINIMAL_PATH="${minimal_path}" \
-STDOUT_PATH="${logs_root}/assistant.stdout.log" \
-STDERR_PATH="${logs_root}/assistant.stderr.log" \
-  "${node_executable}" --input-type=module <<'NODE'
-import fs from "node:fs";
-import path from "node:path";
-
-const escapeXml = (value) =>
-  value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;").replaceAll("'", "&apos;");
-const replacements = {
-  "__NODE_EXECUTABLE__": process.env.NODE_EXECUTABLE,
-  "__RUNTIME_ENTRY__": process.env.RUNTIME_ENTRY,
-  "__CONFIG_PATH__": process.env.CONFIG_PATH,
-  "__REPOSITORY_ROOT__": process.env.REPOSITORY_ROOT,
-  "__CODEX_HOME__": process.env.CODEX_HOME_PATH,
-  "__HOME__": process.env.HOME_PATH,
-  "__MINIMAL_PATH__": process.env.MINIMAL_PATH,
-  "__STDOUT_PATH__": process.env.STDOUT_PATH,
-  "__STDERR_PATH__": process.env.STDERR_PATH,
-};
-let output = fs.readFileSync(process.env.PLIST_TEMPLATE_PATH, "utf8");
-for (const [token, value] of Object.entries(replacements)) {
-  output = output.replaceAll(token, escapeXml(value));
-}
-if (/__[A-Z0-9_]+__/.test(output)) throw new Error("unresolved_plist_placeholder");
-const target = process.env.PLIST_PATH;
-const temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
-const fd = fs.openSync(temp, "wx", 0o600);
-try {
-  fs.writeFileSync(fd, output, "utf8");
-  fs.fsyncSync(fd);
-} finally {
-  fs.closeSync(fd);
-}
-fs.renameSync(temp, target);
-NODE
+"${node_executable}" "${INSTALL_SUPPORT}" render-launchd \
+  "${PLIST_TEMPLATE}" \
+  "${plist_path}" \
+  "${node_executable}" \
+  "${runtime_entry}" \
+  "${config_path}" \
+  "${REPOSITORY_ROOT}" \
+  "${codex_home}" \
+  "${HOME}" \
+  "${minimal_path}" \
+  "${logs_root}/assistant.stdout.log" \
+  "${logs_root}/assistant.stderr.log" ||
+  die "LaunchAgent 配置渲染失败。"
 /bin/chmod 0644 "${plist_path}"
 /usr/bin/plutil -lint "${plist_path}" >/dev/null || die "渲染后的 LaunchAgent plist 无效。"
 
