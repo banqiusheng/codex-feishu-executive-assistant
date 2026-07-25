@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { Buffer } from "node:buffer";
 import {
   chmodSync,
   closeSync,
@@ -11,6 +12,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -23,7 +25,26 @@ import { spawnSync } from "node:child_process";
 const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime";
 const MARKETPLACE_NAME = "openai-primary-runtime";
 const LAUNCHD_LABEL = "com.codex-feishu.executive-assistant";
+const KEYCHAIN_SERVICE = "com.codex-feishu-executive-assistant.bot";
 const VERSION_PATTERN = /^[0-9]+(?:\.[0-9]+)+$/;
+const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const FORBIDDEN_SECRET_KEYS = new Set([
+  "appsecret",
+  "clientsecret",
+  "client_secret",
+  "secretvalue",
+  "secret_value",
+  "app_secret",
+  "secret",
+  "token",
+  "accesstoken",
+  "access_token",
+  "refreshtoken",
+  "refresh_token",
+  "password",
+  "credential",
+  "credentials",
+]);
 
 function fail(code) {
   throw new Error(code);
@@ -55,6 +76,226 @@ function assertRegularFile(pathname, code) {
     fail(code);
   }
   if (!stat.isFile() || stat.isSymbolicLink()) fail(code);
+}
+
+function assertCodexNodeEntrypoint(nodeExecutable, codexExecutable) {
+  assertAbsolutePath(nodeExecutable, "invalid_node_executable");
+  assertAbsolutePath(codexExecutable, "invalid_codex_executable");
+  assertRegularFile(nodeExecutable, "node_executable_unavailable");
+  assertRegularFile(codexExecutable, "codex_executable_unavailable");
+
+  const descriptor = openSync(codexExecutable, "r");
+  const prefix = Buffer.alloc(64);
+  let length;
+  try {
+    length = readSync(descriptor, prefix, 0, prefix.length, 0);
+  } finally {
+    closeSync(descriptor);
+  }
+  const newline = prefix.subarray(0, length).indexOf(0x0a);
+  if (
+    newline === -1 ||
+    prefix.subarray(0, newline).toString("utf8") !== "#!/usr/bin/env node"
+  ) {
+    fail("unsupported_codex_entrypoint");
+  }
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isExactIdentifier(value, nullable = false) {
+  if (nullable && value === null) return true;
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    value === value.trim() &&
+    !value.includes("\0")
+  );
+}
+
+function isAbsoluteConfigPath(value, nullable = false) {
+  if (nullable && value === null) return true;
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    !value.includes("\0") &&
+    path.isAbsolute(value) &&
+    path.resolve(value) === value
+  );
+}
+
+function hasForbiddenSecretField(value) {
+  if (Array.isArray(value)) return value.some(hasForbiddenSecretField);
+  if (!isRecord(value)) return false;
+  for (const [key, entry] of Object.entries(value)) {
+    if (FORBIDDEN_SECRET_KEYS.has(key.toLowerCase())) return true;
+    if (hasForbiddenSecretField(entry)) return true;
+  }
+  return false;
+}
+
+function assertRuntimeConfigContract(
+  config,
+  {
+    expectedAppId,
+    expectedRuntimeRoot,
+    expectedLarkHome,
+    expectedLarkCli,
+    expectedPresentationsVersion,
+  },
+) {
+  if (hasForbiddenSecretField(config)) {
+    fail("runtime_config_contains_secret_field");
+  }
+  const paired =
+    isExactIdentifier(config?.presidentOpenId) &&
+    isExactIdentifier(config?.presidentChatId);
+  const unpaired =
+    config?.presidentOpenId === null && config?.presidentChatId === null;
+  const pairing = config?.pairing;
+  const pairingShapeValid =
+    isRecord(pairing) &&
+    typeof pairing.enabled === "boolean" &&
+    (pairing.codeHash === null ||
+      (typeof pairing.codeHash === "string" &&
+        SHA256_PATTERN.test(pairing.codeHash))) &&
+    (pairing.expiresAt === null ||
+      (typeof pairing.expiresAt === "string" &&
+        Number.isFinite(Date.parse(pairing.expiresAt)))) &&
+    ((pairing.enabled &&
+      pairing.codeHash !== null &&
+      pairing.expiresAt !== null) ||
+      (!pairing.enabled &&
+        pairing.codeHash === null &&
+        pairing.expiresAt === null));
+  if (
+    !isRecord(config) ||
+    config.schemaVersion !== 1 ||
+    config.appId !== expectedAppId ||
+    !isExactIdentifier(config.appId) ||
+    !isExactIdentifier(config.tenantKey ?? null, true) ||
+    (!paired && !unpaired) ||
+    !pairingShapeValid ||
+    (paired && pairing.enabled) ||
+    (unpaired && !pairing.enabled) ||
+    !isRecord(config.secretRef) ||
+    config.secretRef.type !== "macos-keychain" ||
+    config.secretRef.service !== KEYCHAIN_SERVICE ||
+    config.secretRef.account !== expectedAppId ||
+    !isRecord(config.paths) ||
+    config.paths.runtimeRoot !== expectedRuntimeRoot ||
+    !isAbsoluteConfigPath(config.paths.jobsRoot) ||
+    !isAbsoluteConfigPath(config.paths.workspaceRoot) ||
+    !isAbsoluteConfigPath(config.paths.codexHome) ||
+    config.paths.larkHome !== expectedLarkHome ||
+    !isAbsoluteConfigPath(config.paths.databasePath) ||
+    !isRecord(config.executables) ||
+    !isAbsoluteConfigPath(config.executables.node) ||
+    !isAbsoluteConfigPath(config.executables.codex) ||
+    !isAbsoluteConfigPath(config.executables.gatewayClient) ||
+    config.executables.larkCli !== expectedLarkCli ||
+    !isAbsoluteConfigPath(config.executables.runtimeEntry, true) ||
+    config.visualFirstPpt?.presentationsPlugin?.id !==
+      PRESENTATIONS_PLUGIN_ID ||
+    config.visualFirstPpt?.presentationsPlugin?.version !==
+      expectedPresentationsVersion
+  ) {
+    fail("runtime_config_identity_mismatch");
+  }
+}
+
+function assertSafeConfigFile(configPath) {
+  assertAbsolutePath(configPath, "invalid_runtime_config_path");
+  assertRegularFile(configPath, "runtime_config_unavailable");
+  const stat = lstatSync(configPath);
+  if (
+    (stat.mode & 0o777) !== 0o600 ||
+    (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
+    realpathSync(configPath) !== configPath
+  ) {
+    fail("runtime_config_identity_mismatch");
+  }
+}
+
+function writeAtomicJson(targetPath, value) {
+  const temporaryPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${process.pid}.tmp`,
+  );
+  const descriptor = openSync(temporaryPath, "wx", 0o600);
+  try {
+    writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  try {
+    renameSync(temporaryPath, targetPath);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+function refreshRuntimeExecutables([
+  configPath,
+  expectedAppId,
+  expectedRuntimeRoot,
+  expectedLarkHome,
+  expectedLarkCli,
+  expectedPresentationsVersion,
+  nodeExecutable,
+  codexExecutable,
+]) {
+  assertSafeConfigFile(configPath);
+  for (const [value, code] of [
+    [expectedRuntimeRoot, "invalid_expected_runtime_root"],
+    [expectedLarkHome, "invalid_expected_lark_home"],
+    [expectedLarkCli, "invalid_expected_lark_cli"],
+  ]) {
+    assertAbsolutePath(value, code);
+  }
+  assertCodexNodeEntrypoint(nodeExecutable, codexExecutable);
+  const config = parseJson(
+    readFileSync(configPath, "utf8"),
+    "invalid_runtime_config",
+  );
+  assertRuntimeConfigContract(config, {
+    expectedAppId,
+    expectedRuntimeRoot,
+    expectedLarkHome,
+    expectedLarkCli,
+    expectedPresentationsVersion,
+  });
+  if (
+    config.executables.node === nodeExecutable &&
+    config.executables.codex === codexExecutable
+  ) {
+    return { action: "unchanged" };
+  }
+
+  config.executables = {
+    ...config.executables,
+    node: nodeExecutable,
+    codex: codexExecutable,
+  };
+  writeAtomicJson(configPath, config);
+  assertSafeConfigFile(configPath);
+  const verified = parseJson(
+    readFileSync(configPath, "utf8"),
+    "invalid_refreshed_runtime_config",
+  );
+  if (
+    verified?.executables?.node !== nodeExecutable ||
+    verified?.executables?.codex !== codexExecutable ||
+    verified?.appId !== expectedAppId
+  ) {
+    fail("runtime_executable_refresh_verification_failed");
+  }
+  return { action: "updated" };
 }
 
 function assertNumericVersion(version, code = "invalid_presentations_version") {
@@ -740,6 +981,19 @@ async function main() {
     case "ensure-presentations": {
       assertArgumentCount(args, 5);
       process.stdout.write(`${JSON.stringify(ensurePresentations(...args))}\n`);
+      return;
+    }
+    case "validate-codex-entry": {
+      assertArgumentCount(args, 2);
+      assertCodexNodeEntrypoint(...args);
+      process.stdout.write('{"kind":"node-script"}\n');
+      return;
+    }
+    case "refresh-runtime-executables": {
+      assertArgumentCount(args, 8);
+      process.stdout.write(
+        `${JSON.stringify(refreshRuntimeExecutables(args))}\n`,
+      );
       return;
     }
     case "render-launchd": {

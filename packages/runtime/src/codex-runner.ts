@@ -42,6 +42,7 @@ type Spawn = (
 ) => ChildProcessWithoutNullStreams;
 
 export type ProductionCodexRunnerOptions = Readonly<{
+  nodePath: string;
   codexPath: string;
   codexHome: string;
   spawn?: Spawn;
@@ -336,6 +337,7 @@ function createRawJsonlParser(
 export function createProductionCodexRunner(
   options: ProductionCodexRunnerOptions,
 ): CodexRunner {
+  assertAbsolutePath(options.nodePath, "node path");
   assertAbsolutePath(options.codexPath, "codex path");
   assertAbsolutePath(options.codexHome, "codex home");
   const spawn = options.spawn ?? (nodeSpawn as Spawn);
@@ -363,8 +365,11 @@ export function createProductionCodexRunner(
       let child: ChildProcessWithoutNullStreams;
       try {
         child = spawn(
-          options.codexPath,
-          commandArguments(input.sessionId, input.gatewaySocket),
+          options.nodePath,
+          [
+            options.codexPath,
+            ...commandArguments(input.sessionId, input.gatewaySocket),
+          ],
           {
             cwd: input.workspace,
             env,

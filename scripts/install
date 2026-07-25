@@ -282,6 +282,9 @@ typeset codex_executable="${commands[codex]:-}"
 [[ -n "${codex_executable}" ]] || die "未找到 Codex CLI。"
 corepack_executable="${corepack_executable:A}"
 codex_executable="${codex_executable:A}"
+"${node_executable}" "${INSTALL_SUPPORT}" validate-codex-entry \
+  "${node_executable}" "${codex_executable}" >/dev/null ||
+  die "当前 Codex CLI 不是本版本支持的 Node.js 脚本入口。"
 
 note "安装冻结依赖并构建仓库。"
 (
@@ -1011,6 +1014,18 @@ const canRenewPairing =
 process.stdout.write(canRenewPairing ? "renew-pairing" : "preserve");
 NODE
   )" || die "已有运行配置与本次安装身份不一致。"
+  typeset executable_refresh_result
+  executable_refresh_result="$(
+    "${node_executable}" "${INSTALL_SUPPORT}" refresh-runtime-executables \
+      "${config_path}" "${app_id}" "${runtime_root}" "${lark_home}" \
+      "${lark_cli_executable}" "${presentations_plugin_version}" \
+      "${node_executable}" "${codex_executable}"
+  )" || die "无法安全刷新运行配置中的 Node/Codex 启动路径。"
+  if [[ "${executable_refresh_result}" == '{"action":"updated"}' ]]; then
+    note "已原子刷新运行配置中的 Node/Codex 启动路径。"
+  elif [[ "${executable_refresh_result}" != '{"action":"unchanged"}' ]]; then
+    die "运行配置启动路径刷新结果无法验证。"
+  fi
   if [[ "${existing_config_state}" == "renew-pairing" ]]; then
     generate_pairing_contract
     PAIRING_HASH="${pairing_hash}" \

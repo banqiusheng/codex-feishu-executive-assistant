@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- 修复 LaunchAgent 接到真实消息后，runtime 直接执行 `#!/usr/bin/env node` 的 Codex 脚本、却把子进程 `PATH` 固定为不含安装 Node 的系统目录，导致 Codex 在产生首个 JSONL 事件前以 127 退出：运行配置现在保留并验证安装时记录的 Node 绝对路径，由该 Node 直接启动固定 Codex 脚本，同时继续使用不含秘密和私有飞书 CLI 的精简环境；doctor 的 Codex 登录与插件检查也复用同一启动方式，并新增真实 shebang 进程回归。重复安装会原子刷新已漂移的非秘密 Node/Codex 路径；本版本只接受经安装器验证的 `#!/usr/bin/env node` Codex 入口，原生或未知入口明确停止。
 - 修复重复安装时旧 LaunchAgent 仍处于 launchd `removing` 过渡窗口，紧接执行 `bootstrap` 会返回 `Input/output error`：安装器现在等待同一服务确认卸载，再只对该次卸载后的精确过渡期 EIO 做有限重试；新安装或其他错误仍然 fail closed，并在启动前后核验服务状态。
 - 修复专用 `CODEX_HOME` 中已经安装同一官方 `openai-primary-runtime` 来源的旧版 Presentations 时，安装器把正常版本漂移误判为来源异常：现在直接从官方 marketplace 清单和插件 manifest 读取当前版本，仅允许数字版本严格向前升级；升级前把旧 cache 完整复制到权限 `0700` 的私有隔离区，官方安装失败或升级后精确复核失败时恢复旧 cache，来源、身份、版本方向或缓存结构不明时仍然拒绝覆盖。
 - 修复 LaunchAgent 渲染阶段把顶层只读 `REPOSITORY_ROOT` 再次作为临时环境变量赋值，导致 zsh 在生成 plist 前中止：渲染器现在通过位置参数接收仓库根，并新增真实 shell 行为回归，确保只读变量保持不变且 XML 正确转义。

@@ -28,6 +28,7 @@ export async function runRuntimeCli(
   const configPath = configPathFromArguments(argv, environment);
   const config = await loadRuntimeConfig(configPath);
   const runner = createProductionCodexRunner({
+    nodePath: config.executables.node,
     codexPath: config.executables.codex,
     codexHome: config.paths.codexHome,
   });

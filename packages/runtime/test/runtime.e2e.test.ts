@@ -419,6 +419,7 @@ async function fixtureConfig(
       databasePath: join(runtimeRoot, "assistant.sqlite"),
     },
     executables: {
+      node: "/usr/local/bin/node",
       codex: "/usr/local/bin/codex",
       gatewayClient: "/usr/local/bin/assistant-gateway",
       larkCli: "/usr/local/bin/lark-cli",
@@ -853,6 +854,12 @@ describe("executive runtime offline integration", () => {
 });
 
 describe("production boundaries", () => {
+  it("retains the configured Node executable for the production runner", async () => {
+    const config = await fixtureConfig();
+
+    expect(config.executables.node).toBe("/usr/local/bin/node");
+  });
+
   it("rejects inline secrets in otherwise valid JSON configuration", async () => {
     const config = await fixtureConfig();
     expect(() =>
@@ -893,6 +900,7 @@ describe("production boundaries", () => {
         }>
       | undefined;
     const runner = createProductionCodexRunner({
+      nodePath: "/usr/local/bin/node",
       codexPath: "/usr/local/bin/codex",
       codexHome: "/private/runtime/codex-home",
       spawn: (command, args, options) => {
@@ -950,7 +958,8 @@ describe("production boundaries", () => {
     await consume;
 
     expect(observed).toHaveLength(4);
-    expect(invocation?.command).toBe("/usr/local/bin/codex");
+    expect(invocation?.command).toBe("/usr/local/bin/node");
+    expect(invocation?.args.at(0)).toBe("/usr/local/bin/codex");
     expect(invocation?.options.shell).toBe(false);
     expect(invocation?.args).toContain("network_proxy");
     expect(invocation?.args.join(" ")).toContain(

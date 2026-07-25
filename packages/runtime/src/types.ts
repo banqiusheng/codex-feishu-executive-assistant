@@ -24,6 +24,7 @@ export type RuntimePaths = Readonly<{
 }>;
 
 export type RuntimeExecutables = Readonly<{
+  node: string;
   codex: string;
   gatewayClient: string;
   larkCli: string | null;

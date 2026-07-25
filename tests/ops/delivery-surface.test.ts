@@ -1,11 +1,14 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -174,6 +177,118 @@ describe("lean delivery surface", () => {
     });
     expect(help.status, `${help.stdout}\n${help.stderr}`).toBe(0);
     expect(help.stdout).toContain("doctor 只读取状态");
+  });
+
+  it("checks Codex login through configured Node with the production-minimal environment", () => {
+    const home = temporaryHome();
+    const runtimeRoot = join(home, "PresidentAssistant", "runtime");
+    const codexHome = join(runtimeRoot, "codex-home");
+    const larkHome = join(runtimeRoot, "lark-home");
+    const configRoot = join(runtimeRoot, "config");
+    const configPath = join(configRoot, "assistant.json");
+    const codexFixture = join(runtimeRoot, "codex-fixture.mjs");
+    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    mkdirSync(larkHome, { recursive: true, mode: 0o700 });
+    mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      codexFixture,
+      `#!/usr/bin/env node
+if (
+  process.env.PATH !== "/usr/bin:/bin:/usr/sbin:/sbin" ||
+  process.env.DOCTOR_AMBIENT_SENTINEL !== undefined ||
+  process.env.CODEX_HOME !== ${JSON.stringify(codexHome)}
+) {
+  process.exit(72);
+}
+const args = process.argv.slice(2);
+if (args.join(" ") === "login status") {
+  process.stdout.write("Logged in\\n");
+  process.exit(0);
+}
+if (args.includes("plugin")) {
+  process.stdout.write(JSON.stringify({
+    installed: [{
+      pluginId: "presentations@openai-primary-runtime",
+      marketplaceName: "openai-primary-runtime",
+      marketplaceSource: { sourceType: "local" },
+      version: "test",
+      installed: true,
+      enabled: true,
+    }],
+    available: [],
+  }) + "\\n");
+  process.exit(0);
+}
+process.exit(64);
+`,
+      { mode: 0o500 },
+    );
+    chmodSync(codexFixture, 0o500);
+    writeFileSync(
+      configPath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          appId: "cli_TEST123456",
+          presidentOpenId: null,
+          presidentChatId: null,
+          pairing: {
+            enabled: true,
+            codeHash: `sha256:${"a".repeat(64)}`,
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          },
+          secretRef: {
+            type: "macos-keychain",
+            service: "com.codex-feishu-executive-assistant.bot",
+            account: "cli_TEST123456",
+          },
+          paths: {
+            runtimeRoot,
+            larkHome,
+            databasePath: join(runtimeRoot, "assistant.sqlite"),
+            codexHome,
+          },
+          executables: {
+            node: process.execPath,
+            codex: codexFixture,
+            larkCli: join(runtimeRoot, "missing-lark-cli"),
+            runtimeEntry: codexFixture,
+          },
+          visualFirstPpt: {
+            skillRoot: join(runtimeRoot, "missing-ppt"),
+            presentationsPlugin: {
+              id: "presentations@openai-primary-runtime",
+              version: "test",
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+    chmodSync(configPath, 0o600);
+
+    const result = runZsh(doctorPath, ["--json", "--config", configPath], {
+      HOME: home,
+      DOCTOR_AMBIENT_SENTINEL: "must-not-reach-codex",
+    });
+    const report = JSON.parse(result.stdout) as {
+      checks: Array<{ id: string; status: string }>;
+    };
+
+    expect(report.checks.find((check) => check.id === "codex-login")).toEqual({
+      id: "codex-login",
+      status: "PASS",
+      detail: "专用 CODEX_HOME 已登录。",
+    });
+    expect(report.checks.find((check) => check.id === "presentations")).toEqual(
+      {
+        id: "presentations",
+        status: "PASS",
+        detail: "专用 CODEX_HOME 已启用官方 Presentations test。",
+      },
+    );
   });
 
   it("stores only a Keychain reference in the config template", () => {

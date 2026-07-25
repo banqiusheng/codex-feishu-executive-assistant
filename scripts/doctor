@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 const LABEL = "com.codex-feishu.executive-assistant";
 const KEYCHAIN_SERVICE = "com.codex-feishu-executive-assistant.bot";
 const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime";
+const MINIMAL_RUNTIME_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 const REQUIRED_USER_SCOPES = Object.freeze([
   "calendar:calendar.event:create",
   "calendar:calendar.event:update",
@@ -197,17 +198,25 @@ const codexExecutable = config?.executables?.codex;
 const codexHome = config?.paths?.codexHome;
 let presentationsVerified = false;
 if (
+  typeof configuredNode !== "string" ||
+  !path.isAbsolute(configuredNode) ||
+  !isPlainFile(configuredNode) ||
   typeof codexExecutable !== "string" ||
   !path.isAbsolute(codexExecutable) ||
   !isPlainFile(codexExecutable) ||
   typeof codexHome !== "string" ||
   !path.isAbsolute(codexHome)
 ) {
-  add("codex-login", "FAIL", "Codex 可执行文件或专用 CODEX_HOME 配置无效。");
+  add("codex-login", "FAIL", "Node、Codex 可执行文件或专用 CODEX_HOME 配置无效。");
 } else {
-  const result = run(codexExecutable, ["login", "status"], {
+  const result = run(configuredNode, [codexExecutable, "login", "status"], {
     timeout: 20_000,
-    env: { ...process.env, CODEX_HOME: codexHome },
+    env: {
+      PATH: MINIMAL_RUNTIME_PATH,
+      CODEX_HOME: codexHome,
+      LANG: "zh_CN.UTF-8",
+      LC_ALL: "zh_CN.UTF-8",
+    },
   });
   add(
     "codex-login",
@@ -217,6 +226,9 @@ if (
 }
 
 if (
+  typeof configuredNode !== "string" ||
+  !path.isAbsolute(configuredNode) ||
+  !isPlainFile(configuredNode) ||
   typeof codexExecutable !== "string" ||
   typeof codexHome !== "string" ||
   !isPlainFile(codexExecutable)
@@ -224,8 +236,9 @@ if (
   add("presentations", "FAIL", "无法使用专用 Codex 环境核验 Presentations 插件。");
 } else {
   const result = run(
-    codexExecutable,
+    configuredNode,
     [
+      codexExecutable,
       "plugin",
       "list",
       "--marketplace",
@@ -235,7 +248,12 @@ if (
     ],
     {
       timeout: 20_000,
-      env: { ...process.env, CODEX_HOME: codexHome },
+      env: {
+        PATH: MINIMAL_RUNTIME_PATH,
+        CODEX_HOME: codexHome,
+        LANG: "zh_CN.UTF-8",
+        LC_ALL: "zh_CN.UTF-8",
+      },
     },
   );
   try {

@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -364,6 +365,237 @@ function reloadLaunchd(fixture: ReturnType<typeof prepareFakeLaunchctl>) {
 }
 
 describe("installer compatibility support", () => {
+  it("atomically refreshes stale configured Node and Codex paths without changing pairing or secret references", () => {
+    const root = realpathSync(
+      makeTemporaryRoot("assistant-runtime-executables."),
+    );
+    const runtimeRoot = join(root, "runtime");
+    const larkHome = join(runtimeRoot, "lark-home");
+    const larkCli = join(runtimeRoot, "private-bin", "lark-cli");
+    const configPath = join(runtimeRoot, "assistant.json");
+    const codexPath = join(runtimeRoot, "codex-fixture.mjs");
+    mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(codexPath, "#!/usr/bin/env node\nprocess.exit(0);\n", {
+      mode: 0o500,
+    });
+    writeFileSync(
+      configPath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          appId: "cli_TEST123456",
+          presidentOpenId: "ou_president",
+          presidentChatId: "oc_private",
+          pairing: {
+            enabled: false,
+            codeHash: null,
+            expiresAt: null,
+          },
+          secretRef: {
+            type: "macos-keychain",
+            service: "com.codex-feishu-executive-assistant.bot",
+            account: "cli_TEST123456",
+          },
+          paths: {
+            runtimeRoot,
+            jobsRoot: join(root, "jobs"),
+            workspaceRoot: root,
+            codexHome: join(runtimeRoot, "codex-home"),
+            larkHome,
+            databasePath: join(runtimeRoot, "assistant.sqlite"),
+          },
+          executables: {
+            node: "/stale/node",
+            codex: "/stale/codex",
+            gatewayClient: join(runtimeRoot, "assistant-gateway"),
+            larkCli,
+            runtimeEntry: join(runtimeRoot, "runtime.js"),
+          },
+          visualFirstPpt: {
+            presentationsPlugin: {
+              id: "presentations@openai-primary-runtime",
+              version: "26.723.12215",
+            },
+          },
+          preservedSentinel: "unchanged",
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+    chmodSync(configPath, 0o600);
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        installSupportPath,
+        "refresh-runtime-executables",
+        configPath,
+        "cli_TEST123456",
+        runtimeRoot,
+        larkHome,
+        larkCli,
+        "26.723.12215",
+        process.execPath,
+        codexPath,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ action: "updated" });
+    const refreshed = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(refreshed.executables).toMatchObject({
+      node: process.execPath,
+      codex: codexPath,
+      larkCli,
+    });
+    expect(refreshed).toMatchObject({
+      presidentOpenId: "ou_president",
+      presidentChatId: "oc_private",
+      pairing: {
+        enabled: false,
+        codeHash: null,
+        expiresAt: null,
+      },
+      secretRef: {
+        type: "macos-keychain",
+        service: "com.codex-feishu-executive-assistant.bot",
+        account: "cli_TEST123456",
+      },
+      preservedSentinel: "unchanged",
+    });
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("refuses to refresh an invalid Keychain reference, inline secret, or principal pairing state without changing bytes", () => {
+    const root = realpathSync(
+      makeTemporaryRoot("assistant-invalid-runtime-config."),
+    );
+    const runtimeRoot = join(root, "runtime");
+    const larkHome = join(runtimeRoot, "lark-home");
+    const larkCli = join(runtimeRoot, "private-bin", "lark-cli");
+    const codexPath = join(runtimeRoot, "codex-fixture.mjs");
+    mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(codexPath, "#!/usr/bin/env node\nprocess.exit(0);\n", {
+      mode: 0o500,
+    });
+    const baseConfig = {
+      schemaVersion: 1,
+      appId: "cli_TEST123456",
+      presidentOpenId: "ou_president",
+      presidentChatId: "oc_private",
+      pairing: {
+        enabled: false,
+        codeHash: null,
+        expiresAt: null,
+      },
+      secretRef: {
+        type: "macos-keychain",
+        service: "com.codex-feishu-executive-assistant.bot",
+        account: "cli_TEST123456",
+      },
+      paths: {
+        runtimeRoot,
+        jobsRoot: join(root, "jobs"),
+        workspaceRoot: root,
+        codexHome: join(runtimeRoot, "codex-home"),
+        larkHome,
+        databasePath: join(runtimeRoot, "assistant.sqlite"),
+      },
+      executables: {
+        node: "/stale/node",
+        codex: "/stale/codex",
+        gatewayClient: join(runtimeRoot, "assistant-gateway"),
+        larkCli,
+        runtimeEntry: join(runtimeRoot, "runtime.js"),
+      },
+      visualFirstPpt: {
+        presentationsPlugin: {
+          id: "presentations@openai-primary-runtime",
+          version: "26.723.12215",
+        },
+      },
+    };
+    const variants = [
+      {
+        name: "wrong-keychain-reference",
+        config: {
+          ...baseConfig,
+          secretRef: {
+            ...baseConfig.secretRef,
+            service: "com.example.wrong-service",
+          },
+        },
+      },
+      {
+        name: "inline-client-secret",
+        config: {
+          ...baseConfig,
+          nested: { clientSecret: "must-never-be-accepted" },
+        },
+      },
+      {
+        name: "incoherent-principal-pairing",
+        config: {
+          ...baseConfig,
+          presidentChatId: null,
+        },
+      },
+    ];
+
+    for (const variant of variants) {
+      const configPath = join(runtimeRoot, `${variant.name}.json`);
+      const original = `${JSON.stringify(variant.config, null, 2)}\n`;
+      writeFileSync(configPath, original, { mode: 0o600 });
+      chmodSync(configPath, 0o600);
+      const result = spawnSync(
+        process.execPath,
+        [
+          installSupportPath,
+          "refresh-runtime-executables",
+          configPath,
+          "cli_TEST123456",
+          runtimeRoot,
+          larkHome,
+          larkCli,
+          "26.723.12215",
+          process.execPath,
+          codexPath,
+        ],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status, variant.name).not.toBe(0);
+      expect(readFileSync(configPath, "utf8"), variant.name).toBe(original);
+      expect(statSync(configPath).mode & 0o777, variant.name).toBe(0o600);
+    }
+  });
+
+  it("rejects a native Codex executable when this release requires an env-node script", () => {
+    const root = makeTemporaryRoot("assistant-native-codex.");
+    const nativeCodexPath = join(root, "codex-native");
+    writeFileSync(nativeCodexPath, Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), {
+      mode: 0o500,
+    });
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        installSupportPath,
+        "validate-codex-entry",
+        process.execPath,
+        nativeCodexPath,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("unsupported_codex_entrypoint");
+  });
+
   it("derives the expected version from the unique official marketplace source", () => {
     const root = makeTemporaryRoot("assistant-presentations-contract.");
     const marketplaceRoot = join(root, "openai-primary-runtime");

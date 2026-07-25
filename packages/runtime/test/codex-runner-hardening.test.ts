@@ -38,6 +38,7 @@ function fakeChild(): FakeChild {
 
 function runnerFor(child: FakeChild) {
   return createProductionCodexRunner({
+    nodePath: "/usr/local/bin/node",
     codexPath: "/usr/local/bin/codex",
     codexHome: "/private/runtime/codex-home",
     spawn: () => child as unknown as ChildProcessWithoutNullStreams,

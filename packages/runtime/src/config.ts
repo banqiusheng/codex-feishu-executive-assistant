@@ -147,6 +147,7 @@ function parsePaths(value: unknown): RuntimePaths {
 function parseExecutables(value: unknown): RuntimeExecutables {
   if (!isRecord(value)) return invalid("executables");
   return Object.freeze({
+    node: absolutePath(value.node, "executables.node") as string,
     codex: absolutePath(value.codex, "executables.codex") as string,
     gatewayClient: absolutePath(
       value.gatewayClient,
