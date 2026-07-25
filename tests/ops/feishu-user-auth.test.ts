@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   lstatSync,
@@ -29,7 +30,6 @@ import {
   parseAuthorizationComplete,
   parseNoWaitResponse,
   runFeishuUserAuth,
-  sanitizeLoginScopeCacheKey,
   validateRegularExecutable,
 } from "../../scripts/feishu-user-auth.mjs";
 
@@ -100,10 +100,37 @@ function writeOwnedScopeCache(
   return cachePath;
 }
 
+function flowLockPath(larkHome: string): string {
+  return join(
+    larkHome,
+    ".lark-cli",
+    "cache",
+    "executive-assistant-user-auth.lock",
+  );
+}
+
+function controlledChild() {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    kill: (signal: string) => boolean;
+  };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const killedSignals: string[] = [];
+  child.kill = (signal: string) => {
+    killedSignals.push(signal);
+    return true;
+  };
+  return { child, killedSignals };
+}
+
 function successfulFixture(
   options: {
     deviceCode?: string;
     noWait?: Buffer;
+    noWaitStatus?: number;
+    createNoWaitCache?: boolean;
     poll?: Buffer;
     pollStatus?: number;
     openerStatus?: number;
@@ -111,7 +138,9 @@ function successfulFixture(
     verificationUrl?: string;
     abortSignal?: AbortSignal;
     cacheScopes?: readonly string[];
+    mutateNoWaitCache?: (cachePath: string) => void;
     waitForAbortDuringPoll?: boolean;
+    mutateCacheDuringPoll?: (cachePath: string) => void;
   } = {},
 ) {
   const root = temporaryRoot();
@@ -135,13 +164,16 @@ function successfulFixture(
   }) => {
     calls.push(request);
     if (request.args.includes("--no-wait")) {
-      writeOwnedScopeCache(
-        larkHome,
-        deviceCode,
-        options.cacheScopes ?? missingScopes,
-      );
+      if (options.createNoWaitCache !== false) {
+        const cachePath = writeOwnedScopeCache(
+          larkHome,
+          deviceCode,
+          options.cacheScopes ?? missingScopes,
+        );
+        options.mutateNoWaitCache?.(cachePath);
+      }
       return {
-        status: 0,
+        status: options.noWaitStatus ?? 0,
         stdout:
           options.noWait ??
           noWaitPayload(
@@ -170,6 +202,9 @@ function successfulFixture(
         stderr: Buffer.alloc(0),
       };
     }
+    options.mutateCacheDuringPoll?.(
+      authorizationCachePath(larkHome, deviceCode),
+    );
     if ((options.pollStatus ?? 0) === 0) {
       rmSync(authorizationCachePath(larkHome, deviceCode), { force: true });
     }
@@ -208,12 +243,6 @@ describe("validated Feishu user authorization", () => {
     const fixture = successfulFixture({
       verificationUrl: verificationUrl.href,
     });
-    const unrelatedCode = generatedOpaqueValue();
-    const unrelatedPath = writeOwnedScopeCache(
-      fixture.larkHome,
-      unrelatedCode,
-      ["contact:user:search"],
-    );
     const result = await runFeishuUserAuth(
       {
         larkCliPath: fixture.larkCliPath,
@@ -254,9 +283,6 @@ describe("validated Feishu user authorization", () => {
     expect(
       existsSync(authorizationCachePath(fixture.larkHome, fixture.deviceCode)),
     ).toBe(false);
-    expect(readFileSync(unrelatedPath, "utf8")).toContain(
-      "contact:user:search",
-    );
     const publicSurface = `${result}\n${fixture.messages.join("\n")}`;
     expect(publicSurface).not.toContain(fixture.deviceCode);
     expect(publicSurface).not.toContain(verificationUrl.href);
@@ -350,6 +376,40 @@ describe("validated Feishu user authorization", () => {
       expect(() =>
         parseNoWaitResponse(noWaitPayload(deviceCode, verificationUrl)),
       ).toThrow("AUTH_OUTPUT_INVALID");
+    }
+  });
+
+  it("rejects raw URL parser-confusion forms before URL parsing", () => {
+    const deviceCode = generatedOpaqueValue();
+    const invalidUrls = [
+      `${AUTHORIZATION_ORIGIN}:443`,
+      AUTHORIZATION_ORIGIN.replace("://", "://@"),
+      AUTHORIZATION_ORIGIN.replace("://", "://opaque@"),
+      `${AUTHORIZATION_ORIGIN}#`,
+      `${AUTHORIZATION_ORIGIN}\\opaque`,
+      `${AUTHORIZATION_ORIGIN}/\ud800`,
+      `${AUTHORIZATION_ORIGIN}/\u0085`,
+      `${AUTHORIZATION_ORIGIN}/\u200b`,
+      `${AUTHORIZATION_ORIGIN}/\u2028`,
+      `${AUTHORIZATION_ORIGIN}/\u2029`,
+      `${AUTHORIZATION_ORIGIN}/\u00a0`,
+      `${AUTHORIZATION_ORIGIN}/\u1680`,
+    ];
+    for (const verificationUrl of invalidUrls) {
+      expect(() =>
+        parseNoWaitResponse(noWaitPayload(deviceCode, verificationUrl)),
+      ).toThrow("AUTH_OUTPUT_INVALID");
+    }
+    for (const verificationUrl of [
+      AUTHORIZATION_ORIGIN,
+      `${AUTHORIZATION_ORIGIN}/`,
+      `${AUTHORIZATION_ORIGIN}?opaque`,
+      `${AUTHORIZATION_ORIGIN}/opaque?opaque`,
+    ]) {
+      expect(
+        parseNoWaitResponse(noWaitPayload(deviceCode, verificationUrl))
+          .verificationUrl,
+      ).toBe(verificationUrl);
     }
   });
 
@@ -470,6 +530,126 @@ describe("validated Feishu user authorization", () => {
     });
   });
 
+  it("treats child error as forced failure but settles only after close", async () => {
+    const { child, killedSignals } = controlledChild();
+    const runner = createBoundedCommandRunner(() => child);
+    let settled = false;
+    const pending = runner({
+      executable: "/fixed/executable",
+      args: [],
+      environment: {},
+      timeoutMs: 1_000,
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+    child.emit("error", new Error("opaque"));
+    expect(killedSignals).toEqual(["SIGKILL"]);
+    expect(settled).toBe(false);
+    child.emit("close", null);
+    await expect(pending).resolves.toMatchObject({
+      status: 1,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    });
+  });
+
+  it("treats either pipe error as forced failure but settles only after close", async () => {
+    for (const pipeName of ["stdout", "stderr"] as const) {
+      const { child, killedSignals } = controlledChild();
+      const runner = createBoundedCommandRunner(() => child);
+      let settled = false;
+      const pending = runner({
+        executable: "/fixed/executable",
+        args: [],
+        environment: {},
+        timeoutMs: 1_000,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      expect(() =>
+        child[pipeName].emit("error", new Error("opaque")),
+      ).not.toThrow();
+      expect(killedSignals).toEqual(["SIGKILL"]);
+      expect(settled).toBe(false);
+      child.emit("close", null);
+      await expect(pending).resolves.toMatchObject({
+        status: 1,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+      });
+    }
+  });
+
+  it("keeps abort pending until close and ignores repeated abort attempts", async () => {
+    const { child, killedSignals } = controlledChild();
+    const controller = new AbortController();
+    const runner = createBoundedCommandRunner(() => child);
+    let settled = false;
+    const pending = runner({
+      executable: "/fixed/executable",
+      args: [],
+      environment: {},
+      timeoutMs: 1_000,
+      abortSignal: controller.signal,
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+    controller.abort();
+    controller.abort();
+    expect(killedSignals).toEqual(["SIGKILL"]);
+    expect(settled).toBe(false);
+    child.emit("close", null);
+    await expect(pending).resolves.toMatchObject({ status: 1 });
+  });
+
+  it("runs real local Node children through the default bounded close gate", async () => {
+    const runner = createBoundedCommandRunner();
+    const environment = {
+      PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      LANG: "C",
+      LC_ALL: "C",
+    };
+    const normal = await runner({
+      executable: process.execPath,
+      args: ["-e", 'process.stdout.write("ok")'],
+      environment,
+      timeoutMs: 5_000,
+    });
+    expect(normal).toMatchObject({
+      status: 0,
+      stdout: Buffer.from("ok"),
+      stderr: Buffer.alloc(0),
+    });
+    const overflow = await runner({
+      executable: process.execPath,
+      args: [
+        "-e",
+        `process.stdout.write(Buffer.alloc(${MAX_CLI_OUTPUT_BYTES + 1}, 97))`,
+      ],
+      environment,
+      timeoutMs: 5_000,
+    });
+    expect(overflow).toMatchObject({
+      status: 1,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    });
+    const timeout = await runner({
+      executable: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      environment,
+      timeoutMs: 20,
+    });
+    expect(timeout).toMatchObject({
+      status: 1,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    });
+  });
+
   it("fails closed for no GUI, opener failure, CLI failure, and malformed poll output without fallback or leakage", async () => {
     const fixtures = [
       successfulFixture({ gui: false }),
@@ -537,51 +717,131 @@ describe("validated Feishu user authorization", () => {
     ).resolves.toBe(BLOCKED_USER_AUTH);
   });
 
-  it("never deletes a baseline cache entry when sanitizer collisions make ownership ambiguous", async () => {
-    const root = temporaryRoot();
-    const larkHome = join(root, "lark-home");
-    const larkCliPath = join(root, "private-bin", "lark-cli");
-    const unsafeCode = `${generatedOpaqueValue()}/suffix`;
-    const collidingCode = unsafeCode.replace("/", "?");
-    expect(sanitizeLoginScopeCacheKey(unsafeCode)).toBe(
-      sanitizeLoginScopeCacheKey(collidingCode),
+  it("blocks before the CLI when the scope-cache baseline is nonempty and preserves every byte", async () => {
+    const fixture = successfulFixture();
+    const baselinePath = writeOwnedScopeCache(
+      fixture.larkHome,
+      generatedOpaqueValue(),
+      ["contact:user:search"],
     );
-    mkdirSync(dirname(larkCliPath), { recursive: true, mode: 0o700 });
-    writeFileSync(larkCliPath, "", { mode: 0o500 });
-    mkdirSync(larkHome, { mode: 0o700 });
-    const baselinePath = writeOwnedScopeCache(larkHome, collidingCode, [
-      "contact:user:search",
-    ]);
     const baselineBytes = readFileSync(baselinePath);
-    const calls: unknown[] = [];
-    const result = await runFeishuUserAuth(
-      { larkCliPath, larkHome, missingScopes },
-      {
-        abortSignal: undefined,
-        emit: () => undefined,
-        hasGuiSession: async () => true,
-        runCommand: async (request: {
-          args: readonly string[];
-          executable: string;
-        }) => {
-          calls.push(request);
-          return request.args.includes("--no-wait")
-            ? {
-                status: 0,
-                stdout: noWaitPayload(unsafeCode),
-                stderr: Buffer.alloc(0),
-              }
-            : {
-                status: 0,
-                stdout: Buffer.alloc(0),
-                stderr: Buffer.alloc(0),
-              };
+    await expect(
+      runFeishuUserAuth(
+        {
+          larkCliPath: fixture.larkCliPath,
+          larkHome: fixture.larkHome,
+          missingScopes,
         },
-      },
-    );
-    expect(result).toBe(BLOCKED_USER_AUTH);
+        fixture.dependencies,
+      ),
+    ).resolves.toBe(BLOCKED_USER_AUTH);
+    expect(fixture.calls).toEqual([]);
     expect(readFileSync(baselinePath)).toEqual(baselineBytes);
-    expect(calls).toHaveLength(1);
+    expect(existsSync(flowLockPath(fixture.larkHome))).toBe(false);
+  });
+
+  it("never takes over or deletes an existing user-auth flow lock", async () => {
+    const fixture = successfulFixture();
+    const lockPath = flowLockPath(fixture.larkHome);
+    mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+    chmodSync(lockPath, 0o700);
+    const sentinelPath = join(lockPath, "sentinel");
+    writeFileSync(sentinelPath, "opaque", { mode: 0o600 });
+    await expect(
+      runFeishuUserAuth(
+        {
+          larkCliPath: fixture.larkCliPath,
+          larkHome: fixture.larkHome,
+          missingScopes,
+        },
+        fixture.dependencies,
+      ),
+    ).resolves.toBe(BLOCKED_USER_AUTH);
+    expect(fixture.calls).toEqual([]);
+    expect(readFileSync(sentinelPath, "utf8")).toBe("opaque");
+  });
+
+  it("cleans one exact new cache entry after malformed or nonzero no-wait output while holding its own flow lock", async () => {
+    for (const fixture of [
+      successfulFixture({ noWait: Buffer.from("{}") }),
+      successfulFixture({ noWaitStatus: 7 }),
+    ]) {
+      await expect(
+        runFeishuUserAuth(
+          {
+            larkCliPath: fixture.larkCliPath,
+            larkHome: fixture.larkHome,
+            missingScopes,
+          },
+          fixture.dependencies,
+        ),
+      ).resolves.toBe(BLOCKED_USER_AUTH);
+      expect(
+        existsSync(
+          authorizationCachePath(fixture.larkHome, fixture.deviceCode),
+        ),
+      ).toBe(false);
+      expect(existsSync(flowLockPath(fixture.larkHome))).toBe(false);
+    }
+  });
+
+  it("confirms an empty cache after malformed no-wait output and releases only its own lock", async () => {
+    const fixture = successfulFixture({
+      createNoWaitCache: false,
+      noWait: Buffer.from("{}"),
+    });
+    await expect(
+      runFeishuUserAuth(
+        {
+          larkCliPath: fixture.larkCliPath,
+          larkHome: fixture.larkHome,
+          missingScopes,
+        },
+        fixture.dependencies,
+      ),
+    ).resolves.toBe(BLOCKED_USER_AUTH);
+    expect(fixture.calls).toHaveLength(1);
+    expect(existsSync(flowLockPath(fixture.larkHome))).toBe(false);
+  });
+
+  it("does not delete ambiguous multiple new cache entries", async () => {
+    const fixture = successfulFixture({
+      createNoWaitCache: false,
+      noWait: Buffer.from("{}"),
+    });
+    const firstCode = generatedOpaqueValue();
+    const secondCode = generatedOpaqueValue();
+    fixture.dependencies.runCommand = async (request: {
+      executable: string;
+      args: readonly string[];
+      environment: Readonly<Record<string, string>>;
+    }) => {
+      fixture.calls.push(request);
+      writeOwnedScopeCache(fixture.larkHome, firstCode);
+      writeOwnedScopeCache(fixture.larkHome, secondCode);
+      return {
+        status: 1,
+        stdout: Buffer.from("{}"),
+        stderr: Buffer.alloc(0),
+      };
+    };
+    await expect(
+      runFeishuUserAuth(
+        {
+          larkCliPath: fixture.larkCliPath,
+          larkHome: fixture.larkHome,
+          missingScopes,
+        },
+        fixture.dependencies,
+      ),
+    ).resolves.toBe(BLOCKED_USER_AUTH);
+    expect(
+      existsSync(authorizationCachePath(fixture.larkHome, firstCode)),
+    ).toBe(true);
+    expect(
+      existsSync(authorizationCachePath(fixture.larkHome, secondCode)),
+    ).toBe(true);
+    expect(existsSync(flowLockPath(fixture.larkHome))).toBe(false);
   });
 
   it("requires the owned cache entry to be a canonical regular 0600 file with the exact requested scope", async () => {
@@ -604,6 +864,120 @@ describe("validated Feishu user authorization", () => {
     ).resolves.toBe(BLOCKED_USER_AUTH);
     expect(fixture.calls).toHaveLength(1);
     expect(existsSync(cachePath)).toBe(true);
+  });
+
+  it("leaves wrong-mode, symlinked, or oversized new cache entries untouched", async () => {
+    const fixtures = [
+      successfulFixture({
+        mutateNoWaitCache: (cachePath) => chmodSync(cachePath, 0o644),
+      }),
+      successfulFixture({
+        mutateNoWaitCache: (cachePath) => {
+          const target = join(dirname(cachePath), "..", generatedOpaqueValue());
+          writeFileSync(
+            target,
+            JSON.stringify({ requested_scope: missingScopes.join(" ") }),
+            { mode: 0o600 },
+          );
+          rmSync(cachePath);
+          symlinkSync(target, cachePath);
+        },
+      }),
+      successfulFixture({
+        mutateNoWaitCache: (cachePath) =>
+          writeFileSync(
+            cachePath,
+            Buffer.alloc(MAX_CLI_OUTPUT_BYTES + 1, 0x61),
+          ),
+      }),
+    ];
+    for (const fixture of fixtures) {
+      const cachePath = authorizationCachePath(
+        fixture.larkHome,
+        fixture.deviceCode,
+      );
+      await expect(
+        runFeishuUserAuth(
+          {
+            larkCliPath: fixture.larkCliPath,
+            larkHome: fixture.larkHome,
+            missingScopes,
+          },
+          fixture.dependencies,
+        ),
+      ).resolves.toBe(BLOCKED_USER_AUTH);
+      expect(existsSync(cachePath)).toBe(true);
+      expect(fixture.calls).toHaveLength(1);
+      expect(existsSync(flowLockPath(fixture.larkHome))).toBe(false);
+    }
+  });
+
+  it("does not delete an owned cache path that grows or is replaced before cleanup", async () => {
+    const growingFixture = successfulFixture({
+      pollStatus: 1,
+      mutateCacheDuringPoll: (cachePath) => {
+        appendFileSync(cachePath, Buffer.alloc(MAX_CLI_OUTPUT_BYTES + 1, 0x61));
+      },
+    });
+    const replacingFixture = successfulFixture({
+      pollStatus: 1,
+      mutateCacheDuringPoll: (cachePath) => {
+        rmSync(cachePath);
+        writeFileSync(
+          cachePath,
+          JSON.stringify({ requested_scope: missingScopes.join(" ") }),
+          { mode: 0o600 },
+        );
+        chmodSync(cachePath, 0o600);
+      },
+    });
+    for (const fixture of [growingFixture, replacingFixture]) {
+      await expect(
+        runFeishuUserAuth(
+          {
+            larkCliPath: fixture.larkCliPath,
+            larkHome: fixture.larkHome,
+            missingScopes,
+          },
+          fixture.dependencies,
+        ),
+      ).resolves.toBe(BLOCKED_USER_AUTH);
+      expect(
+        existsSync(
+          authorizationCachePath(fixture.larkHome, fixture.deviceCode),
+        ),
+      ).toBe(true);
+      expect(existsSync(flowLockPath(fixture.larkHome))).toBe(false);
+    }
+  });
+
+  it("does not remove a replacement flow lock after losing its recorded identity", async () => {
+    let observedOwnedLock = false;
+    let replacementSentinel = "";
+    const fixture = successfulFixture({
+      pollStatus: 1,
+      mutateCacheDuringPoll: () => {
+        const lockPath = flowLockPath(fixture.larkHome);
+        observedOwnedLock = existsSync(lockPath);
+        rmSync(lockPath, { recursive: true, force: true });
+        mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+        chmodSync(lockPath, 0o700);
+        replacementSentinel = join(lockPath, "replacement");
+        writeFileSync(replacementSentinel, "opaque", { mode: 0o600 });
+      },
+    });
+    await expect(
+      runFeishuUserAuth(
+        {
+          larkCliPath: fixture.larkCliPath,
+          larkHome: fixture.larkHome,
+          missingScopes,
+        },
+        fixture.dependencies,
+      ),
+    ).resolves.toBe(BLOCKED_USER_AUTH);
+    expect(observedOwnedLock).toBe(true);
+    expect(readFileSync(replacementSentinel, "utf8")).toBe("opaque");
   });
 
   it("aborts the active poll, waits for its fixed result, and cleans only the owned cache", async () => {
@@ -636,6 +1010,69 @@ describe("validated Feishu user authorization", () => {
     expect(
       existsSync(authorizationCachePath(fixture.larkHome, fixture.deviceCode)),
     ).toBe(false);
+  });
+
+  it("keeps persistent SIGINT, SIGTERM, and SIGHUP handlers until authorization cleanup completes", async () => {
+    const module = await import("../../scripts/feishu-user-auth.mjs");
+    const main = Reflect.get(module, "runFeishuUserAuthMain") as unknown;
+    expect(typeof main).toBe("function");
+    if (typeof main !== "function") return;
+
+    const runtime = new EventEmitter() as EventEmitter & {
+      exitCode?: number;
+      stderr: { write: (value: string) => boolean };
+    };
+    const stderr: string[] = [];
+    runtime.stderr = {
+      write: (value) => {
+        stderr.push(value);
+        return true;
+      },
+    };
+    let observedSignal: AbortSignal | undefined;
+    let observedInput: unknown;
+    let finishAuthorization: (() => void) | undefined;
+    const authorizationPending = new Promise<void>((resolvePromise) => {
+      finishAuthorization = resolvePromise;
+    });
+    const pending = Reflect.apply(main, undefined, [
+      {
+        argv: ["/fixed/lark-cli", "/fixed/lark-home", ...missingScopes],
+        processLike: runtime,
+        authorize: async (
+          input: unknown,
+          dependencies: { abortSignal?: AbortSignal },
+        ) => {
+          observedInput = input;
+          observedSignal = dependencies.abortSignal;
+          await authorizationPending;
+          return BLOCKED_USER_AUTH;
+        },
+      },
+    ]) as Promise<void>;
+    await Promise.resolve();
+    expect(runtime.listenerCount("SIGINT")).toBe(1);
+    expect(runtime.listenerCount("SIGTERM")).toBe(1);
+    expect(runtime.listenerCount("SIGHUP")).toBe(1);
+    expect(observedInput).toEqual({
+      larkCliPath: "/fixed/lark-cli",
+      larkHome: "/fixed/lark-home",
+      missingScopes,
+    });
+    runtime.emit("SIGHUP");
+    runtime.emit("SIGINT");
+    runtime.emit("SIGTERM");
+    runtime.emit("SIGHUP");
+    expect(observedSignal?.aborted).toBe(true);
+    expect(runtime.listenerCount("SIGHUP")).toBe(1);
+    expect(stderr).toEqual([]);
+    finishAuthorization?.();
+    await pending;
+    expect(runtime.listenerCount("SIGINT")).toBe(0);
+    expect(runtime.listenerCount("SIGTERM")).toBe(0);
+    expect(runtime.listenerCount("SIGHUP")).toBe(0);
+    expect(runtime.exitCode).toBe(1);
+    expect(stderr).toEqual([`${BLOCKED_USER_AUTH}\n`]);
   });
 
   it("rejects missing and symlinked executable delivery paths", () => {

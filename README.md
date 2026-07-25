@@ -39,6 +39,12 @@ App Secret 仍只在 macOS Keychain 的安全提示中输入。
 核验为飞书账户站点后直接调用固定 macOS opener。总裁无需复制授权链接或设备码，只需在
 浏览器点击授权；CLI 输出、授权站点、GUI、opener、临时 cache 归属或完成回执任一不可信时，
 安装器都会固定报 `BLOCKED_USER_AUTH`，不回显临时授权数据，也不降级为手工复制。
+授权 helper 会用原子独占目录协调自身并发，并且只在 CLI scope-cache 基线为空时启动；若发现
+已有 entry 或既有锁，会在调用 CLI 前停止并保持原字节不变，交由人工核查。异常 no-wait
+只会在持有自身锁时清理唯一、权限和内容都严格匹配的新 entry；多项、符号链接、权限/内容
+异常、增长或替换一律不删。该模型用于协调合作的 helper 实例，不宣称抵抗恶意同 UID writer；
+Node 没有 `unlinkat`，因此清理虽在删除前复核 fd/path/目录/锁身份，仍不宣称具备对抗同 UID
+路径竞态的 inode-bound 删除保证。
 如果配对码过期或遗失，重新运行 `./scripts/install --apply` 会在尚未配对时安全刷新新码。
 
 `visual-first-ppt` 会从锁定的 `v0.3.0` 中只安装实际 Skill 子目录并核验子树。
@@ -61,9 +67,10 @@ doctor 还会在不读取 App Secret、Bot/User Token 或调用写接口的前�
 doctor 只给出固定失败分类，不回显子进程内容。
 当前交付回归还验证网络 helper 或用户授权 helper 缺失、非普通文件或符号链接时，
 `--verify-only` 会在写入前停止。用户授权 helper 的本地受控 seam 已覆盖严格 JSON/UTF-8/输出
-上限、完整授权路径与查询、固定 opener 参数、6 项权限差额、CLI 临时 cache 归属与清理、异常/
-信号中止及完成后 `auth status --verify` 与 `auth check` 复核；`--plan`、`--verify-only` 与
-doctor 测试模式均不会调用浏览器 opener。
+上限、原始授权串的 authority/Unicode/parser-confusion 拒绝、固定 opener 参数、6 项权限差额、
+独占 flow lock、空 cache 基线、有界 fd 读取与保守清理、child `close` 结算边界、SIGINT/SIGTERM/
+SIGHUP 中止，以及完成后 `auth status --verify` 与 `auth check` 复核；`--plan`、`--verify-only`
+与 doctor 测试模式均不会调用浏览器 opener。
 该 doctor 回归使用最小合法配置运行正常 JSON 检查路径，而不是帮助参数的早退路径。
 
 也可以直接把下面这句话交给 Codex：

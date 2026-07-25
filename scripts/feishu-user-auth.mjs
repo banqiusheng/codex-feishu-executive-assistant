@@ -1,14 +1,17 @@
 import { Buffer } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   constants as fsConstants,
   fstatSync,
   lstatSync,
+  mkdirSync,
   openSync,
-  readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
+  rmdirSync,
   unlinkSync,
 } from "node:fs";
 import process from "node:process";
@@ -71,7 +74,7 @@ function hasLoneSurrogate(value) {
     const code = value.charCodeAt(index);
     if (code >= 0xd800 && code <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
-      if (next < 0xdc00 || next > 0xdfff) return true;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
       index += 1;
     } else if (code >= 0xdc00 && code <= 0xdfff) {
       return true;
@@ -319,7 +322,17 @@ function validateAuthorizationUrl(rawUrl) {
     typeof rawUrl !== "string" ||
     rawUrl.length < 1 ||
     rawUrl.length > MAX_AUTH_URL_CHARS ||
-    hasForbiddenAscii(rawUrl, true)
+    rawUrl.includes("\\") ||
+    rawUrl.includes("#") ||
+    hasLoneSurrogate(rawUrl) ||
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}\p{White_Space}]/u.test(rawUrl)
+  ) {
+    throw authOutputInvalid();
+  }
+  const authoritySuccessor = rawUrl.slice(AUTHORIZATION_ORIGIN.length)[0] ?? "";
+  if (
+    !rawUrl.startsWith(AUTHORIZATION_ORIGIN) ||
+    !["", "/", "?"].includes(authoritySuccessor)
   ) {
     throw authOutputInvalid();
   }
@@ -333,7 +346,7 @@ function validateAuthorizationUrl(rawUrl) {
     parsed.protocol !== "https:" ||
     parsed.origin !== AUTHORIZATION_ORIGIN ||
     parsed.hostname !== "accounts.feishu.cn" ||
-    (parsed.port !== "" && parsed.port !== "443") ||
+    parsed.port !== "" ||
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.hash !== ""
@@ -528,42 +541,246 @@ function cacheDirectoryPath(larkHome) {
   return join(resolve(larkHome), ".lark-cli", "cache", "auth_login_scopes");
 }
 
-function baselineCacheNames(larkHome) {
-  const directory = cacheDirectoryPath(larkHome);
+function flowLockPath(larkHome) {
+  return join(
+    resolve(larkHome),
+    ".lark-cli",
+    "cache",
+    "executive-assistant-user-auth.lock",
+  );
+}
+
+function sameIdentity(left, right) {
+  return (
+    left.dev === right.dev && left.ino === right.ino && left.uid === right.uid
+  );
+}
+
+function ensureCanonicalOwnedDirectory(path) {
   try {
-    lstatSync(directory);
+    mkdirSync(path, { mode: 0o700 });
   } catch (error) {
-    if (isMissing(error)) return Object.freeze(new Set());
-    throw authOutputInvalid();
-  }
-  try {
-    if (!validatePrivateDirectory(directory)) throw authOutputInvalid();
-    const names = readdirSync(directory, { encoding: "utf8" });
     if (
-      names.some(
-        (name) =>
-          typeof name !== "string" ||
-          name.length < 1 ||
-          name.includes("/") ||
-          name.includes("\0"),
-      )
+      error === null ||
+      typeof error !== "object" ||
+      !Object.hasOwn(error, "code") ||
+      error.code !== "EEXIST"
     ) {
       throw authOutputInvalid();
     }
-    return Object.freeze(new Set(names));
+  }
+  try {
+    const stat = lstatSync(path);
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      stat.uid !== currentUid() ||
+      (modeOf(stat) & 0o022) !== 0 ||
+      realpathSync(path) !== resolve(path)
+    ) {
+      throw authOutputInvalid();
+    }
   } catch {
     throw authOutputInvalid();
   }
 }
 
-function verifyOwnedCache(larkHome, deviceCode, requestedScope, baselineNames) {
-  const path = authorizationCachePath(larkHome, deviceCode);
-  const name = path.slice(path.lastIndexOf("/") + 1);
-  if (baselineNames.has(name)) throw authOutputInvalid();
-  const directory = cacheDirectoryPath(larkHome);
-  if (!validatePrivateDirectory(directory)) throw authOutputInvalid();
+function acquireFlowLock(larkHome) {
+  let created = null;
+  try {
+    const larkRoot = join(resolve(larkHome), ".lark-cli");
+    ensureCanonicalOwnedDirectory(larkRoot);
+    const parent = join(larkRoot, "cache");
+    ensureCanonicalOwnedDirectory(parent);
+    const path = flowLockPath(larkHome);
+    mkdirSync(path, { mode: 0o700 });
+    const initial = lstatSync(path);
+    if (
+      !initial.isDirectory() ||
+      initial.isSymbolicLink() ||
+      initial.uid !== currentUid() ||
+      realpathSync(path) !== resolve(path)
+    ) {
+      throw authOutputInvalid();
+    }
+    created = Object.freeze({
+      path,
+      dev: initial.dev,
+      ino: initial.ino,
+      uid: initial.uid,
+    });
+    chmodSync(path, 0o700);
+    const stat = lstatSync(path);
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      !sameIdentity(stat, created) ||
+      modeOf(stat) !== 0o700 ||
+      realpathSync(path) !== resolve(path)
+    ) {
+      throw authOutputInvalid();
+    }
+    return Object.freeze({
+      path,
+      dev: stat.dev,
+      ino: stat.ino,
+      uid: stat.uid,
+    });
+  } catch {
+    if (created !== null) {
+      try {
+        const current = lstatSync(created.path);
+        if (
+          current.isDirectory() &&
+          !current.isSymbolicLink() &&
+          sameIdentity(current, created) &&
+          readdirSync(created.path, { encoding: "utf8" }).length === 0
+        ) {
+          rmdirSync(created.path);
+        }
+      } catch {
+        // Ownership or cleanup could not be confirmed; leave the path untouched.
+      }
+    }
+    throw authOutputInvalid();
+  }
+}
+
+function flowLockIsOwned(evidence) {
+  try {
+    const stat = lstatSync(evidence.path);
+    return (
+      stat.isDirectory() &&
+      !stat.isSymbolicLink() &&
+      sameIdentity(stat, evidence) &&
+      modeOf(stat) === 0o700 &&
+      realpathSync(evidence.path) === resolve(evidence.path)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function releaseFlowLock(evidence) {
+  try {
+    if (!flowLockIsOwned(evidence)) return false;
+    if (readdirSync(evidence.path, { encoding: "utf8" }).length !== 0) {
+      return false;
+    }
+    if (!flowLockIsOwned(evidence)) return false;
+    rmdirSync(evidence.path);
+    try {
+      lstatSync(evidence.path);
+      return false;
+    } catch (error) {
+      return isMissing(error);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function prepareEmptyCacheDirectory(larkHome, flowLock) {
+  if (!flowLockIsOwned(flowLock)) throw authOutputInvalid();
+  const path = cacheDirectoryPath(larkHome);
+  let existed = true;
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if (!isMissing(error)) throw authOutputInvalid();
+    existed = false;
+  }
+  if (!existed) {
+    try {
+      mkdirSync(path, { recursive: true, mode: 0o700 });
+      chmodSync(path, 0o700);
+    } catch {
+      throw authOutputInvalid();
+    }
+  }
+  try {
+    const stat = lstatSync(path);
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      stat.uid !== currentUid() ||
+      modeOf(stat) !== 0o700 ||
+      realpathSync(path) !== resolve(path) ||
+      readdirSync(path, { encoding: "utf8" }).length !== 0 ||
+      !flowLockIsOwned(flowLock)
+    ) {
+      throw authOutputInvalid();
+    }
+    return Object.freeze({
+      path,
+      dev: stat.dev,
+      ino: stat.ino,
+      uid: stat.uid,
+    });
+  } catch {
+    throw authOutputInvalid();
+  }
+}
+
+function cacheDirectoryIsOwned(evidence, flowLock) {
+  try {
+    if (!flowLockIsOwned(flowLock)) return false;
+    const stat = lstatSync(evidence.path);
+    return (
+      stat.isDirectory() &&
+      !stat.isSymbolicLink() &&
+      sameIdentity(stat, evidence) &&
+      modeOf(stat) === 0o700 &&
+      realpathSync(evidence.path) === resolve(evidence.path)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function readBoundedStableDescriptor(descriptor, expectedIdentity) {
+  const before = fstatSync(descriptor);
+  if (
+    !before.isFile() ||
+    !sameIdentity(before, expectedIdentity) ||
+    before.size < 1 ||
+    before.size > MAX_CACHE_BYTES ||
+    modeOf(before) !== 0o600
+  ) {
+    throw authOutputInvalid();
+  }
+  const bytes = Buffer.alloc(MAX_CACHE_BYTES + 1);
+  let offset = 0;
+  for (;;) {
+    const read = readSync(
+      descriptor,
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      null,
+    );
+    if (read === 0) break;
+    offset += read;
+    if (offset > MAX_CACHE_BYTES) throw authOutputInvalid();
+  }
+  const after = fstatSync(descriptor);
+  if (
+    !sameIdentity(after, before) ||
+    after.size !== before.size ||
+    after.size !== offset ||
+    modeOf(after) !== 0o600
+  ) {
+    throw authOutputInvalid();
+  }
+  return bytes.subarray(0, offset);
+}
+
+function inspectCacheFile(path, requestedScope, cacheDirectory, flowLock) {
   let descriptor;
   try {
+    if (!cacheDirectoryIsOwned(cacheDirectory, flowLock)) {
+      throw authOutputInvalid();
+    }
     const before = lstatSync(path);
     if (
       !before.isFile() ||
@@ -577,31 +794,31 @@ function verifyOwnedCache(larkHome, deviceCode, requestedScope, baselineNames) {
       throw authOutputInvalid();
     }
     descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const opened = fstatSync(descriptor);
-    if (
-      !opened.isFile() ||
-      opened.dev !== before.dev ||
-      opened.ino !== before.ino ||
-      opened.uid !== currentUid() ||
-      modeOf(opened) !== 0o600 ||
-      opened.size < 1 ||
-      opened.size > MAX_CACHE_BYTES
-    ) {
+    const content = readBoundedStableDescriptor(descriptor, before);
+    const value = parseStrictInput(content, MAX_CACHE_BYTES);
+    const snapshot = exactOwnData(value, CACHE_KEYS);
+    if (snapshot === null || snapshot.requested_scope !== requestedScope) {
       throw authOutputInvalid();
     }
-    const cacheValue = parseStrictInput(
-      readFileSync(descriptor),
-      MAX_CACHE_BYTES,
-    );
-    const snapshot = exactOwnData(cacheValue, CACHE_KEYS);
-    if (snapshot === null || snapshot.requested_scope !== requestedScope) {
+    const finalPath = lstatSync(path);
+    if (
+      !sameIdentity(finalPath, before) ||
+      !finalPath.isFile() ||
+      finalPath.isSymbolicLink() ||
+      finalPath.size !== before.size ||
+      modeOf(finalPath) !== 0o600 ||
+      !cacheDirectoryIsOwned(cacheDirectory, flowLock)
+    ) {
       throw authOutputInvalid();
     }
     return Object.freeze({
       path,
-      dev: opened.dev,
-      ino: opened.ino,
+      dev: before.dev,
+      ino: before.ino,
+      uid: before.uid,
+      size: before.size,
       requestedScope,
+      cacheDirectory,
     });
   } catch {
     throw authOutputInvalid();
@@ -610,17 +827,32 @@ function verifyOwnedCache(larkHome, deviceCode, requestedScope, baselineNames) {
   }
 }
 
-function cleanupOwnedCache(evidence) {
+function verifyOwnedCache(
+  larkHome,
+  deviceCode,
+  requestedScope,
+  cacheDirectory,
+  flowLock,
+) {
+  return inspectCacheFile(
+    authorizationCachePath(larkHome, deviceCode),
+    requestedScope,
+    cacheDirectory,
+    flowLock,
+  );
+}
+
+function cleanupOwnedCache(evidence, flowLock) {
   let descriptor;
   try {
+    if (!cacheDirectoryIsOwned(evidence.cacheDirectory, flowLock)) return false;
     const before = lstatSync(evidence.path);
     if (
       !before.isFile() ||
       before.isSymbolicLink() ||
-      before.uid !== currentUid() ||
+      !sameIdentity(before, evidence) ||
+      before.size !== evidence.size ||
       modeOf(before) !== 0o600 ||
-      before.dev !== evidence.dev ||
-      before.ino !== evidence.ino ||
       realpathSync(evidence.path) !== resolve(evidence.path)
     ) {
       return false;
@@ -629,20 +861,21 @@ function cleanupOwnedCache(evidence) {
       evidence.path,
       fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
     );
-    const opened = fstatSync(descriptor);
-    if (
-      opened.dev !== evidence.dev ||
-      opened.ino !== evidence.ino ||
-      opened.uid !== currentUid() ||
-      modeOf(opened) !== 0o600
-    ) {
-      return false;
-    }
-    const value = parseStrictInput(readFileSync(descriptor), MAX_CACHE_BYTES);
+    const content = readBoundedStableDescriptor(descriptor, evidence);
+    const value = parseStrictInput(content, MAX_CACHE_BYTES);
     const snapshot = exactOwnData(value, CACHE_KEYS);
     if (
       snapshot === null ||
       snapshot.requested_scope !== evidence.requestedScope
+    ) {
+      return false;
+    }
+    const finalPath = lstatSync(evidence.path);
+    if (
+      !sameIdentity(finalPath, evidence) ||
+      finalPath.size !== evidence.size ||
+      modeOf(finalPath) !== 0o600 ||
+      !cacheDirectoryIsOwned(evidence.cacheDirectory, flowLock)
     ) {
       return false;
     }
@@ -657,6 +890,34 @@ function cleanupOwnedCache(evidence) {
     return isMissing(error);
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function reconcileUnknownNoWaitCache(cacheDirectory, requestedScope, flowLock) {
+  try {
+    if (!cacheDirectoryIsOwned(cacheDirectory, flowLock)) return false;
+    const names = readdirSync(cacheDirectory.path, { encoding: "utf8" });
+    if (names.length === 0) {
+      return cacheDirectoryIsOwned(cacheDirectory, flowLock);
+    }
+    if (
+      names.length !== 1 ||
+      typeof names[0] !== "string" ||
+      names[0].length < 1 ||
+      names[0].includes("/") ||
+      names[0].includes("\0")
+    ) {
+      return false;
+    }
+    const evidence = inspectCacheFile(
+      join(cacheDirectory.path, names[0]),
+      requestedScope,
+      cacheDirectory,
+      flowLock,
+    );
+    return cleanupOwnedCache(evidence, flowLock);
+  } catch {
+    return false;
   }
 }
 
@@ -702,6 +963,7 @@ export function createBoundedCommandRunner(spawnImplementation = spawn) {
       let settled = false;
       let forcedFailure = false;
       let child;
+      let childCreated = false;
       const signal = request.abortSignal;
       const onAbort = () => killAndWaitForClose();
       const settle = (status) => {
@@ -751,6 +1013,11 @@ export function createBoundedCommandRunner(spawnImplementation = spawn) {
           shell: false,
           stdio: ["ignore", "pipe", "pipe"],
         });
+        childCreated = true;
+        child.once("close", settle);
+        child.once("error", killAndWaitForClose);
+        child.stdout.on("error", killAndWaitForClose);
+        child.stderr.on("error", killAndWaitForClose);
         const collect = (chunks, kind) => (chunk) => {
           if (settled || forcedFailure) return;
           const buffer = Buffer.from(chunk);
@@ -771,16 +1038,15 @@ export function createBoundedCommandRunner(spawnImplementation = spawn) {
         };
         child.stdout.on("data", collect(stdout, "stdout"));
         child.stderr.on("data", collect(stderr, "stderr"));
-        child.once("error", () => {
-          forcedFailure = true;
-          settle(1);
-        });
-        child.once("close", settle);
         signal?.addEventListener?.("abort", onAbort, { once: true });
         if (signal?.aborted === true) onAbort();
       } catch {
-        forcedFailure = true;
-        settle(1);
+        if (childCreated) {
+          killAndWaitForClose();
+        } else {
+          forcedFailure = true;
+          settle(1);
+        }
       }
     });
 }
@@ -873,7 +1139,11 @@ export async function runFeishuUserAuth(
   input,
   dependencies = PRODUCTION_DEPENDENCIES,
 ) {
+  let flowLock = null;
+  let cacheDirectory = null;
   let ownedCache = null;
+  let noWaitAttempted = false;
+  let requestedScope = "";
   let outcome = BLOCKED_USER_AUTH;
   try {
     const request = validatedRequest(input);
@@ -885,14 +1155,16 @@ export async function runFeishuUserAuth(
     ) {
       throw authOutputInvalid();
     }
-    const baselineNames = baselineCacheNames(request.larkHome);
-    const requestedScope = request.missingScopes.join(" ");
+    flowLock = acquireFlowLock(request.larkHome);
+    cacheDirectory = prepareEmptyCacheDirectory(request.larkHome, flowLock);
+    requestedScope = request.missingScopes.join(" ");
     const cliEnvironment = Object.freeze({
       HOME: request.larkHome,
       PATH: MINIMAL_CLI_PATH,
       LANG: "C",
       LC_ALL: "C",
     });
+    noWaitAttempted = true;
     const noWaitResult = decodeProcessStreams(
       await injected.runCommand(
         Object.freeze({
@@ -920,7 +1192,8 @@ export async function runFeishuUserAuth(
       request.larkHome,
       noWait.deviceCode,
       requestedScope,
-      baselineNames,
+      cacheDirectory,
+      flowLock,
     );
     validateAuthorizationUrl(noWait.verificationUrl);
     if ((await injected.hasGuiSession()) !== true) throw authOutputInvalid();
@@ -970,22 +1243,36 @@ export async function runFeishuUserAuth(
   } catch {
     outcome = BLOCKED_USER_AUTH;
   } finally {
-    if (ownedCache !== null && !cleanupOwnedCache(ownedCache)) {
+    if (flowLock !== null && cacheDirectory !== null) {
+      if (
+        ownedCache !== null
+          ? !cleanupOwnedCache(ownedCache, flowLock)
+          : noWaitAttempted &&
+            !reconcileUnknownNoWaitCache(
+              cacheDirectory,
+              requestedScope,
+              flowLock,
+            )
+      ) {
+        outcome = BLOCKED_USER_AUTH;
+      }
+    }
+    if (flowLock !== null && !releaseFlowLock(flowLock)) {
       outcome = BLOCKED_USER_AUTH;
     }
   }
   return outcome;
 }
 
-async function main() {
-  const [larkCliPath, larkHome, ...missingScopes] = process.argv.slice(2);
+export async function runFeishuUserAuthMain({ argv, processLike, authorize }) {
+  const [larkCliPath, larkHome, ...missingScopes] = argv;
   const controller = new globalThis.AbortController();
   const abort = () => controller.abort();
-  process.once("SIGINT", abort);
-  process.once("SIGTERM", abort);
-  let result;
+  const signals = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
+  for (const signal of signals) processLike.on(signal, abort);
+  let result = BLOCKED_USER_AUTH;
   try {
-    result = await runFeishuUserAuth(
+    result = await authorize(
       {
         larkCliPath,
         larkHome,
@@ -996,16 +1283,21 @@ async function main() {
         abortSignal: controller.signal,
       }),
     );
+  } catch {
+    result = BLOCKED_USER_AUTH;
   } finally {
-    process.removeListener("SIGINT", abort);
-    process.removeListener("SIGTERM", abort);
+    for (const signal of signals) processLike.removeListener(signal, abort);
   }
   if (result !== USER_AUTH_COMPLETE) {
-    process.stderr.write(`${BLOCKED_USER_AUTH}\n`);
-    process.exitCode = 1;
+    processLike.stderr.write(`${BLOCKED_USER_AUTH}\n`);
+    processLike.exitCode = 1;
   }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  await main();
+  await runFeishuUserAuthMain({
+    argv: process.argv.slice(2),
+    processLike: process,
+    authorize: runFeishuUserAuth,
+  });
 }
