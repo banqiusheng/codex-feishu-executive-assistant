@@ -13,6 +13,7 @@ readonly PLIST_TEMPLATE="${REPOSITORY_ROOT}/launchd/com.codex-feishu.executive-a
 readonly EXECUTIVE_SKILL_SOURCE="${REPOSITORY_ROOT}/skills/executive-assistant"
 readonly PPT_LICENSE_NOTICE="${REPOSITORY_ROOT}/LICENSES/visual-first-ppt-MIT.txt"
 readonly INSTALL_SUPPORT="${REPOSITORY_ROOT}/scripts/install-support.mjs"
+readonly FEISHU_NETWORK_DOCTOR="${REPOSITORY_ROOT}/scripts/doctor-feishu-network.mjs"
 readonly LAUNCHD_LABEL="com.codex-feishu.executive-assistant"
 readonly KEYCHAIN_SERVICE="com.codex-feishu-executive-assistant.bot"
 
@@ -105,6 +106,8 @@ done
   die "visual-first-ppt 许可证声明缺失或不是可信普通文件。"
 [[ -f "${INSTALL_SUPPORT}" && ! -L "${INSTALL_SUPPORT}" ]] ||
   die "安装器兼容性支持脚本缺失或不是可信普通文件。"
+[[ -f "${FEISHU_NETWORK_DOCTOR}" && ! -L "${FEISHU_NETWORK_DOCTOR}" ]] ||
+  die "飞书网络 doctor helper 缺失或不是可信普通文件。"
 
 typeset node_executable="${commands[node]:-}"
 [[ -n "${node_executable}" ]] || die "未找到 Node.js 20 或更高版本。"

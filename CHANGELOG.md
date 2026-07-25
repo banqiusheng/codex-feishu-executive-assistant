@@ -6,7 +6,8 @@
 
 ### Added
 
-- 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；doctor、OAuth、完整门禁、公开 push 和真实飞书回放仍待完成。
+- 新增无凭据飞书网络 doctor：以配置中的 Node 绝对路径和固定三键子环境执行固定 DNS 与 HTTPS `HEAD` 探测，分别报告 `feishu-dns` 和 `feishu-https-rest`；任意 HTTP 状态只代表网络可达，不代表权限、业务 API 成功、配对或 24 小时就绪。子进程异常、超时、超量/非 UTF-8/畸形/重复键输出及未知字段均按固定分类 fail closed，安装器同时拒绝缺失、符号链接或非普通 helper 文件。
+- 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；OAuth、完整门禁、公开 push 和真实飞书回放仍待完成。
 - 新增校验和迁移的任务 ACK 账本，将数据库任务 claim 收紧为只允许持久 `ACKNOWLEDGED` 行，并接通单次新消息的发送、私有 marker、数据库 ACK、worker wake 与启动对账；本安全切片不代表 DNS retry、doctor、OAuth、marker v2 或真实 E2E 已完成。
 - 规格确认后新增 ACK 安全恢复与零复制授权的可执行实现计划：按持久 ACK 门禁、单 FIFO 协调器、无凭据网络 doctor、浏览器直接授权、全量门禁与公开 `main` 推送五个切片推进，并固定每个切片先红测、独立复核和不泄露临时授权数据的要求。
 - 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim，并要求安装器从锁定 CLI 的结构化输出取得授权地址后直接调用 macOS 浏览器。

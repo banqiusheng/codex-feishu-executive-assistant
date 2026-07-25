@@ -49,6 +49,10 @@ App Secret 仍只在 macOS Keychain 的安全提示中输入。
 的 `PATH`；只读 doctor 也用相同的精简环境核验 Codex 登录和插件入口，避免出现
 “doctor 正常、真实消息任务却无法启动”的误报。重复安装会原子刷新已漂移的 Node/Codex
 绝对路径；当前版本只支持安装器验证通过的 Node.js 脚本入口，未知或原生入口会明确停止。
+doctor 还会在不读取 App Secret、Bot/User Token 或调用写接口的前提下报告 `feishu-dns` 与
+`feishu-https-rest`：前者只检查固定飞书域名能否解析，后者只检查固定 HTTPS `HEAD` 请求
+能否到达（任意 HTTP 状态都表示网络可达）。这两项只证明网络连通性，不代表飞书权限、API
+业务调用成功、配对完成或 24 小时可用；安装器也会核验该 helper 是普通非符号链接交付文件。
 
 也可以直接把下面这句话交给 Codex：
 
@@ -70,7 +74,7 @@ App Secret 仍只在 macOS Keychain 的安全提示中输入。
 
 本仓库提供格式、静态检查、类型检查、构建、全量测试、供应链离线回放、安装合同和密钥扫描门禁。公开仓库的 `main` 分支 push 与 Pull Request 会在 macOS GitHub Actions 中重新运行这些检查。
 
-ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认。持久数据库 ACK 门禁、专用一次性 raw reply、静默 SDK logger、单 FIFO 协调器、仅 `ENOTFOUND` / `EAI_AGAIN` 的可恢复退避、严格 task-bound marker v2、数据库 finalization 不确定性执行屏障、worker/coordinator 进度握手、重复事件原路由恢复，以及启动前 marker/账本 truth table 已在本地 seam 测试实现。网络 doctor、OAuth 浏览器自动打开、完整仓库门禁、公开 push 和真实飞书回放仍待完成。
+ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认。持久数据库 ACK 门禁、专用一次性 raw reply、静默 SDK logger、单 FIFO 协调器、仅 `ENOTFOUND` / `EAI_AGAIN` 的可恢复退避、严格 task-bound marker v2、数据库 finalization 不确定性执行屏障、worker/coordinator 进度握手、重复事件原路由恢复、启动前 marker/账本 truth table，以及无凭据 DNS/HTTPS 网络 doctor 已在本地 seam 测试实现。OAuth 浏览器自动打开、完整仓库门禁、公开 push 和真实飞书回放仍待完成。
 
 真实飞书收发、妙记、日程、通知、PPT 文件回传、Keychain 静默读取、用户授权续期和 LaunchAgent 异常拉起，仍必须在客户 Mac mini 与目标飞书租户中逐项验收。连续 24 小时实机测试通过前，不应把本候选版标记为 `production ready`。
 

@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -23,6 +24,11 @@ const installSupportPath = join(
   "install-support.mjs",
 );
 const doctorPath = join(repositoryRoot, "scripts/doctor");
+const feishuNetworkDoctorPath = join(
+  repositoryRoot,
+  "scripts",
+  "doctor-feishu-network.mjs",
+);
 const restartPath = join(repositoryRoot, "scripts/restart");
 const temporaryRoots: string[] = [];
 
@@ -72,6 +78,12 @@ describe("lean delivery surface", () => {
     expect(result.stdout).toContain("仓库交付面校验通过");
     expect(() => statSync(join(home, "PresidentAssistant"))).toThrow();
     expect(() => statSync(join(home, "Library", "LaunchAgents"))).toThrow();
+  });
+
+  it("delivers the Feishu network doctor helper as a regular non-symlink file", () => {
+    const stat = lstatSync(feishuNetworkDoctorPath);
+    expect(stat.isFile()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
   });
 
   it("blocks apply mode before any Keychain launchctl build or directory side effect in tests", () => {
@@ -271,6 +283,7 @@ process.exit(64);
 
     const result = runZsh(doctorPath, ["--json", "--config", configPath], {
       HOME: home,
+      ASSISTANT_TEST_MODE: "1",
       DOCTOR_AMBIENT_SENTINEL: "must-not-reach-codex",
     });
     const report = JSON.parse(result.stdout) as {

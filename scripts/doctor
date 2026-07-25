@@ -10,12 +10,13 @@ if [[ -z "${node_executable}" ]]; then
 fi
 node_executable="${node_executable:A}"
 
-exec "${node_executable}" --input-type=module - "$@" <<'NODE'
+exec "${node_executable}" --input-type=module - "${0:A:h}/doctor-feishu-network.mjs" "$@" <<'NODE'
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const LABEL = "com.codex-feishu.executive-assistant";
 const KEYCHAIN_SERVICE = "com.codex-feishu-executive-assistant.bot";
@@ -57,9 +58,10 @@ function usage() {
   );
 }
 
+const helperPath = process.argv[2];
 let json = false;
 let configPath = path.join(os.homedir(), "PresidentAssistant", "runtime", "config", "assistant.json");
-const args = process.argv.slice(2);
+const args = process.argv.slice(3);
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
   if (arg === "--json") {
@@ -88,8 +90,9 @@ function add(id, status, detail) {
 
 function run(executable, argv, options = {}) {
   return spawnSync(executable, argv, {
-    encoding: "utf8",
+    encoding: options.encoding ?? "utf8",
     timeout: options.timeout ?? 15_000,
+    maxBuffer: options.maxBuffer ?? 1024 * 1024,
     env: options.env ?? process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -174,6 +177,7 @@ if (!path.isAbsolute(configPath)) {
 }
 
 const configuredNode = config?.executables?.node;
+let configuredNodeHealthy = false;
 if (typeof configuredNode !== "string" || !path.isAbsolute(configuredNode) || !isPlainFile(configuredNode)) {
   add("node", "FAIL", "配置中的 Node.js 绝对路径不可用。");
 } else {
@@ -184,8 +188,71 @@ if (typeof configuredNode !== "string" || !path.isAbsolute(configuredNode) || !i
     add("node", "FAIL", "Node.js 必须是受支持的 20 或更高偶数主版本。");
   } else {
     add("node", "PASS", `Node.js ${major} 可用。`);
+    configuredNodeHealthy = true;
   }
 }
+
+const feishuNetworkDetails = Object.freeze({
+  dns: Object.freeze({
+    PASS: "飞书 DNS 可达。",
+    DNS_UNAVAILABLE: "飞书 DNS 不可达。",
+  }),
+  httpsRest: Object.freeze({
+    PASS: "飞书 HTTPS/REST 可达。",
+    REST_UNREACHABLE: "飞书 HTTPS/REST 不可达。",
+  }),
+});
+let feishuNetworkReport = Object.freeze({
+  dns: "DNS_UNAVAILABLE",
+  httpsRest: "REST_UNREACHABLE",
+});
+if (
+  process.env.ASSISTANT_TEST_MODE !== "1" &&
+  configuredNodeHealthy &&
+  typeof helperPath === "string" &&
+  isPlainFile(helperPath)
+) {
+  try {
+    const networkDoctor = await import(pathToFileURL(helperPath).href);
+    const result = run(configuredNode, [helperPath], {
+      timeout: 5_000,
+      maxBuffer: 4_096,
+      encoding: "buffer",
+      env: {
+        PATH: MINIMAL_RUNTIME_PATH,
+        LANG: "C",
+        LC_ALL: "C",
+      },
+    });
+    if (
+      result.status !== 0 ||
+      result.signal !== null ||
+      result.error !== undefined ||
+      !Buffer.isBuffer(result.stdout) ||
+      result.stdout.byteLength > 4_096 ||
+      !Buffer.isBuffer(result.stderr) ||
+      result.stderr.byteLength !== 0
+    ) {
+      throw new Error("feishu_network_child_invalid");
+    }
+    feishuNetworkReport = networkDoctor.parseExactProbeReport(result.stdout);
+  } catch {
+    feishuNetworkReport = Object.freeze({
+      dns: "DNS_UNAVAILABLE",
+      httpsRest: "REST_UNREACHABLE",
+    });
+  }
+}
+add(
+  "feishu-dns",
+  feishuNetworkReport.dns === "PASS" ? "PASS" : "FAIL",
+  feishuNetworkDetails.dns[feishuNetworkReport.dns] ?? "飞书 DNS 不可达。",
+);
+add(
+  "feishu-https-rest",
+  feishuNetworkReport.httpsRest === "PASS" ? "PASS" : "FAIL",
+  feishuNetworkDetails.httpsRest[feishuNetworkReport.httpsRest] ?? "飞书 HTTPS/REST 不可达。",
+);
 
 const runtimeEntry = config?.executables?.runtimeEntry;
 if (typeof runtimeEntry === "string" && path.isAbsolute(runtimeEntry) && isPlainFile(runtimeEntry)) {
