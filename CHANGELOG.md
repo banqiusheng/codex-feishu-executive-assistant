@@ -6,8 +6,9 @@
 
 ### Added
 
+- 新增零复制飞书用户授权 helper：安装器只在 `--apply` 且 6 项 MVP 用户权限确有缺失时，消费锁定 CLI 的严格有界 JSON，核验完整飞书账户授权地址后以固定 `["--", url]` 参数直接调用 macOS opener。总裁只需在浏览器点击，不复制链接或设备码；helper 对 GUI、普通非符号链接可执行文件、权限差额、临时 cache 归属/权限/内容、完成回执和 child `close` 边界均 fail closed，异常或信号中止只清理本次确认拥有的 cache，并固定返回 `BLOCKED_USER_AUTH`。`--plan`、`--verify-only` 与 doctor 不打开浏览器；真实浏览器点击和目标租户验收仍待完成。
 - 新增无凭据飞书网络 doctor：以配置中的 Node 绝对路径和固定三键子环境执行固定 DNS 与 HTTPS `HEAD` 探测，分别报告 `feishu-dns` 和 `feishu-https-rest`；任意 HTTP 状态只代表网络可达，不代表权限、业务 API 成功、配对或 24 小时就绪。子进程异常、超时、超量/非 UTF-8/畸形/重复键输出及未知字段均按固定分类 fail closed，安装器同时拒绝缺失、符号链接或非普通 helper 文件。
-- 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；OAuth、完整门禁、公开 push 和真实飞书回放仍待完成。
+- 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；完整门禁、公开 push 和真实飞书回放仍待完成。
 - 新增校验和迁移的任务 ACK 账本，将数据库任务 claim 收紧为只允许持久 `ACKNOWLEDGED` 行，并接通单次新消息的发送、私有 marker、数据库 ACK、worker wake 与启动对账；本安全切片不代表 DNS retry、doctor、OAuth、marker v2 或真实 E2E 已完成。
 - 规格确认后新增 ACK 安全恢复与零复制授权的可执行实现计划：按持久 ACK 门禁、单 FIFO 协调器、无凭据网络 doctor、浏览器直接授权、全量门禁与公开 `main` 推送五个切片推进，并固定每个切片先红测、独立复核和不泄露临时授权数据的要求。
 - 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim，并要求安装器从锁定 CLI 的结构化输出取得授权地址后直接调用 macOS 浏览器。
@@ -15,7 +16,7 @@
 ### Fixed
 
 - 修复无凭据飞书网络 doctor 的两项边界：configured Node child 现在在五秒到期时使用不可忽略的强制终止，忽略普通终止信号也只返回固定失败分类；生产 HTTPS adapter 以单次结算处理 `information`、`upgrade` 与最终 response，100–599 任一状态均表示网络可达，后续 error 或重复事件不能改变结果。补齐 child 非零、超时、stderr、超量、畸形、非 UTF-8、重复/额外/未知字段的 fail-closed 回归。
-- 补齐网络 helper 交付与无 opener 行为回归：最小临时交付根在 helper 缺失或符号链接时会在 `--verify-only` 写入前固定停止；`--plan`、`--verify-only` 与 doctor 测试模式均通过 fake opener 调用日志验证为零调用。OAuth 的 apply-only opener 仍不在本轮实现范围内。
+- 补齐网络 helper 与用户授权 helper 的交付边界回归：最小临时交付根在任一 helper 缺失或符号链接时会在 `--verify-only` 写入前固定停止；`--plan`、`--verify-only` 与 doctor 测试模式均通过 fake opener 调用日志验证为零调用。
 - 将 doctor 无 opener 回归收紧为最小合法 config 的正常 `--json --config` 检查路径，断言可解析固定 JSON report 与实际 check id，再验证 fake opener 零调用；不再以 `--help` 参数早退作为行为证据。
 - 修复 ACK 协调器首轮复审发现的三处运行时安全缺口：内置 Lark channel 现在固定使用忽略全部参数的静默 SDK logger，避免默认 logger 输出请求主机、路径或消息标识；任何 ACK 数据库 finalization 返回空值或抛错都会在同一事件循环触发进程级执行屏障，worker 在每次 claim 和 runner 启动前复核屏障，commit 后抛错也不会让同进程的后一任务启动；worker drain 结束后会安全唤醒 ACK coordinator，使“重启头任务已由 marker 对账、后一任务尚未 ACK”的队列无需新入站消息也能继续推进。回归覆盖真实 SQLite 先提交后抛错、同进程禁止执行、重启按证据恢复，以及双任务重启队列进度。
 - 修复 ACK 数据库门禁落地后 runtime 仍只写文件 marker、未推进数据库 ACK，导致所有新任务收到接单回复却永远无法 claim 的回归；生产顺序现为 runtime 以当前 taskId 要求 store 在同一事务核对 FIFO 头并持久 `SENDING`、发送成功、耐久 marker、数据库 `ACKNOWLEDGED`、最后 wake，taskId 不匹配时零写入且不发送。全局单 `SENDING` 约束通过 append-only 迁移 004 修正，不改写已记录 checksum 的迁移 003；启动时通过受限 marker 文件校验逐项对账，冲突状态进入人工确认，未知发送/marker 结果不伪造成功且不启动 Codex。

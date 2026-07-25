@@ -14,6 +14,7 @@ readonly EXECUTIVE_SKILL_SOURCE="${REPOSITORY_ROOT}/skills/executive-assistant"
 readonly PPT_LICENSE_NOTICE="${REPOSITORY_ROOT}/LICENSES/visual-first-ppt-MIT.txt"
 readonly INSTALL_SUPPORT="${REPOSITORY_ROOT}/scripts/install-support.mjs"
 readonly FEISHU_NETWORK_DOCTOR="${REPOSITORY_ROOT}/scripts/doctor-feishu-network.mjs"
+readonly FEISHU_USER_AUTH="${REPOSITORY_ROOT}/scripts/feishu-user-auth.mjs"
 readonly LAUNCHD_LABEL="com.codex-feishu.executive-assistant"
 readonly KEYCHAIN_SERVICE="com.codex-feishu-executive-assistant.bot"
 
@@ -108,6 +109,8 @@ done
   die "安装器兼容性支持脚本缺失或不是可信普通文件。"
 [[ -f "${FEISHU_NETWORK_DOCTOR}" && ! -L "${FEISHU_NETWORK_DOCTOR}" ]] ||
   die "飞书网络 doctor helper 缺失或不是可信普通文件。"
+[[ -f "${FEISHU_USER_AUTH}" && ! -L "${FEISHU_USER_AUTH}" ]] ||
+  die "飞书用户授权 helper 缺失或不是可信普通文件。"
 
 typeset node_executable="${commands[node]:-}"
 [[ -n "${node_executable}" ]] || die "未找到 Node.js 20 或更高版本。"
@@ -235,7 +238,7 @@ print_plan() {
   note "安装 executive-assistant 和精确核验的 visual-first-ppt v0.3.0。"
   note "imagegen 只做真实可见性判断；无法用本机证据确认时保持 WARN。"
   note "App Secret 由 /usr/bin/security 自己安全提示，不进入 argv、环境或配置文件。"
-  note "初始化独立飞书 CLI 配置，并引导总裁完成日历、通讯录和妙记用户授权。"
+  note "初始化独立飞书 CLI 配置；缺少用户权限时自动打开可信飞书授权页。"
   note "生成一个用户级 RunAtLoad + KeepAlive LaunchAgent。"
   note "最后运行只读 doctor；真实飞书连接、配对和能力仍以 doctor/运行时结果为准。"
   print -r -- ""
@@ -910,13 +913,20 @@ lark_user_missing_scopes() {
       const missing = result?.missing == null ? [] : result.missing;
       if (
         !Array.isArray(missing) ||
+        new Set(missing).size !== missing.length ||
         missing.some(
           (scope) => typeof scope !== "string" || !required.has(scope),
         )
       ) {
         process.exit(2);
       }
-      process.stdout.write(missing.join("\n"));
+      const missingSet = new Set(missing);
+      process.stdout.write(
+        process.argv
+          .slice(1)
+          .filter((scope) => missingSet.has(scope))
+          .join("\n"),
+      );
     ' "${MVP_USER_SCOPES[@]}"
 }
 
@@ -929,7 +939,7 @@ if [[ "${user_identity_healthy}" == "yes" ]] && lark_user_scopes_are_healthy; th
   note "飞书用户授权仍然有效，复用现有授权。"
 else
   typeset -a missing_user_scopes=()
-  typeset requested_user_scope_arg="${mvp_user_scope_arg}"
+  typeset -a requested_user_scopes=("${MVP_USER_SCOPES[@]}")
   if [[ "${user_identity_healthy}" == "yes" ]]; then
     typeset missing_user_scope_output
     missing_user_scope_output="$(lark_user_missing_scopes)" ||
@@ -939,14 +949,15 @@ else
     fi
     (( ${#missing_user_scopes[@]} > 0 )) ||
       die "飞书用户授权状态异常，但没有可安全申请的缺失 MVP 权限。"
-    requested_user_scope_arg="${(j: :)missing_user_scopes}"
+    requested_user_scopes=("${missing_user_scopes[@]}")
   fi
   print -r -- ""
-  print -r -- "接下来会打开飞书授权页，仅请求当前缺失的 MVP 权限：${requested_user_scope_arg}"
-  HOME="${lark_home}" "${lark_cli_executable}" \
-    --profile "${lark_profile}" \
-    auth login --scope "${requested_user_scope_arg}" ||
-    die "飞书用户授权未完成。"
+  print -r -- "仅请求当前缺失的 MVP 用户权限：${(j: :)requested_user_scopes}"
+  "${node_executable}" "${FEISHU_USER_AUTH}" \
+    "${lark_cli_executable}" \
+    "${lark_home}" \
+    "${requested_user_scopes[@]}" ||
+    die "BLOCKED_USER_AUTH：请在这台 Mac 的可见终端重跑安装。"
 fi
 lark_user_auth_is_healthy && lark_user_scopes_are_healthy ||
   die "飞书用户授权健康检查或 6 项 MVP 权限检查未通过。"

@@ -32,6 +32,11 @@ const feishuNetworkDoctorPath = join(
   "scripts",
   "doctor-feishu-network.mjs",
 );
+const feishuUserAuthPath = join(
+  repositoryRoot,
+  "scripts",
+  "feishu-user-auth.mjs",
+);
 const restartPath = join(repositoryRoot, "scripts/restart");
 const temporaryRoots: string[] = [];
 
@@ -64,6 +69,7 @@ function copyMinimalInstallDelivery(root: string): string {
     "scripts/install",
     "scripts/install-support.mjs",
     "scripts/doctor-feishu-network.mjs",
+    "scripts/feishu-user-auth.mjs",
   ]) {
     cpSync(join(repositoryRoot, entry), join(root, entry), { recursive: true });
   }
@@ -105,6 +111,12 @@ describe("lean delivery surface", () => {
     expect(stat.isSymbolicLink()).toBe(false);
   });
 
+  it("delivers the Feishu user-auth helper as a regular non-symlink file", () => {
+    const stat = lstatSync(feishuUserAuthPath);
+    expect(stat.isFile()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
+  });
+
   it("rejects a missing or symlinked Feishu helper before verify-only can write installation state", () => {
     for (const mode of ["missing", "symlink"] as const) {
       const root = temporaryHome();
@@ -131,6 +143,35 @@ describe("lean delivery surface", () => {
       expect(result.status).not.toBe(0);
       expect(`${result.stdout}\n${result.stderr}`).toContain(
         "飞书网络 doctor helper 缺失或不是可信普通文件",
+      );
+      expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
+    }
+  });
+
+  it("rejects a missing or symlinked Feishu user-auth helper before verify-only", () => {
+    for (const mode of ["missing", "symlink"] as const) {
+      const root = temporaryHome();
+      const localInstall = copyMinimalInstallDelivery(root);
+      const helper = join(root, "scripts", "feishu-user-auth.mjs");
+      rmSync(helper);
+      if (mode === "symlink") {
+        symlinkSync(
+          join(repositoryRoot, "scripts", "feishu-user-auth.mjs"),
+          helper,
+        );
+      }
+      const result = spawnSync("/bin/zsh", [localInstall, "--verify-only"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          ASSISTANT_TEST_MODE: "1",
+        },
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "飞书用户授权 helper 缺失或不是可信普通文件",
       );
       expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
     }
@@ -224,6 +265,9 @@ describe("lean delivery surface", () => {
     expect(existsSync(logPath)).toBe(false);
     expect(readFileSync(installPath, "utf8")).not.toContain("/usr/bin/open");
     expect(readFileSync(doctorPath, "utf8")).not.toContain("/usr/bin/open");
+    expect(readFileSync(feishuUserAuthPath, "utf8")).toContain(
+      '"/usr/bin/open"',
+    );
   });
 
   it("blocks apply mode before any Keychain launchctl build or directory side effect in tests", () => {
@@ -671,7 +715,8 @@ process.exit(64);
     );
     expect(installer).toContain('if [[ -n "${missing_app_scope_output}" ]]');
     expect(installer).toContain('if [[ -n "${missing_user_scope_output}" ]]');
-    expect(installer).toContain("auth login --scope");
+    expect(installer).not.toContain("auth login --scope");
+    expect(installer).toContain('"${FEISHU_USER_AUTH}"');
     expect(doctor).toMatch(/"auth",\s*"status",\s*"--json",\s*"--verify"/);
     expect(doctor).toMatch(/"auth",\s*"check",\s*"--scope"/);
     expect(doctor).toMatch(/"auth",\s*"scopes",\s*"--json"/);

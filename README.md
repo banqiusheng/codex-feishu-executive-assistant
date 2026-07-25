@@ -35,6 +35,10 @@ cd codex-feishu-executive-assistant
 App Secret 仍只在 macOS Keychain 的安全提示中输入。
 安装程序会核验日历、通讯录和妙记所需的 6 项 MVP 用户权限；已有用户授权有效时，
 只增量申请当前缺失项，不会重复申请或扩大权限。
+只有 `--apply` 且确有缺失权限时，安装器才会从锁定 CLI 的严格结构化输出取得授权地址，
+核验为飞书账户站点后直接调用固定 macOS opener。总裁无需复制授权链接或设备码，只需在
+浏览器点击授权；CLI 输出、授权站点、GUI、opener、临时 cache 归属或完成回执任一不可信时，
+安装器都会固定报 `BLOCKED_USER_AUTH`，不回显临时授权数据，也不降级为手工复制。
 如果配对码过期或遗失，重新运行 `./scripts/install --apply` 会在尚未配对时安全刷新新码。
 
 `visual-first-ppt` 会从锁定的 `v0.3.0` 中只安装实际 Skill 子目录并核验子树。
@@ -55,8 +59,11 @@ doctor 还会在不读取 App Secret、Bot/User Token 或调用写接口的前�
 业务调用成功、配对完成或 24 小时可用；安装器也会核验该 helper 是普通非符号链接交付文件。
 网络 child 在五秒到期时会强制终止；其输出、stderr、退出状态与 JSON schema 任一不可信时，
 doctor 只给出固定失败分类，不回显子进程内容。
-当前交付回归还验证 helper 缺失或符号链接时 `--verify-only` 会在写入前停止，并验证 `--plan`、
-`--verify-only` 与 doctor 测试模式不会调用浏览器 opener；OAuth 的 apply-only 授权打开流程仍属后续范围。
+当前交付回归还验证网络 helper 或用户授权 helper 缺失、非普通文件或符号链接时，
+`--verify-only` 会在写入前停止。用户授权 helper 的本地受控 seam 已覆盖严格 JSON/UTF-8/输出
+上限、完整授权路径与查询、固定 opener 参数、6 项权限差额、CLI 临时 cache 归属与清理、异常/
+信号中止及完成后 `auth status --verify` 与 `auth check` 复核；`--plan`、`--verify-only` 与
+doctor 测试模式均不会调用浏览器 opener。
 该 doctor 回归使用最小合法配置运行正常 JSON 检查路径，而不是帮助参数的早退路径。
 
 也可以直接把下面这句话交给 Codex：
@@ -79,7 +86,7 @@ doctor 只给出固定失败分类，不回显子进程内容。
 
 本仓库提供格式、静态检查、类型检查、构建、全量测试、供应链离线回放、安装合同和密钥扫描门禁。公开仓库的 `main` 分支 push 与 Pull Request 会在 macOS GitHub Actions 中重新运行这些检查。
 
-ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认。持久数据库 ACK 门禁、专用一次性 raw reply、静默 SDK logger、单 FIFO 协调器、仅 `ENOTFOUND` / `EAI_AGAIN` 的可恢复退避、严格 task-bound marker v2、数据库 finalization 不确定性执行屏障、worker/coordinator 进度握手、重复事件原路由恢复、启动前 marker/账本 truth table，以及无凭据 DNS/HTTPS 网络 doctor 已在本地 seam 测试实现。OAuth 浏览器自动打开、完整仓库门禁、公开 push 和真实飞书回放仍待完成。
+ACK/DNS 安全恢复与授权页自动打开的[补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)及其[实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)已经完成规格确认。持久数据库 ACK 门禁、专用一次性 raw reply、静默 SDK logger、单 FIFO 协调器、仅 `ENOTFOUND` / `EAI_AGAIN` 的可恢复退避、严格 task-bound marker v2、数据库 finalization 不确定性执行屏障、worker/coordinator 进度握手、重复事件原路由恢复、启动前 marker/账本 truth table、无凭据 DNS/HTTPS 网络 doctor，以及零复制用户授权 helper 已在本地受控 seam 测试实现。完整仓库门禁、公开 push、真实浏览器点击和真实飞书回放仍待完成。
 
 真实飞书收发、妙记、日程、通知、PPT 文件回传、Keychain 静默读取、用户授权续期和 LaunchAgent 异常拉起，仍必须在客户 Mac mini 与目标飞书租户中逐项验收。连续 24 小时实机测试通过前，不应把本候选版标记为 `production ready`。
 

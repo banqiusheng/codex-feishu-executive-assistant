@@ -26,13 +26,13 @@
    `presentations@openai-primary-runtime` 到专用 `CODEX_HOME`，不猜测或复制插件缓存；
 7. 精确核验并安装 `visual-first-ppt v0.3.0`，不覆盖来源不一致的已有安装；
 8. 引导完成专用 Codex 登录，并把 Bot App Secret 通过 Keychain 自身的安全输入写入 macOS Keychain；
-9. 初始化机器人专用飞书 CLI，并由总裁本人完成日历、通讯录和妙记用户授权；
+9. 初始化机器人专用飞书 CLI；若 6 项 MVP 用户权限仍有缺失，安装器会直接打开经严格校验的飞书授权页，由总裁本人在浏览器点击授权；
 10. 生成不含任何 Secret 的运行配置；总裁发送正确的一次性私聊配对码后，程序从可信事件自动绑定企业标识；
 11. 注册一个用户级 LaunchAgent，使服务登录后自动启动、异常退出后自动拉起。
 
 `imagegen` 是 Codex 会话级系统能力，不会因为安装 Presentations 插件就自动出现在空的专用 Home。安装器不会复制系统 Skill 或伪造可用性；`doctor` 会保持 `WARN`，直到目标 Mac mini 的新 Codex 任务真实确认 `Presentations` 和 `imagegen` 都已暴露并完成一次 PPT 验收。
 
-用户授权不由 Bot Secret 代替。安装时会打开飞书授权页，由总裁本人授权日历、通讯录和妙记；授权不存在或失效时，`doctor` 会明确报错，不会假装这些能力可用。
+用户授权不由 Bot Secret 代替。安装器只在 `--apply` 且确有缺失权限时打开飞书授权页，总裁无需复制授权链接或设备码，只需在浏览器点击授权。授权 helper 会严格核验锁定 CLI 的结构化输出、授权站点、GUI、opener、临时 cache 归属和完成回执；任一步不可信都固定报 `BLOCKED_USER_AUTH`，不会回显临时授权数据或降级为手工复制。`--plan`、`--verify-only` 和 `doctor` 不会打开浏览器。授权不存在或失效时，`doctor` 会明确报错，不会假装这些能力可用。
 
 首次配置会显示一次性飞书配对码。总裁只需在机器人私聊中发送该码；任何群聊或其他人员都不能完成配对。
 

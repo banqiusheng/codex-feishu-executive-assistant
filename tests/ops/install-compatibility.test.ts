@@ -365,6 +365,20 @@ function reloadLaunchd(fixture: ReturnType<typeof prepareFakeLaunchctl>) {
 }
 
 describe("installer compatibility support", () => {
+  it("keeps browser authorization in the dedicated helper while final identity and scope checks remain in the installer", () => {
+    const installer = readFileSync(
+      join(repositoryRoot, "scripts", "install"),
+      "utf8",
+    );
+    expect(installer).toContain(
+      'readonly FEISHU_USER_AUTH="${REPOSITORY_ROOT}/scripts/feishu-user-auth.mjs"',
+    );
+    expect(installer).toContain('"${node_executable}" "${FEISHU_USER_AUTH}"');
+    expect(installer).toContain("auth status --json --verify");
+    expect(installer).toContain("auth check --scope");
+    expect(installer).not.toContain("auth login --scope");
+  });
+
   it("atomically refreshes stale configured Node and Codex paths without changing pairing or secret references", () => {
     const root = realpathSync(
       makeTemporaryRoot("assistant-runtime-executables."),
