@@ -88,6 +88,26 @@ function parseReceipt(value: unknown): InstallReceipt {
   });
 }
 
+function parseDesignatedRequirement(output: string): string {
+  const prefixes = ["designated => ", "# designated => "] as const;
+  let requirement: string | null = null;
+  for (const line of output.split("\n").map((entry) => entry.trim())) {
+    const prefix = prefixes.find((candidate) => line.startsWith(candidate));
+    if (!prefix) continue;
+    const candidate = line.slice(prefix.length);
+    if (
+      requirement !== null ||
+      candidate.length === 0 ||
+      candidate.includes("\0")
+    ) {
+      throw new Error("LARK_CLI_SIGNATURE_INVALID");
+    }
+    requirement = candidate;
+  }
+  if (requirement === null) throw new Error("LARK_CLI_SIGNATURE_INVALID");
+  return requirement;
+}
+
 async function codesignEvidence(executable: string): Promise<string> {
   const environment = Object.freeze({
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -106,12 +126,7 @@ async function codesignEvidence(executable: string): Promise<string> {
     timeout: 10_000,
     maxBuffer: 64 * 1024,
   });
-  const requirement = `${result.stdout}\n${result.stderr}`
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line.startsWith("designated => "));
-  if (!requirement) throw new Error("LARK_CLI_SIGNATURE_INVALID");
-  return requirement.slice("designated => ".length);
+  return parseDesignatedRequirement(`${result.stdout}\n${result.stderr}`);
 }
 
 export function createInstalledLarkCliRunnerFactory(

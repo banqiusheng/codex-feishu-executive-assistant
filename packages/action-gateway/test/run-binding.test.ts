@@ -275,6 +275,92 @@ describe("task-bound run sockets", () => {
     await closing;
   });
 
+  it("keeps serving after a client disconnects before a handler response", async () => {
+    const files = await fixture();
+    let markHandlerEntered: (() => void) | undefined;
+    let releaseHandler: (() => void) | undefined;
+    const handlerEntered = new Promise<void>((resolve) => {
+      markHandlerEntered = resolve;
+    });
+    const handlerBarrier = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    const handler = vi.fn(async () => {
+      markHandlerEntered?.();
+      await handlerBarrier;
+      return { state: "ready" };
+    });
+    const handle = await startRunServer({
+      socketPath: files.socketPath,
+      context: {
+        channel: "run",
+        taskId: files.taskId,
+        presidentOpenId: "ou_president",
+        presidentChatId: "oc_private",
+        capabilities: ["minutes.search"],
+      },
+      jobStore: fakeStore(files.taskId, files.workspace),
+      registry: createGatewayRouteRegistry([
+        {
+          channel: "run",
+          kind: "read",
+          capability: "minutes.search",
+          parsePayload: (value) => value,
+          handler,
+        },
+      ]),
+      waitUntilTaskActionsSafe: async () => undefined,
+    });
+    const originalCwd = process.cwd();
+    let socket;
+    try {
+      process.chdir(dirname(files.socketPath));
+      socket = createConnection(basename(files.socketPath));
+    } finally {
+      process.chdir(originalCwd);
+    }
+    socket.on("error", () => undefined);
+
+    try {
+      await once(socket, "connect");
+      socket.end(
+        encodeFrame({
+          version: 1,
+          requestId: randomUUID(),
+          kind: "read",
+          capability: "minutes.search",
+          payload: {},
+        }),
+      );
+      await handlerEntered;
+      const clientClosed = once(socket, "close");
+      socket.destroy();
+      await clientClosed;
+      releaseHandler?.();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const requestId = randomUUID();
+      await expect(
+        sendGatewayRequest(files.socketPath, {
+          version: 1,
+          requestId,
+          kind: "read",
+          capability: "minutes.search",
+          payload: {},
+        }),
+      ).resolves.toEqual({
+        version: 1,
+        requestId,
+        ok: true,
+        result: { state: "ready" },
+      });
+    } finally {
+      releaseHandler?.();
+      socket.destroy();
+      await handle.close();
+    }
+  });
+
   it("binds only the fixed gateway.sock name inside the task workspace", async () => {
     const files = await fixture();
     await expect(

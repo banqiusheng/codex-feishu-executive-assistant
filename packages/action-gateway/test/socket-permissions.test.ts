@@ -9,13 +9,16 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { once } from "node:events";
+import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createGatewayRouteRegistry } from "../src/ipc/schemas.js";
 import { startRunServer } from "../src/ipc/run-server.js";
+import { startLocalSocketServer } from "../src/ipc/socket-server.js";
 
 const roots: string[] = [];
 
@@ -211,5 +214,40 @@ describe("socket filesystem policy", () => {
       () => "rejected",
     );
     expect(outcome).toBe("rejected");
+  });
+
+  it("contains a connection-local EPIPE after its handler settles", async () => {
+    const fixture = await secureWorkspace();
+    let captureSocket: ((socket: Socket) => void) | undefined;
+    const acceptedSocket = new Promise<Socket>((resolve) => {
+      captureSocket = resolve;
+    });
+    const handle = await startLocalSocketServer({
+      socketPath: fixture.socketPath,
+      onConnection: async (socket) => {
+        captureSocket?.(socket);
+      },
+    });
+    const originalCwd = process.cwd();
+    let client;
+    try {
+      process.chdir(dirname(fixture.socketPath));
+      client = createConnection(basename(fixture.socketPath));
+    } finally {
+      process.chdir(originalCwd);
+    }
+    client.on("error", () => undefined);
+
+    try {
+      await once(client, "connect");
+      const socket = await acceptedSocket;
+      await Promise.resolve();
+      const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+
+      expect(() => socket.emit("error", epipe)).not.toThrow();
+    } finally {
+      client.destroy();
+      await handle.close();
+    }
   });
 });

@@ -1,6 +1,7 @@
 import Foundation
 
 private let rejectedResponse = #"{"ok":false,"error":"GATEWAY_CLIENT_REJECTED"}"#
+private let exchangeDeadlineMilliseconds: UInt64 = 180_000
 
 private func reject() -> Never {
   FileHandle.standardOutput.write(Data(rejectedResponse.utf8))
@@ -22,7 +23,11 @@ do {
   let requestData = try readBoundedStandardInput()
   let request = try parseStrictJSON(requestData)
   let requestId = try validateRunRequest(request)
-  let responseData = try exchangeFrame(socketPath: socketPath, request: requestData)
+  let responseData = try exchangeFrame(
+    socketPath: socketPath,
+    request: requestData,
+    deadlineMilliseconds: exchangeDeadlineMilliseconds
+  )
   let response = try parseStrictJSON(responseData)
   try validateRunResponse(response, requestID: requestId)
   FileHandle.standardOutput.write(responseData)

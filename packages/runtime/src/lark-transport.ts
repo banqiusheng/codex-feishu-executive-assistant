@@ -688,18 +688,23 @@ export function createBuiltInLarkTransport(
                   content: confirmationPreview(card),
                 },
                 {
-                  tag: "action",
-                  actions: [
+                  tag: "button",
+                  type: "primary",
+                  text: { tag: "plain_text", content: "确认执行" },
+                  behaviors: [
                     {
-                      tag: "button",
-                      type: "primary",
-                      text: { tag: "plain_text", content: "确认执行" },
+                      type: "callback",
                       value: { ...buttonValue, decision: "approve" },
                     },
+                  ],
+                },
+                {
+                  tag: "button",
+                  type: "default",
+                  text: { tag: "plain_text", content: "取消" },
+                  behaviors: [
                     {
-                      tag: "button",
-                      type: "default",
-                      text: { tag: "plain_text", content: "取消" },
+                      type: "callback",
                       value: { ...buttonValue, decision: "reject" },
                     },
                   ],

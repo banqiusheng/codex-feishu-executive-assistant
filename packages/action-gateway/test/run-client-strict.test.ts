@@ -23,6 +23,7 @@ const rejection = JSON.stringify({
 });
 
 let runClient = "";
+let deadlineTestClient = "";
 
 type Invocation = Readonly<{
   status: number | null;
@@ -46,6 +47,83 @@ function buildClient(sourceRoot = runClientRoot): string {
         LC_ALL: "C",
         PATH: "/usr/bin:/bin",
       },
+    },
+  );
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(existsSync(output)).toBe(true);
+  return output;
+}
+
+function buildDeadlineTestClient(deadlineMilliseconds: number): string {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "assistant-run-deadline-client-")),
+  );
+  const overlay = join(root, "swift-vfs-overlay.yaml");
+  const harness = join(root, "main.swift");
+  const output = join(root, "assistant-gateway-deadline-test");
+  writeFileSync(
+    overlay,
+    JSON.stringify({
+      version: 0,
+      "case-sensitive": "true",
+      roots: [
+        {
+          type: "file",
+          name: "/Library/Developer/CommandLineTools/usr/include/swift/bridging.modulemap",
+          "external-contents": "/dev/null",
+        },
+      ],
+    }),
+  );
+  writeFileSync(
+    harness,
+    String.raw`
+import Darwin
+import Foundation
+
+private let rejectedResponse = #"{"ok":false,"error":"GATEWAY_CLIENT_REJECTED"}"#
+
+private func reject() -> Never {
+  FileHandle.standardOutput.write(Data(rejectedResponse.utf8))
+  exit(2)
+}
+
+guard CommandLine.arguments.count == 1,
+  let socketPath = ProcessInfo.processInfo.environment["ASSISTANT_GATEWAY_SOCKET"]
+else {
+  reject()
+}
+
+do {
+  let requestData = try readBoundedStandardInput()
+  let responseData = try exchangeFrame(
+    socketPath: socketPath,
+    request: requestData,
+    deadlineMilliseconds: ${deadlineMilliseconds}
+  )
+  FileHandle.standardOutput.write(responseData)
+} catch {
+  reject()
+}
+
+exit(0)
+`,
+  );
+  const result = spawnSync(
+    "/usr/bin/xcrun",
+    [
+      "swiftc",
+      "-vfsoverlay",
+      overlay,
+      resolve(runClientRoot, "Framing.swift"),
+      harness,
+      "-o",
+      output,
+    ],
+    {
+      encoding: "utf8",
+      env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
     },
   );
 
@@ -86,9 +164,10 @@ async function invoke(
   socketPath: string,
   input: string | Buffer,
   timeoutMs = 5_000,
+  clientPath = runClient,
 ): Promise<Invocation> {
   return await new Promise((resolveInvocation, rejectInvocation) => {
-    const child = spawn(runClient, [], {
+    const child = spawn(clientPath, [], {
       env: { ASSISTANT_GATEWAY_SOCKET: socketPath },
     });
     let stdout = "";
@@ -182,6 +261,7 @@ describe("strict native public run client", () => {
     const sourceRoot = join(isolatedRoot, "run-client");
     cpSync(runClientRoot, sourceRoot, { recursive: true });
     runClient = buildClient(sourceRoot);
+    deadlineTestClient = buildDeadlineTestClient(1_000);
   });
 
   it("builds from an isolated run-client source copy with a verified read-only executable", () => {
@@ -445,6 +525,7 @@ describe("strict native public run client", () => {
       socketPath,
       JSON.stringify(validRequest(requestId)),
       4_000,
+      deadlineTestClient,
     );
     const elapsed = Date.now() - started;
     for (const socket of sockets) socket.destroy();
@@ -475,6 +556,35 @@ describe("strict native public run client", () => {
     },
   );
 
+  it("accepts a valid response that arrives after one second", async () => {
+    const requestId = randomUUID();
+    const root = mkdtempSync(join(tmpdir(), "assistant-run-slow-response-"));
+    const socketPath = join(root, "gateway.sock");
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      socket.on("error", () => undefined);
+      socket.resume();
+      socket.once("end", () => {
+        setTimeout(
+          () => socket.end(frameText(successResponse(requestId))),
+          1_250,
+        );
+      });
+    });
+    await listen(server, socketPath);
+    const result = await invoke(
+      socketPath,
+      JSON.stringify(validRequest(requestId)),
+      4_000,
+    );
+    await closeServer(server);
+
+    expect(result).toEqual({
+      status: 0,
+      stdout: successResponse(requestId),
+      stderr: "",
+    });
+  }, 8_000);
+
   it("times out a peer that never returns a response frame", async () => {
     const root = mkdtempSync(join(tmpdir(), "assistant-run-timeout-"));
     const socketPath = join(root, "gateway.sock");
@@ -490,6 +600,7 @@ describe("strict native public run client", () => {
       socketPath,
       JSON.stringify(validRequest()),
       4_000,
+      deadlineTestClient,
     );
     const elapsed = Date.now() - started;
     for (const socket of sockets) socket.destroy();
@@ -521,6 +632,7 @@ describe("strict native public run client", () => {
       socketPath,
       JSON.stringify(validRequest()),
       4_000,
+      deadlineTestClient,
     );
     const elapsed = Date.now() - started;
     await closeServer(server);

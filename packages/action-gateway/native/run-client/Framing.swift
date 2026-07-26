@@ -532,10 +532,15 @@ private func readExactly(
   return value
 }
 
-func exchangeFrame(socketPath: String, request: Data) throws -> Data {
+func exchangeFrame(
+  socketPath: String,
+  request: Data,
+  deadlineMilliseconds: UInt64
+) throws -> Data {
   guard socketPath.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
     throw ClientFailure.rejected
   }
+  guard deadlineMilliseconds > 0 else { throw ClientFailure.rejected }
   let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
   guard descriptor >= 0 else { throw ClientFailure.rejected }
   defer { Darwin.close(descriptor) }
@@ -545,7 +550,7 @@ func exchangeFrame(socketPath: String, request: Data) throws -> Data {
   else {
     throw ClientFailure.rejected
   }
-  let deadline = try SocketDeadline(milliseconds: 1_000)
+  let deadline = try SocketDeadline(milliseconds: deadlineMilliseconds)
   var noSignal: Int32 = 1
   guard
     setsockopt(

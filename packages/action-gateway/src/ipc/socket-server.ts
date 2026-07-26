@@ -169,6 +169,7 @@ export async function startLocalSocketServer(
   const sockets = new Set<Socket>();
   let boundIdentity: SocketIdentity | undefined;
   const server = createServer({ allowHalfOpen: true }, (socket) => {
+    socket.on("error", () => undefined);
     if (!ready || !accepting) {
       socket.destroy();
       return;

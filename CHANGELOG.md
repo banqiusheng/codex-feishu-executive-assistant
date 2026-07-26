@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- 兼容锁定 `lark-cli` 在不同 macOS `codesign -d -r-` 版本中输出 `designated =>` 或 `# designated =>` 的差异，并把同一严格签名证据接入只读 doctor；确认卡升级为 Schema 2.0 原生 `button + behaviors.callback`，网关客户端等待窗口扩展到 180 秒，单个客户端提前断开产生的连接级错误不再击穿常驻服务。
 - 修复 ACK 审查发现的取消、崩溃、进度与超时闭环：取消期间的 `SENDING` 现在仍可落账且不复活任务，启动对账会把任意持久任务状态上的 orphan `SENDING` 按 marker 修复为 `ACKNOWLEDGED` 或 `AMBIGUOUS` 并释放全局唯一门禁；worker wake 改为 level-triggered accepted 握手，取消会中断当前退避并重读 FIFO 头，而普通新入站仍不能越过持久退避。内置 Lark channel 通过委托 SDK `defaultHttpInstance` 的有界 wrapper 给全部 generated HTTP 调用强制 30 秒 timeout，超时继续进入不重发、不执行的 `RESULT_AMBIGUOUS` 路径。legacy v1 只允许无账本或历史 `ACKNOWLEDGED + attemptCount=0` backfill，正常 attempt 不会降级接受。本地 job-store/runtime 定向与离线 E2E 已覆盖；完整仓库门禁、公开 push、目标 Mac mini 重装和真实飞书回放仍待完成。
 - 收紧零复制用户授权的独立审查边界：原始授权串现在只接受精确飞书账户 authority，后继仅允许 EOF、`/` 或 `?`，并在 URL 解析前拒绝显式端口、任意 userinfo/fragment、反斜杠、lone surrogate 及 Unicode control/format/separator/whitespace。no-wait 前以 same-UID `0700` 原子目录锁协调 helper 自身并发，scope-cache 基线必须为空；malformed/nonzero 输出只在 own lock 下清理唯一、same-UID `0600`、普通 canonical、bounded exact-scope 且身份稳定的新 entry，零 entry 可确认 absent，多项/未知/增长/替换均 fail closed 且不删。cache fd 最多读取 `MAX_CACHE_BYTES+1` 并在读前后及删除前复核身份；child、stdout 或 stderr error、timeout、abort 只标记失败并 kill，创建 child 后始终等 observed `close` 才结算；生产 SIGINT/SIGTERM/SIGHUP handler 保持到 child close 与 cache cleanup 完成。该锁只协调合作的 helper 实例；受 Node 无 `unlinkat` 限制，不宣称抵抗恶意同 UID 路径竞态。
 - 修复无凭据飞书网络 doctor 的两项边界：configured Node child 现在在五秒到期时使用不可忽略的强制终止，忽略普通终止信号也只返回固定失败分类；生产 HTTPS adapter 以单次结算处理 `information`、`upgrade` 与最终 response，100–599 任一状态均表示网络可达，后续 error 或重复事件不能改变结果。补齐 child 非零、超时、stderr、超量、畸形、非 UTF-8、重复/额外/未知字段的 fail-closed 回归。
@@ -165,9 +166,13 @@
 - 精确 HEAD `1d74e03` 的安全复审与全量复审均明确 `APPROVED`：上一轮六个 blocker 全部关闭，文档与供应链证据一致，无 skip/todo/only；干净 HEAD 总门禁为 23 files / 539 tests、bridge 15 files / 365 tests、Task 7 聚焦 141/141，离线 frozen install、format、lint、typecheck、build、vendor replay、diff-check、clean worktree 和 remote=0 均通过。
 - Stage A 状态升级为 `STAGE_A_SEAMS_VERIFIED`。该状态只确认本地开发 seam 与静态/fake 证据，不代表生产 `PASS`、真实飞书/Codex E2E、macOS sandbox/网络阻断、部署或 24 小时可用性。
 
+### Changed
+
+- 截至 2026-07-26，已在一台 MacBook Air 上按公开仓库 fresh-clone 路径完成模拟安装与真实飞书 MVP 功能验收，覆盖消息回环、妙记、联系人、通知确认、日程确认与取消、持久停止、重启恢复及 PPT 文件回传。该状态仅为 `ALL_MVP_FUNCTIONS_VERIFIED_ON_MACBOOK_AIR`，不代表客户目标 Mac mini 或 24 小时常驻验收。
+
 ### Known limitations
 
-- 尚未完成客户 Mac mini 安装、真实飞书 API、PPT 客户端、Keychain/OAuth 续期和 LaunchAgent 恢复验收。
+- 尚未在客户目标 Mac mini 上完成首次安装、Keychain/OAuth 续期及长期常驻复验。
 - 尚未完成连续 24 小时实机测试，因此本候选版不标记为 `production ready`。
 
 [Unreleased]: https://github.com/banqiusheng/codex-feishu-executive-assistant/compare/v0.1.0-rc.1...HEAD

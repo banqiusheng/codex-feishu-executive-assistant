@@ -139,6 +139,13 @@ class FakeLarkChannel {
   connectCalls = 0;
   disconnectCalls = 0;
   sendCalls = 0;
+  sendArguments: Array<
+    Readonly<{
+      to: string;
+      input: unknown;
+      options: unknown;
+    }>
+  > = [];
   rawReplyCalls: unknown[] = [];
   rawReplyFailure: unknown;
   rawReplyResult: unknown = {
@@ -189,8 +196,13 @@ class FakeLarkChannel {
     this.disconnectCalls += 1;
   }
 
-  async send(): Promise<Readonly<{ messageId: string }>> {
+  async send(
+    to: string,
+    input: unknown,
+    options?: unknown,
+  ): Promise<Readonly<{ messageId: string }>> {
     this.sendCalls += 1;
+    this.sendArguments.push(Object.freeze({ to, input, options }));
     return Object.freeze({ messageId: "fixture-reply" });
   }
 
@@ -446,6 +458,90 @@ describe("built-in Lark transport tenant binding", () => {
     ).rejects.toThrow("LARK_ACKNOWLEDGEMENT_FAILED");
     expect(channel.rawReplyCalls).toHaveLength(1);
     expect(channel.sendCalls).toBe(0);
+  });
+
+  it("sends confirmation controls as native Schema 2.0 callback buttons", async () => {
+    const channel = new FakeLarkChannel();
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+
+    await expect(
+      transport.sendConfirmationCard({
+        chatId: "oc_fixture_private_chat",
+        replyToMessageId: "message-fixture",
+        actionId: "11111111-1111-4111-8111-111111111111",
+        actionPayloadHash: `sha256:${"a".repeat(64)}`,
+        nonce: "fixture-card-nonce",
+        expiresAt: "2026-07-26T12:00:00.000Z",
+        preview: Object.freeze({
+          action: "message.send",
+          identity: "bot",
+          impact: "将发送一条测试消息",
+        }),
+      }),
+    ).resolves.toEqual({ messageId: "fixture-reply" });
+
+    expect(channel.sendArguments).toEqual([
+      {
+        to: "oc_fixture_private_chat",
+        input: {
+          card: {
+            schema: "2.0",
+            config: { wide_screen_mode: true },
+            header: {
+              template: "orange",
+              title: { tag: "plain_text", content: "请确认执行" },
+            },
+            body: {
+              elements: [
+                {
+                  tag: "markdown",
+                  content: expect.stringContaining('"action": "message.send"'),
+                },
+                {
+                  tag: "button",
+                  type: "primary",
+                  text: { tag: "plain_text", content: "确认执行" },
+                  behaviors: [
+                    {
+                      type: "callback",
+                      value: {
+                        version: 1,
+                        actionId: "11111111-1111-4111-8111-111111111111",
+                        actionPayloadHash: `sha256:${"a".repeat(64)}`,
+                        nonce: "fixture-card-nonce",
+                        decision: "approve",
+                      },
+                    },
+                  ],
+                },
+                {
+                  tag: "button",
+                  type: "default",
+                  text: { tag: "plain_text", content: "取消" },
+                  behaviors: [
+                    {
+                      type: "callback",
+                      value: {
+                        version: 1,
+                        actionId: "11111111-1111-4111-8111-111111111111",
+                        actionPayloadHash: `sha256:${"a".repeat(64)}`,
+                        nonce: "fixture-card-nonce",
+                        decision: "reject",
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        options: { replyTo: "message-fixture" },
+      },
+    ]);
   });
 
   it("binds only from the correct unexpired private pairing message and replays it once", async () => {

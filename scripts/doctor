@@ -442,6 +442,43 @@ if (
     ) {
       throw new Error("lark_cli_identity");
     }
+    const codesignEnvironment = {
+      PATH: MINIMAL_RUNTIME_PATH,
+      LANG: "C",
+      LC_ALL: "C",
+    };
+    const signatureResult = run(
+      "/usr/bin/codesign",
+      ["--verify", "--strict", larkCliExecutable],
+      { env: codesignEnvironment },
+    );
+    const requirementResult = run(
+      "/usr/bin/codesign",
+      ["-d", "-r-", larkCliExecutable],
+      { env: codesignEnvironment },
+    );
+    const requirementPrefixes = ["designated => ", "# designated => "];
+    const requirements =
+      `${requirementResult.stdout ?? ""}\n${requirementResult.stderr ?? ""}`
+        .split("\n")
+        .map((line) => line.trim())
+        .flatMap((line) => {
+          const prefix = requirementPrefixes.find((candidate) =>
+            line.startsWith(candidate),
+          );
+          if (!prefix) return [];
+          const requirement = line.slice(prefix.length);
+          return requirement.length > 0 && !requirement.includes("\0")
+            ? [requirement]
+            : [];
+        });
+    if (
+      signatureResult.status !== 0 ||
+      requirementResult.status !== 0 ||
+      requirements.length !== 1
+    ) {
+      throw new Error("lark_cli_signature");
+    }
     const versionResult = run(larkCliExecutable, ["--version"]);
     if (
       versionResult.status !== 0 ||
@@ -462,9 +499,9 @@ if (
       throw new Error("lark_home_identity");
     }
     larkCliVerified = true;
-    add("lark-cli", "PASS", "锁定的 lark-cli 1.0.72 位于私有目录，版本、SHA 和收据一致。");
+    add("lark-cli", "PASS", "锁定的 lark-cli 1.0.72 位于私有目录，版本、SHA、收据和签名证据一致。");
   } catch {
-    add("lark-cli", "FAIL", "私有 lark-cli 或独立 HOME 的路径、权限、版本、SHA 或来源收据不匹配。");
+    add("lark-cli", "FAIL", "私有 lark-cli 或独立 HOME 的路径、权限、版本、SHA、来源收据或签名证据不匹配。");
   }
 }
 
