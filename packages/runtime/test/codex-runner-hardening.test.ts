@@ -41,6 +41,8 @@ function runnerFor(child: FakeChild) {
     nodePath: "/usr/local/bin/node",
     codexPath: "/usr/local/bin/codex",
     codexHome: "/private/runtime/codex-home",
+    repositoryRoot: "/private/repository",
+    runtimeRoot: "/private/runtime",
     spawn: () => child as unknown as ChildProcessWithoutNullStreams,
   });
 }

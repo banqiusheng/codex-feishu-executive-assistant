@@ -6,6 +6,11 @@
 
 ### Added
 
+- 新增面向单总裁、单 Mac mini 的最简更新入口：正常使用时每天至多检查一次公开
+  `main`，只有出现新 commit 才提示，且仅在总裁私聊去除首尾空白后精确等于“更新”时
+  fast-forward 并复用现有安装链。更新不新增守护进程、Release 系统或管理页面；脏工作区、
+  非快进和安装失败均停止或恢复旧版本，App ID、Keychain、用户授权和单一 LaunchAgent
+  继续复用；既有旧安装只需由本机 Codex 执行一次固定的 `--update-existing` 初始化。
 - 新增零复制飞书用户授权 helper：安装器只在 `--apply` 且 6 项 MVP 用户权限确有缺失时，消费锁定 CLI 的严格有界 JSON，核验完整飞书账户授权地址后以固定 `["--", url]` 参数直接调用 macOS opener。总裁只需在浏览器点击，不复制链接或设备码；helper 对 GUI、普通非符号链接可执行文件、权限差额、临时 cache 归属/权限/内容、完成回执和 child `close` 边界均 fail closed，异常或信号中止只清理本次确认拥有的 cache，并固定返回 `BLOCKED_USER_AUTH`。`--plan`、`--verify-only` 与 doctor 不打开浏览器；真实浏览器点击和目标租户验收仍待完成。
 - 新增无凭据飞书网络 doctor：以配置中的 Node 绝对路径和固定三键子环境执行固定 DNS 与 HTTPS `HEAD` 探测，分别报告 `feishu-dns` 和 `feishu-https-rest`；任意 HTTP 状态只代表网络可达，不代表权限、业务 API 成功、配对或 24 小时就绪。子进程异常、超时、超量/非 UTF-8/畸形/重复键输出及未知字段均按固定分类 fail closed，安装器同时拒绝缺失、符号链接或非普通 helper 文件。
 - 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；完整门禁、公开 push 和真实飞书回放仍待完成。

@@ -45,6 +45,8 @@ export type ProductionCodexRunnerOptions = Readonly<{
   nodePath: string;
   codexPath: string;
   codexHome: string;
+  repositoryRoot: string;
+  runtimeRoot: string;
   spawn?: Spawn;
 }>;
 
@@ -340,6 +342,8 @@ export function createProductionCodexRunner(
   assertAbsolutePath(options.nodePath, "node path");
   assertAbsolutePath(options.codexPath, "codex path");
   assertAbsolutePath(options.codexHome, "codex home");
+  assertAbsolutePath(options.repositoryRoot, "repository root");
+  assertAbsolutePath(options.runtimeRoot, "runtime root");
   const spawn = options.spawn ?? (nodeSpawn as Spawn);
 
   return Object.freeze({
@@ -359,6 +363,9 @@ export function createProductionCodexRunner(
         CODEX_HOME: options.codexHome,
         ASSISTANT_GATEWAY_SOCKET: input.gatewaySocket,
         ASSISTANT_GATEWAY_CLIENT: input.gatewayClient,
+        ASSISTANT_NODE_PATH: options.nodePath,
+        ASSISTANT_REPOSITORY_ROOT: options.repositoryRoot,
+        ASSISTANT_RUNTIME_ROOT: options.runtimeRoot,
         LANG: "zh_CN.UTF-8",
         LC_ALL: "zh_CN.UTF-8",
       });

@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   statSync,
@@ -103,6 +104,54 @@ describe("lean delivery surface", () => {
     expect(result.stdout).toContain("仓库交付面校验通过");
     expect(() => statSync(join(home, "PresidentAssistant"))).toThrow();
     expect(() => statSync(join(home, "Library", "LaunchAgents"))).toThrow();
+  });
+
+  it("recognizes the internal update mode but refuses it without an existing installation", () => {
+    const home = temporaryHome();
+    const result = runZsh(installPath, ["--update-existing"], {
+      HOME: home,
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "未找到可更新的现有安装",
+    );
+    expect(existsSync(join(home, "PresidentAssistant"))).toBe(false);
+  });
+
+  it("keeps the internal update mode non-interactive and mutation-free in test mode", () => {
+    const home = temporaryHome();
+    const runtimeRoot = join(home, "PresidentAssistant", "runtime");
+    const configRoot = join(runtimeRoot, "config");
+    const configPath = join(configRoot, "assistant.json");
+    const nodePath = realpathSync(process.execPath);
+    mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        appId: "cli_TEST123456",
+        paths: { runtimeRoot },
+        executables: {
+          node: nodePath,
+          codex: nodePath,
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const result = runZsh(installPath, ["--update-existing"], {
+      HOME: home,
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "测试模式禁止 --update-existing",
+    );
+    expect(readFileSync(configPath, "utf8")).toContain("cli_TEST123456");
+    expect(existsSync(join(home, "Library", "LaunchAgents"))).toBe(false);
   });
 
   it("delivers the Feishu network doctor helper as a regular non-symlink file", () => {

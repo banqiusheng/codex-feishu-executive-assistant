@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createProductionCodexRunner } from "./codex-runner.js";
@@ -31,6 +33,8 @@ export async function runRuntimeCli(
     nodePath: config.executables.node,
     codexPath: config.executables.codex,
     codexHome: config.paths.codexHome,
+    repositoryRoot: realpathSync(resolve(import.meta.dirname, "../../..")),
+    runtimeRoot: config.paths.runtimeRoot,
   });
   const runtime = await startProductionExecutiveRuntime(config, { runner });
   let shuttingDown = false;

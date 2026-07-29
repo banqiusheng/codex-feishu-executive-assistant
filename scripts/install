@@ -77,6 +77,11 @@ while (( $# > 0 )); do
       mode="apply"
       shift
       ;;
+    --update-existing)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="update"
+      shift
+      ;;
     --app-id)
       (( $# >= 2 )) || die "--app-id 缺少值。" 64
       app_id="$2"
@@ -112,9 +117,88 @@ done
 [[ -f "${FEISHU_USER_AUTH}" && ! -L "${FEISHU_USER_AUTH}" ]] ||
   die "飞书用户授权 helper 缺失或不是可信普通文件。"
 
-typeset node_executable="${commands[node]:-}"
-[[ -n "${node_executable}" ]] || die "未找到 Node.js 20 或更高版本。"
-node_executable="${node_executable:A}"
+typeset node_executable=""
+typeset codex_executable=""
+if [[ "${mode}" == "update" ]]; then
+  typeset update_repository_root="${ASSISTANT_REPOSITORY_ROOT:-${REPOSITORY_ROOT}}"
+  [[ -d "${update_repository_root}" &&
+    ! -L "${update_repository_root}" &&
+    "${update_repository_root:A}" == "${REPOSITORY_ROOT}" ]] ||
+    die "内部更新仓库身份不匹配；不会执行更新。" 64
+
+  typeset update_runtime_candidate="${ASSISTANT_RUNTIME_ROOT:-${HOME}/PresidentAssistant/runtime}"
+  typeset update_runtime_root="${update_runtime_candidate:A}"
+  typeset update_config_path="${update_runtime_root}/config/assistant.json"
+  [[ -f "${update_config_path}" && ! -L "${update_config_path}" ]] ||
+    die "未找到可更新的现有安装；不会创建新安装。" 64
+  [[ -d "${update_runtime_root}" && ! -L "${update_runtime_root}" &&
+    "${update_runtime_root}" == "${HOME:A}/PresidentAssistant/runtime" ]] ||
+    die "现有安装运行目录身份不匹配；不会执行更新。" 64
+
+  typeset update_node_candidate="${ASSISTANT_NODE_PATH:-${commands[node]:-}}"
+  [[ -n "${update_node_candidate}" ]] ||
+    die "现有安装记录的 Node 路径不可用。" 64
+  node_executable="${update_node_candidate:A}"
+  [[ -f "${node_executable}" && ! -L "${node_executable}" &&
+    -x "${node_executable}" ]] ||
+    die "现有安装记录的 Node 路径不可用。" 64
+
+  typeset -a update_identity
+  update_identity=("${(@f)$(
+    "${node_executable}" --input-type=module - \
+      "${update_config_path}" "${update_runtime_root}" "${node_executable}" <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+
+const [configPath, expectedRuntimeRoot, expectedNode] = process.argv.slice(2);
+const stat = fs.lstatSync(configPath);
+if (
+  !stat.isFile() ||
+  stat.isSymbolicLink() ||
+  stat.uid !== process.getuid() ||
+  (stat.mode & 0o077) !== 0
+) {
+  throw new Error("update_config_identity_invalid");
+}
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+const appId = config?.appId;
+const runtimeRoot = config?.paths?.runtimeRoot;
+const node = config?.executables?.node;
+const codex = config?.executables?.codex;
+if (
+  config?.schemaVersion !== 1 ||
+  typeof appId !== "string" ||
+  !/^cli_[A-Za-z0-9_-]{6,128}$/.test(appId) ||
+  typeof runtimeRoot !== "string" ||
+  !path.isAbsolute(runtimeRoot) ||
+  runtimeRoot.includes("\0") ||
+  fs.realpathSync(runtimeRoot) !== expectedRuntimeRoot ||
+  typeof node !== "string" ||
+  !path.isAbsolute(node) ||
+  node.includes("\0") ||
+  fs.realpathSync(node) !== expectedNode ||
+  typeof codex !== "string" ||
+  !path.isAbsolute(codex) ||
+  codex.includes("\0")
+) {
+  throw new Error("update_config_contract_invalid");
+}
+const serialized = JSON.stringify(config);
+if (/"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/.test(serialized)) {
+  throw new Error("update_config_contains_secret_field");
+}
+process.stdout.write(`${appId}\n${codex}\n`);
+NODE
+  )}") || die "现有安装配置无法安全读取；不会执行更新。" 64
+  (( ${#update_identity[@]} == 2 )) ||
+    die "现有安装配置身份不完整；不会执行更新。" 64
+  app_id="${update_identity[1]}"
+  codex_executable="${update_identity[2]:A}"
+else
+  node_executable="${commands[node]:-}"
+  [[ -n "${node_executable}" ]] || die "未找到 Node.js 20 或更高版本。"
+  node_executable="${node_executable:A}"
+fi
 
 verify_repository_contract() {
   local output
@@ -269,10 +353,17 @@ if [[ "${mode}" == "auto" ]]; then
   mode="apply"
 fi
 
-[[ "${mode}" == "apply" ]] || die "内部运行模式无效。"
-[[ "${ASSISTANT_TEST_MODE:-0}" != "1" ]] ||
+[[ "${mode}" == "apply" || "${mode}" == "update" ]] ||
+  die "内部运行模式无效。"
+if [[ "${ASSISTANT_TEST_MODE:-0}" == "1" ]]; then
+  if [[ "${mode}" == "update" ]]; then
+    die "测试模式禁止 --update-existing；未执行构建、安装或 LaunchAgent 变更。" 64
+  fi
   die "测试模式禁止 --apply；未执行 Keychain、launchctl、构建或目录写入。" 64
-[[ -t 0 && -t 1 ]] || die "--apply 必须在交互终端运行。" 64
+fi
+if [[ "${mode}" == "apply" ]]; then
+  [[ -t 0 && -t 1 ]] || die "--apply 必须在交互终端运行。" 64
+fi
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || die "只支持 macOS。"
 
 if [[ -z "${app_id}" ]]; then
@@ -282,12 +373,21 @@ fi
 [[ "${app_id}" =~ '^cli_[A-Za-z0-9_-]{6,128}$' ]] ||
   die "App ID 格式不正确，应以 cli_ 开头。"
 
-typeset corepack_executable="${commands[corepack]:-}"
-typeset codex_executable="${commands[codex]:-}"
+typeset corepack_executable=""
+if [[ "${mode}" == "update" ]]; then
+  corepack_executable="${node_executable:h}/corepack"
+else
+  corepack_executable="${commands[corepack]:-}"
+  codex_executable="${commands[codex]:-}"
+fi
 [[ -n "${corepack_executable}" ]] || die "未找到 corepack。"
 [[ -n "${codex_executable}" ]] || die "未找到 Codex CLI。"
 corepack_executable="${corepack_executable:A}"
 codex_executable="${codex_executable:A}"
+[[ -f "${corepack_executable}" && ! -L "${corepack_executable}" &&
+  -x "${corepack_executable}" ]] || die "corepack 路径不可用。"
+[[ -f "${codex_executable}" && ! -L "${codex_executable}" &&
+  -x "${codex_executable}" ]] || die "Codex CLI 路径不可用。"
 "${node_executable}" "${INSTALL_SUPPORT}" validate-codex-entry \
   "${node_executable}" "${codex_executable}" >/dev/null ||
   die "当前 Codex CLI 不是本版本支持的 Node.js 脚本入口。"
@@ -483,19 +583,55 @@ install_local_skill() {
   local source="$1"
   local target="$2"
   local name="$3"
+  [[ -d "${source}" && ! -L "${source}" &&
+    -z "$(/usr/bin/find "${source}" -type l -print -quit)" ]] ||
+    die "${name} 的仓库来源不是可信普通目录。"
   if [[ -e "${target}" ]]; then
     [[ -d "${target}" && ! -L "${target}" ]] || die "${name} 的已有目标不是可信目录。"
-    /usr/bin/diff -qr "${source}" "${target}" >/dev/null ||
+    if /usr/bin/diff -qr "${source}" "${target}" >/dev/null; then
+      note "${name} 已安装且内容一致，复用现有目录。"
+      return
+    fi
+    [[ "${mode}" == "update" ]] ||
       die "${name} 已存在但内容与仓库不一致；安装器不会覆盖。"
-    note "${name} 已安装且内容一致，复用现有目录。"
-    return
   fi
+
   local staging
   staging="$(/usr/bin/mktemp -d "${skills_root}/ea-${name}.XXXXXX")"
   cleanup_paths+=("${staging}")
   /usr/bin/ditto "${source}" "${staging}"
   /usr/bin/find "${staging}" -type d -exec /bin/chmod 0700 {} \;
   /usr/bin/find "${staging}" -type f -exec /bin/chmod 0600 {} \;
+
+  if [[ -e "${target}" ]]; then
+    local quarantine_root="${runtime_root}/quarantine"
+    if [[ -e "${quarantine_root}" ]]; then
+      [[ -d "${quarantine_root}" && ! -L "${quarantine_root}" ]] ||
+        die "${name} 的隔离目录不是可信目录。"
+    else
+      /bin/mkdir "${quarantine_root}"
+    fi
+    /bin/chmod 0700 "${quarantine_root}"
+    local quarantine
+    quarantine="$(/usr/bin/mktemp -d "${quarantine_root}/${name}-previous.XXXXXX")"
+    /bin/chmod 0700 "${quarantine}"
+    /bin/mv "${target}" "${quarantine}/${name}"
+    if ! /bin/mv "${staging}" "${target}"; then
+      /bin/mv "${quarantine}/${name}" "${target}" ||
+        die "${name} 更新失败且旧版本无法自动恢复。"
+      die "${name} 更新失败；已恢复旧版本。"
+    fi
+    if ! /usr/bin/diff -qr "${source}" "${target}" >/dev/null; then
+      /bin/mv "${target}" "${quarantine}/failed-${name}" ||
+        die "${name} 更新校验失败且新目录无法隔离。"
+      /bin/mv "${quarantine}/${name}" "${target}" ||
+        die "${name} 更新校验失败且旧版本无法自动恢复。"
+      die "${name} 更新校验失败；已恢复旧版本。"
+    fi
+    note "${name} 已更新；旧版本保留在私有隔离目录。"
+    return
+  fi
+
   /bin/mv "${staging}" "${target}"
   note "${name} 已安装到专用 CODEX_HOME。"
 }
@@ -777,6 +913,8 @@ fi
 
 note "检查专用 Codex 登录。"
 if ! CODEX_HOME="${codex_home}" "${codex_executable}" login status >/dev/null 2>&1; then
+  [[ "${mode}" != "update" ]] ||
+    die "现有专用 Codex 登录已失效；自动更新不会启动交互登录。"
   print -r -- "接下来打开 Codex 官方登录流程，只写入专用 CODEX_HOME。"
   CODEX_HOME="${codex_home}" "${codex_executable}" login
 fi
@@ -786,6 +924,8 @@ CODEX_HOME="${codex_home}" "${codex_executable}" login status >/dev/null 2>&1 ||
 if /usr/bin/security find-generic-password -a "${app_id}" -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1; then
   note "Bot App Secret 的 Keychain item 已存在；安装器不会显示或覆盖。"
 else
+  [[ "${mode}" != "update" ]] ||
+    die "现有 Bot App Secret 不在 Keychain；自动更新不会请求或写入秘密。"
   print -r -- ""
   print -r -- "macOS 即将安全提示输入 App Secret。输入内容不会进入脚本 argv、环境或配置文件。"
   /usr/bin/security add-generic-password \
@@ -938,6 +1078,8 @@ fi
 if [[ "${user_identity_healthy}" == "yes" ]] && lark_user_scopes_are_healthy; then
   note "飞书用户授权仍然有效，复用现有授权。"
 else
+  [[ "${mode}" != "update" ]] ||
+    die "现有飞书用户授权无效或权限不足；自动更新不会打开授权流程。"
   typeset -a missing_user_scopes=()
   typeset -a requested_user_scopes=("${MVP_USER_SCOPES[@]}")
   if [[ "${user_identity_healthy}" == "yes" ]]; then

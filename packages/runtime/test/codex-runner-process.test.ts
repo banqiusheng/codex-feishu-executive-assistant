@@ -22,6 +22,7 @@ describe("production Codex process launch", () => {
     const codexPath = join(root, "codex-fixture.mjs");
     const gatewaySocket = join(root, "gateway.sock");
     const gatewayClient = join(root, "assistant-gateway");
+    const runtimeRoot = join(root, "runtime");
     await writeFile(
       codexPath,
       `#!/usr/bin/env node
@@ -33,6 +34,9 @@ for await (const chunk of process.stdin) prompt += chunk;
 if (
   process.env.PATH !== expectedPath ||
   process.env.AMBIENT_SECRET_SENTINEL !== undefined ||
+  process.env.ASSISTANT_NODE_PATH !== ${JSON.stringify(process.execPath)} ||
+  process.env.ASSISTANT_REPOSITORY_ROOT !== ${JSON.stringify(root)} ||
+  process.env.ASSISTANT_RUNTIME_ROOT !== ${JSON.stringify(runtimeRoot)} ||
   prompt !== "只回复连接正常" ||
   !argv.includes("exec") ||
   !argv.includes("--json") ||
@@ -68,6 +72,8 @@ for (const event of [
       nodePath: process.execPath,
       codexPath,
       codexHome: join(root, "codex-home"),
+      repositoryRoot: root,
+      runtimeRoot,
     });
     const previousSentinel = process.env.AMBIENT_SECRET_SENTINEL;
     process.env.AMBIENT_SECRET_SENTINEL = "must-not-reach-codex";

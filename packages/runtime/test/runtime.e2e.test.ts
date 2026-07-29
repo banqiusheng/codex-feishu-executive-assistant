@@ -2100,6 +2100,8 @@ describe("production boundaries", () => {
       nodePath: "/usr/local/bin/node",
       codexPath: "/usr/local/bin/codex",
       codexHome: "/private/runtime/codex-home",
+      repositoryRoot: "/private/repository",
+      runtimeRoot: "/private/runtime",
       spawn: (command, args, options) => {
         invocation = { command, args, options };
         queueMicrotask(() => {
@@ -2173,6 +2175,9 @@ describe("production boundaries", () => {
       CODEX_HOME: "/private/runtime/codex-home",
       ASSISTANT_GATEWAY_SOCKET: "/private/runtime/jobs/task-1/gateway.sock",
       ASSISTANT_GATEWAY_CLIENT: "/private/runtime/bin/assistant-gateway",
+      ASSISTANT_NODE_PATH: "/usr/local/bin/node",
+      ASSISTANT_REPOSITORY_ROOT: "/private/repository",
+      ASSISTANT_RUNTIME_ROOT: "/private/runtime",
       LANG: "zh_CN.UTF-8",
       LC_ALL: "zh_CN.UTF-8",
     });

@@ -12,6 +12,7 @@
 - 通知与日程必须先显示中文预览，由总裁本人点击确认卡片；
 - “停一下”“停止当前任务”“取消这个任务”可以持久取消当前任务；
 - PPT 直接复用锁定版本的 [`visual-first-ppt`](https://github.com/banqiusheng/visual-first-ppt)，不重复实现；
+- 正常使用时每天至多检查一次公开 `main`；有新版才提示，总裁精确回复“更新”即可安装；
 - 提供安装、只读检查、重启和用户级常驻服务。
 
 ## 快速开始
@@ -78,6 +79,21 @@ SIGHUP 中止，以及完成后 `auth status --verify` 与 `auth check` 复核�
 > 请读取本仓库的 AGENTS.md 和 BOOTSTRAP.md，先运行 `./scripts/install --plan`，确认无误后在交互终端运行 `./scripts/install --apply`。App Secret 只在 macOS Keychain 的安全提示中输入，不要写进聊天或文件。
 
 完整准备要求和日常操作见 [Mac mini 安装说明](BOOTSTRAP.md)。
+
+## 日常更新
+
+总裁不需要打开 GitHub 或终端。机器人发现公开 `main` 有新版本时，会在正常任务回复末尾
+提示“发现新版本，回复“更新”即可安装。” 只有去除首尾空格后精确等于“更新”的私聊
+才会安装；其他文字不会触发。安装期间机器人可能短暂离线几分钟，现有 LaunchAgent 会
+自动拉起服务。更新失败时保留或恢复旧版本，不影响下一次正常使用。
+
+已经安装过旧版本的 Mac 只需初始化一次：把本仓库地址交给该 Mac 上的 Codex，并说：
+
+> 请在现有安装仓库中确认没有本地改动，把 main 仅 fast-forward 到这个公开仓库的最新
+> main，阅读 README.md 和 BOOTSTRAP.md，然后运行 `./scripts/install --update-existing`
+> 和 `./scripts/doctor`。不要读取、输出或要求我粘贴任何 Secret。
+
+这次由 Codex 完成后，后续更新都由总裁在飞书里回复“更新”，不再需要上述步骤。
 
 ## 安全边界
 

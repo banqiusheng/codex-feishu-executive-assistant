@@ -50,6 +50,15 @@
 ./scripts/install --apply
 ```
 
+日常更新不需要总裁操作终端：机器人发现公开 `main` 有新版时才会提示
+“发现新版本，回复“更新”即可安装。” 总裁在私聊中只回复“更新”即可；机器人会短暂
+离线并自动恢复。其他文字不会触发安装，24 小时内也不会重复检查或重复提示同一版本。
+
+如果这台 Mac 已经装过不含更新能力的旧版本，交付人员只需让本机 Codex 把现有仓库的
+`main` 仅 fast-forward 到公开最新 `main`，然后运行一次
+`./scripts/install --update-existing` 和 `./scripts/doctor`。该模式从现有配置读取非秘密
+App ID，并复用 Keychain 与用户授权；不会询问 App Secret，也不会打开授权流程。
+
 只读检查：
 
 ```bash
