@@ -15,6 +15,13 @@
 - 正常使用时每天至多检查一次公开 `main`；有新版才提示，总裁精确回复“更新”即可安装；
 - 提供安装、只读检查、重启和用户级常驻服务。
 
+### 已确认但尚未实现的下一阶段
+
+已确认[总裁指令直执行与多维表格报告设计](docs/superpowers/specs/2026-07-29-direct-feishu-actions-and-base-report-design.md)：
+计划将总裁完整的私聊指令直接作为日程和通知的执行授权，并增加组织优先联系人解析、
+文本/卡片/多人/附件通知、多维表格只读分析及原生飞书云文档报告。当前版本尚未实现这些
+能力；现有通知和日程仍需总裁点击确认卡片。
+
 ## 快速开始
 
 交付人员或 Codex 在目标 Mac mini 上执行：
@@ -136,6 +143,7 @@ gitleaks git --config .gitleaks.toml --redact --no-banner .
 - [精简 MVP 计划](docs/superpowers/plans/2026-07-23-lean-mvp.md)
 - [ACK 安全恢复与零复制授权实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)
 - [ACK 安全恢复与零复制授权补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)
+- [总裁指令直执行与多维表格报告设计](docs/superpowers/specs/2026-07-29-direct-feishu-actions-and-base-report-design.md)
 - [设计规格](docs/superpowers/specs/2026-07-20-codex-feishu-executive-assistant-design.md)
 - [总路线图](docs/superpowers/plans/2026-07-20-codex-feishu-executive-assistant-roadmap.md)
 - [本地开发与证据运行手册](docs/runbook/development.md)
