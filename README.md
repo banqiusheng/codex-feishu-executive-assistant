@@ -20,7 +20,9 @@
 已确认[总裁指令直执行与多维表格报告设计](docs/superpowers/specs/2026-07-29-direct-feishu-actions-and-base-report-design.md)：
 计划将总裁完整的私聊指令直接作为日程和通知的执行授权，并增加组织优先联系人解析、
 文本/卡片/多人/附件通知、多维表格只读分析及原生飞书云文档报告。当前版本尚未实现这些
-能力；现有通知和日程仍需总裁点击确认卡片。
+能力；现有通知和日程仍需总裁点击确认卡片。对应的
+[实施计划](docs/superpowers/plans/2026-07-29-direct-feishu-actions-and-base-report.md)
+已登记，本地实现和模拟测试已获授权，但尚未形成完成或真实飞书验收结论。
 
 ## 快速开始
 
@@ -144,6 +146,7 @@ gitleaks git --config .gitleaks.toml --redact --no-banner .
 - [ACK 安全恢复与零复制授权实现计划](docs/superpowers/plans/2026-07-25-ack-recovery-and-zero-copy-auth.md)
 - [ACK 安全恢复与零复制授权补修设计](docs/superpowers/specs/2026-07-25-feishu-ack-recovery-and-zero-copy-auth-design.md)
 - [总裁指令直执行与多维表格报告设计](docs/superpowers/specs/2026-07-29-direct-feishu-actions-and-base-report-design.md)
+- [总裁指令直执行与多维表格报告实施计划](docs/superpowers/plans/2026-07-29-direct-feishu-actions-and-base-report.md)
 - [设计规格](docs/superpowers/specs/2026-07-20-codex-feishu-executive-assistant-design.md)
 - [总路线图](docs/superpowers/plans/2026-07-20-codex-feishu-executive-assistant-roadmap.md)
 - [本地开发与证据运行手册](docs/runbook/development.md)
