@@ -6,8 +6,8 @@
     "tagObjectSha": "fcc8b1f4cb6ef45ba598cda2f057bb2798e479a1",
     "commitSha": "e8b0dc0cdfe2fb378bef7081618138a20d934aa9",
     "treeSha": "9abc1413bf4f44ab048985cbbcebe1e4fc099d8f",
-    "patchedTreeSha": "3be456b1bfbe9b01dba9b1b410518a731400247a",
-    "strictManifestSha256": "23309c3ef1ffee7c9e179b7cbb7204e1e2ecfab954b2453041ede898598cf151",
+    "patchedTreeSha": "93ab1947234d56df21150fb464db3f1780ec97b0",
+    "strictManifestSha256": "fea5f129da9f37bf52b13c2a9ffef3dd80ea96020ff95daade628f7f101fd251",
     "licenseSha256": "4d0cfede2f5089f10c0caf8f270c27797286a27be594da28ef441bfa83a3c782",
     "vendorScriptSha256": "0c3c1c6f81e86d5e0e7635320a6a5b8bccf5fd29b8576c43e811096a786d4e7f",
     "manifestToolSha256": "e23a2d4256b6a99fb59a6ef6529b9dfb26c52c0f58c8a666dfb0a3c695241cf4",
@@ -35,6 +35,10 @@
       {
         "path": "vendor/patches/lark-codex-bridge/0006-task-scoped-unix-socket-permission.patch",
         "sha256": "e3c9497b67fbc35f6cb443b9d61d3678e6a3097af85bc5ee59370d2ccc7ed934"
+      },
+      {
+        "path": "vendor/patches/lark-codex-bridge/0007-task-resource-projection.patch",
+        "sha256": "6c31053abb5014bd788c3acad272992e2e0299e0f5bd4446f2c282c6045379a3"
       }
     ],
     "npmIntegrity": "sha512-+4GztTJXLmqPOsmyd4IFSKkYqpw46QeHiAjtlLH9FANn5+HdcoobCZWSlFfRj306aQUk5xn4AWT8em9v2Krhjg==",

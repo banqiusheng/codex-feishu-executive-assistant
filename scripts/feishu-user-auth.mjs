@@ -20,6 +20,8 @@ import { clearTimeout, setTimeout } from "node:timers";
 import { fileURLToPath, URL } from "node:url";
 import { TextDecoder, types as utilTypes } from "node:util";
 
+import { readScopeContract } from "./feishu-scope-contract.mjs";
+
 export const AUTHORIZATION_ORIGIN = "https://accounts.feishu.cn";
 export const BLOCKED_USER_AUTH = "BLOCKED_USER_AUTH";
 export const USER_AUTH_COMPLETE = "USER_AUTH_COMPLETE";
@@ -37,6 +39,11 @@ const MAX_JSON_NODES = 4_096;
 const MAX_AUTH_URL_CHARS = 8_192;
 const MAX_DEVICE_CODE_CHARS = 2_048;
 const MAX_CACHE_BYTES = 16 * 1024;
+const BUNDLED_SCOPE_CONTRACT_PATH = fileURLToPath(
+  new URL("../config/feishu-scopes.json", import.meta.url),
+);
+const BUNDLED_SCOPE_CONTRACT_SHA256 =
+  "40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e";
 const NO_WAIT_KEYS = Object.freeze([
   "verification_url",
   "device_code",
@@ -56,14 +63,7 @@ const AUTH_COMPLETE_KEYS = Object.freeze([
 ]);
 const CACHE_KEYS = Object.freeze(["requested_scope"]);
 const MINIMAL_CLI_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
-const MVP_USER_SCOPES = Object.freeze([
-  "calendar:calendar.event:create",
-  "calendar:calendar.event:update",
-  "contact:user:search",
-  "minutes:minutes.search:read",
-  "minutes:minutes.basic:read",
-  "minutes:minutes.artifacts:read",
-]);
+const PRESENTERS = new Set(["browser", "stdout-json"]);
 
 function authOutputInvalid() {
   return new Error("AUTH_OUTPUT_INVALID");
@@ -439,7 +439,13 @@ export function parseAuthorizationComplete(input, expectedScopes) {
   return USER_AUTH_COMPLETE;
 }
 
-function validateScopes(value) {
+function validateScopes(
+  value,
+  allowedScopes = readScopeContract(
+    BUNDLED_SCOPE_CONTRACT_PATH,
+    BUNDLED_SCOPE_CONTRACT_SHA256,
+  ).userScopes,
+) {
   if (!Array.isArray(value) || utilTypes.isProxy(value)) {
     throw authOutputInvalid();
   }
@@ -459,7 +465,7 @@ function validateScopes(value) {
     result.push(scope);
   }
   if (result.length < 1 || result.length > 64) throw authOutputInvalid();
-  const positions = result.map((scope) => MVP_USER_SCOPES.indexOf(scope));
+  const positions = result.map((scope) => allowedScopes.indexOf(scope));
   if (
     positions.some((position) => position < 0) ||
     positions.some(
@@ -1114,17 +1120,26 @@ function validatedDependencies(value) {
 }
 
 function validatedRequest(value) {
-  const snapshot = exactOwnData(value, [
-    "larkCliPath",
-    "larkHome",
-    "missingScopes",
-  ]);
+  const hasPresenter =
+    value !== null &&
+    typeof value === "object" &&
+    !utilTypes.isProxy(value) &&
+    Object.hasOwn(value, "presenter");
+  const snapshot = exactOwnData(
+    value,
+    hasPresenter
+      ? ["larkCliPath", "larkHome", "missingScopes", "presenter"]
+      : ["larkCliPath", "larkHome", "missingScopes"],
+  );
   if (
     snapshot === null ||
     typeof snapshot.larkCliPath !== "string" ||
     !isAbsolute(snapshot.larkCliPath) ||
     typeof snapshot.larkHome !== "string" ||
-    !isAbsolute(snapshot.larkHome)
+    !isAbsolute(snapshot.larkHome) ||
+    (hasPresenter &&
+      (typeof snapshot.presenter !== "string" ||
+        !PRESENTERS.has(snapshot.presenter)))
   ) {
     throw authOutputInvalid();
   }
@@ -1132,6 +1147,7 @@ function validatedRequest(value) {
     larkCliPath: snapshot.larkCliPath,
     larkHome: snapshot.larkHome,
     missingScopes: validateScopes(snapshot.missingScopes),
+    presenter: hasPresenter ? snapshot.presenter : "browser",
   });
 }
 
@@ -1142,16 +1158,19 @@ export async function runFeishuUserAuth(
   let flowLock = null;
   let cacheDirectory = null;
   let ownedCache = null;
+  let injected = null;
+  let presenter = "browser";
   let noWaitAttempted = false;
   let requestedScope = "";
   let outcome = BLOCKED_USER_AUTH;
   try {
     const request = validatedRequest(input);
-    const injected = validatedDependencies(dependencies);
+    presenter = request.presenter;
+    injected = validatedDependencies(dependencies);
     if (
       !validateRegularExecutable(request.larkCliPath) ||
       !validatePrivateDirectory(request.larkHome) ||
-      !validateRegularExecutable(OPENER_PATH)
+      (presenter === "browser" && !validateRegularExecutable(OPENER_PATH))
     ) {
       throw authOutputInvalid();
     }
@@ -1196,25 +1215,34 @@ export async function runFeishuUserAuth(
       flowLock,
     );
     validateAuthorizationUrl(noWait.verificationUrl);
-    if ((await injected.hasGuiSession()) !== true) throw authOutputInvalid();
-    const openResult = decodeProcessStreams(
-      await injected.runCommand(
-        Object.freeze({
-          executable: OPENER_PATH,
-          args: Object.freeze(["--", noWait.verificationUrl]),
-          environment: Object.freeze({
-            PATH: MINIMAL_CLI_PATH,
-            LANG: "C",
-            LC_ALL: "C",
+    if (presenter === "browser") {
+      if ((await injected.hasGuiSession()) !== true) throw authOutputInvalid();
+      const openResult = decodeProcessStreams(
+        await injected.runCommand(
+          Object.freeze({
+            executable: OPENER_PATH,
+            args: Object.freeze(["--", noWait.verificationUrl]),
+            environment: Object.freeze({
+              PATH: MINIMAL_CLI_PATH,
+              LANG: "C",
+              LC_ALL: "C",
+            }),
+            timeoutMs: OPEN_TIMEOUT_MS,
+            abortSignal: injected.abortSignal,
           }),
-          timeoutMs: OPEN_TIMEOUT_MS,
-          abortSignal: injected.abortSignal,
+        ),
+      );
+      if (injected.abortSignal?.aborted === true) throw authOutputInvalid();
+      if (openResult.status !== 0) throw authOutputInvalid();
+      injected.emit(BROWSER_OPENED_MESSAGE);
+    } else {
+      injected.emit(
+        JSON.stringify({
+          event: "authorization_url",
+          url: noWait.verificationUrl,
         }),
-      ),
-    );
-    if (injected.abortSignal?.aborted === true) throw authOutputInvalid();
-    if (openResult.status !== 0) throw authOutputInvalid();
-    injected.emit(BROWSER_OPENED_MESSAGE);
+      );
+    }
     const pollResult = decodeProcessStreams(
       await injected.runCommand(
         Object.freeze({
@@ -1260,23 +1288,52 @@ export async function runFeishuUserAuth(
     if (flowLock !== null && !releaseFlowLock(flowLock)) {
       outcome = BLOCKED_USER_AUTH;
     }
+    if (presenter === "stdout-json" && injected !== null) {
+      try {
+        injected.emit(
+          JSON.stringify({
+            event: "authorization_result",
+            status: outcome === USER_AUTH_COMPLETE ? "complete" : "blocked",
+          }),
+        );
+      } catch {
+        outcome = BLOCKED_USER_AUTH;
+      }
+    }
   }
   return outcome;
 }
 
 export async function runFeishuUserAuthMain({ argv, processLike, authorize }) {
-  const [larkCliPath, larkHome, ...missingScopes] = argv;
   const controller = new globalThis.AbortController();
   const abort = () => controller.abort();
   const signals = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
   for (const signal of signals) processLike.on(signal, abort);
   let result = BLOCKED_USER_AUTH;
   try {
+    if (
+      !Array.isArray(argv) ||
+      argv.length < 9 ||
+      argv[0] !== "--presenter" ||
+      !PRESENTERS.has(argv[1]) ||
+      argv[2] !== "--scope-contract" ||
+      argv[4] !== "--scope-contract-sha256"
+    ) {
+      throw authOutputInvalid();
+    }
+    const presenter = argv[1];
+    const scopeContractPath = argv[3];
+    const scopeContractSha256 = argv[5];
+    const larkCliPath = argv[6];
+    const larkHome = argv[7];
+    const missingScopes = argv.slice(8);
+    const contract = readScopeContract(scopeContractPath, scopeContractSha256);
     result = await authorize(
       {
         larkCliPath,
         larkHome,
-        missingScopes,
+        missingScopes: validateScopes(missingScopes, contract.userScopes),
+        presenter,
       },
       Object.freeze({
         ...PRODUCTION_DEPENDENCIES,

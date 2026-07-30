@@ -1,0 +1,1054 @@
+diff --git a/PATCHES.md b/PATCHES.md
+index c3f754b406a0b66f0a8a190055baa276346a969f..c62b2aff25ec59900538451bc9a14037d97b2c40 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -197,5 +197,36 @@
+   binary/profile to every effective config layer and live wiring; Stage D must
+   repeat the matrix on the customer Mac mini before production startup.
+ 
++## `0007-task-resource-projection.patch`
++
++- Purpose: extend the supported assistant ingress seam with a bounded,
++  authority-free projection of current-message files/images and one quoted
++  message `parent_id` candidate for downstream task-resource registration.
++- Runtime or business logic: only ordinary task normalization may observe the
++  projected resources. Pairing, card confirmation, and cancellation receive an
++  empty resource/candidate view without reading the raw values. Current-message
++  resources are limited to 20 plain file/image descriptors with opaque Feishu
++  keys and safe display names; stickers, audio, and video are ignored. Proxies,
++  accessors, exotic prototypes, unknown or authority-bearing fields, unsafe
++  names/keys, sparse arrays, and excessive collections fail closed. The quoted
++  candidate is read lazily after the ingress guard and accepts only an own,
++  enumerable data `parent_id`; `root_id` and quoted-body attachments are never
++  promoted.
++- Applies after `0001-workspace-adapter.patch` through
++  `0006-task-scoped-unix-socket-permission.patch` to upstream commit
++  `e8b0dc0cdfe2fb378bef7081618138a20d934aa9`.
++- Exact paths: `PATCHES.md`, `src/bot/channel.ts`, `src/index.ts`,
++  `src/runtime/assistant-channel.ts`, `test/assistant-channel.test.ts`, and
++  `test/channel-adapter.test.ts`.
++- Verification: guard-before-read tests, non-task route isolation, stable
++  duplicate normalization, bounded immutable projections, parent/root
++  separation, quoted-body non-promotion, proxy/accessor/path/URL/unknown-field
++  rejection, bridge unit/type tests, static dependency-boundary checks,
++  deterministic reverse/forward vendor replay, strict manifest, and repository
++  gates.
++- Evidence boundary: these tests use synthetic SDK envelopes only. They do not
++  read or write a real Feishu tenant, prove quoted-message retrieval through
++  the Lark CLI, or establish target-Mac production readiness.
++
+ Every future upstream modification must use a separately named patch file and
+ record its reason and verification here.
+diff --git a/src/bot/channel.ts b/src/bot/channel.ts
+index b05182266e36d9a4a8e1e8f579b110ed91c44cf0..b30cda7000d871b8ded9a21c3bbc15078ca48825 100644
+--- a/src/bot/channel.ts
++++ b/src/bot/channel.ts
+@@ -1,8 +1,11 @@
+ import { createHash } from "node:crypto";
++import { types as utilTypes } from "node:util";
+ 
+ import {
+   createAssistantChannel,
+   type AssistantChannelDependencies,
++  type CurrentMessageResourceDescriptor,
++  type QuotedMessageCandidate,
+   type RawEnvelope,
+ } from "../runtime/assistant-channel.js";
+ import type { RawIngressMetadata } from "../security/ingress-guard.js";
+@@ -182,8 +185,20 @@ const CARD_EVIDENCE_KEYS = [
+ ] as const;
+ const MAX_CARD_ACTION_DEPTH = 32;
+ const MAX_CARD_ACTION_NODES = 2_048;
++const MAX_CURRENT_MESSAGE_RESOURCES = 20;
++const RESOURCE_DESCRIPTOR_ALLOWED_KEYS = new Set([
++  "type",
++  "fileKey",
++  "fileName",
++  "durationMs",
++  "coverImageKey",
++]);
++const OPAQUE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,511}$/;
+ const INVALID_CARD_ACTION = Symbol("INVALID_CARD_ACTION");
+ const INVALID_CANONICAL_CARD_ACTION = Symbol("INVALID_CANONICAL_CARD_ACTION");
++const INVALID_CURRENT_MESSAGE_RESOURCES = Symbol(
++  "INVALID_CURRENT_MESSAGE_RESOURCES",
++);
+ 
+ function fixedError(message: string): Error {
+   return new Error(message);
+@@ -492,6 +507,229 @@ function toReceivedAt(value: unknown): string | null {
+   }
+ }
+ 
++function isOpaqueToken(value: unknown): value is string {
++  return typeof value === "string" && OPAQUE_TOKEN.test(value);
++}
++
++function hasControlCharacter(value: string): boolean {
++  for (const character of value) {
++    const codePoint = character.codePointAt(0);
++    if (
++      codePoint !== undefined &&
++      (codePoint <= 0x1f || codePoint === 0x7f)
++    ) {
++      return true;
++    }
++  }
++  return false;
++}
++
++function isSafeDisplayName(value: unknown): value is string {
++  return (
++    typeof value === "string" &&
++    value.length > 0 &&
++    value.length <= 512 &&
++    value === value.trim() &&
++    value.normalize("NFC") === value &&
++    !hasControlCharacter(value) &&
++    !value.includes("/") &&
++    !value.includes("\\") &&
++    value !== "." &&
++    value !== ".."
++  );
++}
++
++function ownEnumerableDataValue(
++  value: object,
++  key: string,
++): { present: boolean; value?: unknown } | null {
++  const descriptor = Object.getOwnPropertyDescriptor(value, key);
++  if (descriptor === undefined) return { present: false };
++  if (!("value" in descriptor) || !descriptor.enumerable) return null;
++  return { present: true, value: descriptor.value };
++}
++
++function snapshotCurrentMessageResource(
++  value: unknown,
++  messageId: string,
++): CurrentMessageResourceDescriptor | null | typeof INVALID_CURRENT_MESSAGE_RESOURCES {
++  try {
++    if (
++      value === null ||
++      typeof value !== "object" ||
++      Array.isArray(value) ||
++      utilTypes.isProxy(value)
++    ) {
++      return INVALID_CURRENT_MESSAGE_RESOURCES;
++    }
++    const prototype = Object.getPrototypeOf(value);
++    if (prototype !== Object.prototype && prototype !== null) {
++      return INVALID_CURRENT_MESSAGE_RESOURCES;
++    }
++    const typeProperty = ownEnumerableDataValue(value, "type");
++    if (typeProperty === null || !typeProperty.present) {
++      return INVALID_CURRENT_MESSAGE_RESOURCES;
++    }
++    const type = typeProperty.value;
++    if (type === "sticker" || type === "audio" || type === "video") {
++      return null;
++    }
++    if (type !== "image" && type !== "file") {
++      return INVALID_CURRENT_MESSAGE_RESOURCES;
++    }
++
++    const ownKeys = Reflect.ownKeys(value);
++    if (
++      ownKeys.some(
++        (key) =>
++          typeof key !== "string" ||
++          !RESOURCE_DESCRIPTOR_ALLOWED_KEYS.has(key),
++      )
++    ) {
++      return INVALID_CURRENT_MESSAGE_RESOURCES;
++    }
++    for (const key of ownKeys as string[]) {
++      const descriptor = Object.getOwnPropertyDescriptor(value, key);
++      if (
++        descriptor === undefined ||
++        !("value" in descriptor) ||
++        !descriptor.enumerable
++      ) {
++        return INVALID_CURRENT_MESSAGE_RESOURCES;
++      }
++    }
++
++    const fileKey = Object.getOwnPropertyDescriptor(value, "fileKey")?.value;
++    const fileName = Object.getOwnPropertyDescriptor(value, "fileName")?.value;
++    const durationMs = Object.getOwnPropertyDescriptor(
++      value,
++      "durationMs",
++    )?.value;
++    const coverImageKey = Object.getOwnPropertyDescriptor(
++      value,
++      "coverImageKey",
++    )?.value;
++    if (
++      !isOpaqueToken(messageId) ||
++      !isOpaqueToken(fileKey) ||
++      (fileName !== undefined && !isSafeDisplayName(fileName)) ||
++      (durationMs !== undefined &&
++        (!Number.isSafeInteger(durationMs) || (durationMs as number) < 0)) ||
++      (coverImageKey !== undefined && !isOpaqueToken(coverImageKey))
++    ) {
++      return INVALID_CURRENT_MESSAGE_RESOURCES;
++    }
++    const displayName =
++      fileName ?? (type === "image" ? "图片" : "附件");
++    return type === "image"
++      ? Object.freeze({
++          sourceKind: "current",
++          messageId,
++          kind: "image",
++          imageKey: fileKey,
++          displayName,
++        })
++      : Object.freeze({
++          sourceKind: "current",
++          messageId,
++          kind: "file",
++          fileKey,
++          displayName,
++        });
++  } catch {
++    return INVALID_CURRENT_MESSAGE_RESOURCES;
++  }
++}
++
++function snapshotCurrentMessageResources(
++  value: unknown,
++  messageId: string,
++): readonly CurrentMessageResourceDescriptor[] {
++  try {
++    if (
++      !Array.isArray(value) ||
++      utilTypes.isProxy(value) ||
++      Object.getPrototypeOf(value) !== Array.prototype
++    ) {
++      throw new Error("invalid current message resources");
++    }
++    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
++    if (
++      lengthDescriptor === undefined ||
++      !("value" in lengthDescriptor) ||
++      !Number.isSafeInteger(lengthDescriptor.value) ||
++      lengthDescriptor.value < 0 ||
++      lengthDescriptor.value > MAX_CURRENT_MESSAGE_RESOURCES ||
++      lengthDescriptor.enumerable
++    ) {
++      throw new Error("invalid current message resource count");
++    }
++    const length = lengthDescriptor.value as number;
++    const ownKeys = Reflect.ownKeys(value);
++    if (
++      ownKeys.length !== length + 1 ||
++      !ownKeys.includes("length") ||
++      ownKeys.some(
++        (key) =>
++          key !== "length" &&
++          (typeof key !== "string" ||
++            !/^(0|[1-9]\d*)$/.test(key) ||
++            Number(key) >= length),
++      )
++    ) {
++      throw new Error("invalid current message resource collection");
++    }
++
++    const snapshot: CurrentMessageResourceDescriptor[] = [];
++    for (let index = 0; index < length; index += 1) {
++      const property = Object.getOwnPropertyDescriptor(value, String(index));
++      if (
++        property === undefined ||
++        !("value" in property) ||
++        !property.enumerable
++      ) {
++        throw new Error("invalid current message resource item");
++      }
++      const resource = snapshotCurrentMessageResource(
++        property.value,
++        messageId,
++      );
++      if (resource === INVALID_CURRENT_MESSAGE_RESOURCES) {
++        throw new Error("invalid current message resource descriptor");
++      }
++      if (resource !== null) snapshot.push(resource);
++    }
++    return Object.freeze(snapshot);
++  } catch {
++    throw new Error("invalid current message resources");
++  }
++}
++
++function snapshotQuotedMessageCandidate(
++  rawMessage: object,
++): QuotedMessageCandidate | null {
++  try {
++    const prototype = Object.getPrototypeOf(rawMessage);
++    if (
++      utilTypes.isProxy(rawMessage) ||
++      (prototype !== Object.prototype && prototype !== null)
++    ) {
++      return null;
++    }
++    const parentId = ownEnumerableDataValue(rawMessage, "parent_id");
++    if (
++      parentId === null ||
++      !parentId.present ||
++      !isOpaqueToken(parentId.value)
++    ) {
++      return null;
++    }
++    return Object.freeze({ parentId: parentId.value });
++  } catch {
++    return null;
++  }
++}
++
+ function messageEnvelope(
+   input: SdkMessageEvent,
+   appId: string,
+@@ -559,6 +797,16 @@ function messageEnvelope(
+     ) {
+       return null;
+     }
++    let quotedMessageCandidateRead = false;
++    let quotedMessageCandidate: QuotedMessageCandidate | null = null;
++    const readQuotedMessageCandidate = (): QuotedMessageCandidate | null => {
++      if (!quotedMessageCandidateRead) {
++        quotedMessageCandidate =
++          snapshotQuotedMessageCandidate(rawMessage);
++        quotedMessageCandidateRead = true;
++      }
++      return quotedMessageCandidate;
++    };
+ 
+     const metadataBase = {
+       appId,
+@@ -582,7 +830,9 @@ function messageEnvelope(
+       receivedAt,
+       readText: () => input.content,
+       readBody: () => rawMessage.content,
+-      readResources: () => input.resources,
++      readResources: () =>
++        snapshotCurrentMessageResources(input.resources, messageId),
++      readQuotedMessageCandidate,
+     });
+   } catch {
+     return null;
+@@ -920,6 +1170,7 @@ function cardEnvelope(
+     readText: () => undefined,
+     readBody: () => action,
+     readResources: () => [],
++    readQuotedMessageCandidate: () => null,
+   });
+ }
+ 
+diff --git a/src/index.ts b/src/index.ts
+index 5c2cb20c1deaf2f8c7f78d0ddf7f81d599a99256..d386bf2ce551083484da41e2d6d47e4e9611b310 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -20,6 +20,10 @@ export {
+   type AssistantChannelDependencies,
+   type AssistantNormalizer,
+   type CardBinding,
++  type CurrentMessageFileResourceDescriptor,
++  type CurrentMessageImageResourceDescriptor,
++  type CurrentMessageResourceDescriptor,
++  type QuotedMessageCandidate,
+   type RawEnvelope,
+ } from "./runtime/assistant-channel.js";
+ export {
+diff --git a/src/runtime/assistant-channel.ts b/src/runtime/assistant-channel.ts
+index ff4b54e38735b81b7a2eaf2275e848800e2ff375..b524d278717d7951831061e43236b05041624ddc 100644
+--- a/src/runtime/assistant-channel.ts
++++ b/src/runtime/assistant-channel.ts
+@@ -37,6 +37,30 @@ export type CardBinding = Readonly<{
+   payloadHash: `sha256:${string}`;
+ }>;
+ 
++export type CurrentMessageImageResourceDescriptor = Readonly<{
++  sourceKind: "current";
++  messageId: string;
++  kind: "image";
++  imageKey: string;
++  displayName: string;
++}>;
++
++export type CurrentMessageFileResourceDescriptor = Readonly<{
++  sourceKind: "current";
++  messageId: string;
++  kind: "file";
++  fileKey: string;
++  displayName: string;
++}>;
++
++export type CurrentMessageResourceDescriptor =
++  | CurrentMessageImageResourceDescriptor
++  | CurrentMessageFileResourceDescriptor;
++
++export type QuotedMessageCandidate = Readonly<{
++  parentId: string;
++}>;
++
+ export interface RawEnvelope {
+   readonly metadata: RawIngressMetadata;
+   readonly eventId: string;
+@@ -45,6 +69,7 @@ export interface RawEnvelope {
+   readText(): unknown;
+   readBody(): unknown;
+   readResources(): unknown;
++  readQuotedMessageCandidate(): unknown;
+ }
+ 
+ export interface AssistantNormalizer {
+@@ -70,6 +95,7 @@ export interface AssistantChannel {
+ }
+ 
+ const CANCEL_PHRASES = new Set(["停一下", "停止当前任务", "取消这个任务"]);
++const EMPTY_TASK_RESOURCES: readonly never[] = Object.freeze([]);
+ 
+ const DENY_REASONS = new Set<string>(Object.values(DENY_REASON));
+ const RAW_METADATA_REQUIRED_KEYS = [
+@@ -218,6 +244,7 @@ function stableEnvelope(
+   readText: () => unknown,
+   readBody: () => unknown,
+   readResources: () => unknown,
++  readQuotedMessageCandidate: () => unknown,
+ ): RawEnvelope {
+   const readEventId = memoizeRead(() => raw.eventId);
+   const readMessageId = memoizeRead(() => raw.messageId);
+@@ -236,6 +263,26 @@ function stableEnvelope(
+     readText,
+     readBody,
+     readResources,
++    readQuotedMessageCandidate,
++  });
++}
++
++function withoutTaskResources(raw: RawEnvelope): RawEnvelope {
++  return Object.freeze({
++    metadata: raw.metadata,
++    get eventId() {
++      return raw.eventId;
++    },
++    get messageId() {
++      return raw.messageId;
++    },
++    get receivedAt() {
++      return raw.receivedAt;
++    },
++    readText: () => raw.readText(),
++    readBody: () => raw.readBody(),
++    readResources: () => EMPTY_TASK_RESOURCES,
++    readQuotedMessageCandidate: () => null,
+   });
+ }
+ 
+@@ -441,6 +488,9 @@ export function createAssistantChannel(
+       const readText = memoizeRead(() => raw.readText());
+       const readBody = memoizeRead(() => raw.readBody());
+       const readResources = memoizeRead(() => raw.readResources());
++      const readQuotedMessageCandidate = memoizeRead(() =>
++        raw.readQuotedMessageCandidate(),
++      );
+       let metadata: RawIngressMetadata;
+       let decision: IngressDecision;
+       try {
+@@ -467,10 +517,12 @@ export function createAssistantChannel(
+         readText,
+         readBody,
+         readResources,
++        readQuotedMessageCandidate,
+       );
++      const nonTaskRaw = withoutTaskResources(stableRaw);
+       if (decision.kind === "allow_pairing") {
+         await callFixed(
+-          () => dependencies.pairingSink.consume(stableRaw),
++          () => dependencies.pairingSink.consume(nonTaskRaw),
+           ASSISTANT_CHANNEL_ERROR.PAIRING_SINK_FAILED,
+         );
+         return;
+@@ -479,7 +531,7 @@ export function createAssistantChannel(
+         await callFixed(
+           () =>
+             dependencies.confirmationSink.consume(
+-              stableRaw,
++              nonTaskRaw,
+               Object.freeze({
+                 nonce: decision.nonce,
+                 payloadHash: decision.payloadHash,
+@@ -501,7 +553,7 @@ export function createAssistantChannel(
+         let request: CancelActiveTaskRequest;
+         try {
+           const normalized =
+-            dependencies.normalizer.toCancelActiveTaskRequest(stableRaw);
++            dependencies.normalizer.toCancelActiveTaskRequest(nonTaskRaw);
+           const parsed = parseCancelRequest(normalized);
+           if (parsed === null) throw new Error("invalid cancel request");
+           request = parsed;
+diff --git a/test/assistant-channel.test.ts b/test/assistant-channel.test.ts
+index db030dc3c1fe037e1634f3293873aedd874a4b58..8814a57a1c9fb931011f22e18ac3ab53da8e7d5d 100644
+--- a/test/assistant-channel.test.ts
++++ b/test/assistant-channel.test.ts
+@@ -32,7 +32,12 @@ function envelope(text = "整理文件"): RawEnvelope {
+     readText: () => text,
+     readBody: () => ({ text }),
+     readResources: () => [],
+-  };
++    readQuotedMessageCandidate: () => null,
++  } as RawEnvelope;
++}
++
++function quotedCandidate(raw: RawEnvelope): unknown {
++  return raw.readQuotedMessageCandidate();
+ }
+ 
+ function dependencies(
+@@ -145,7 +150,15 @@ describe("assistant channel", () => {
+     const readResources = vi.fn(() => {
+       throw new Error("secret resources");
+     });
+-    const guardedRaw: RawEnvelope = { ...raw, readBody, readResources };
++    const readQuotedMessageCandidate = vi.fn(() => {
++      throw new Error("secret quote candidate");
++    });
++    const guardedRaw: RawEnvelope = {
++      ...raw,
++      readBody,
++      readResources,
++      readQuotedMessageCandidate,
++    };
+     const ingressGuard = vi.fn((metadata) => {
+       expect(Object.keys(metadata).sort()).toEqual(
+         [
+@@ -168,6 +181,7 @@ describe("assistant channel", () => {
+     expect(ingressGuard).toHaveBeenCalledWith(guardedRaw.metadata);
+     expect(readBody).not.toHaveBeenCalled();
+     expect(readResources).not.toHaveBeenCalled();
++    expect(readQuotedMessageCandidate).not.toHaveBeenCalled();
+     expect(deps.taskSink.ingest).not.toHaveBeenCalled();
+     expect(deps.gateway.sendSystemReply).not.toHaveBeenCalled();
+     expect(deps.scheduler.wake).not.toHaveBeenCalled();
+@@ -300,6 +314,54 @@ describe("assistant channel", () => {
+     },
+   );
+ 
++  it.each([
++    ["pairing", { kind: "allow_pairing" } as const],
++    [
++      "card",
++      {
++        kind: "allow_card",
++        nonce: "nonce-a",
++        payloadHash: `sha256:${"c".repeat(64)}` as const,
++      },
++    ],
++  ] as const)(
++    "gives the %s route an empty task-resource view even when the raw envelope is forged",
++    async (route, decision) => {
++      const readResources = vi.fn(() => {
++        throw new Error("forged resources must stay unread");
++      });
++      const readQuotedMessageCandidate = vi.fn(() => {
++        throw new Error("forged quote must stay unread");
++      });
++      const raw = {
++        ...envelope(),
++        readResources,
++        readQuotedMessageCandidate,
++      } as RawEnvelope;
++      const inspect = vi.fn(async (stableRaw: RawEnvelope) => {
++        expect(stableRaw.readResources()).toEqual([]);
++        expect(quotedCandidate(stableRaw)).toBeNull();
++      });
++      const deps = dependencies({
++        ingressGuard: () => decision,
++        pairingSink: { consume: route === "pairing" ? inspect : vi.fn() },
++        confirmationSink: {
++          consume:
++            route === "card"
++              ? vi.fn(async (stableRaw) => inspect(stableRaw))
++              : vi.fn(),
++        },
++      });
++
++      await createAssistantChannel(deps).handle(raw);
++
++      expect(inspect).toHaveBeenCalledOnce();
++      expect(readResources).not.toHaveBeenCalled();
++      expect(readQuotedMessageCandidate).not.toHaveBeenCalled();
++      expect(deps.taskSink.ingest).not.toHaveBeenCalled();
++    },
++  );
++
+   it("passes only the guard binding to confirmation and freezes it", async () => {
+     const deps = dependencies({
+       ingressGuard: () => ({
+@@ -461,6 +523,37 @@ describe("assistant channel", () => {
+     },
+   );
+ 
++  it("gives cancellation normalization an empty task-resource view", async () => {
++    const readResources = vi.fn(() => {
++      throw new Error("cancel must not read task resources");
++    });
++    const readQuotedMessageCandidate = vi.fn(() => {
++      throw new Error("cancel must not read quote candidate");
++    });
++    const raw = {
++      ...envelope("停一下"),
++      readResources,
++      readQuotedMessageCandidate,
++    } as RawEnvelope;
++    const baseNormalizer = dependencies().normalizer;
++    const deps = dependencies({
++      normalizer: {
++        ...baseNormalizer,
++        toCancelActiveTaskRequest: vi.fn((stableRaw) => {
++          expect(stableRaw.readResources()).toEqual([]);
++          expect(quotedCandidate(stableRaw)).toBeNull();
++          return baseNormalizer.toCancelActiveTaskRequest(stableRaw);
++        }),
++      },
++    });
++
++    await createAssistantChannel(deps).handle(raw);
++
++    expect(readResources).not.toHaveBeenCalled();
++    expect(readQuotedMessageCandidate).not.toHaveBeenCalled();
++    expect(deps.taskSink.ingest).not.toHaveBeenCalled();
++  });
++
+   it.each(["请停一下", "停一下！", "停止 当前任务", "取消这个任务。"])(
+     "does not fuzzy-match cancellation text %s",
+     async (text) => {
+@@ -797,7 +890,20 @@ describe("assistant channel", () => {
+       .mockImplementation(() => {
+         throw new Error("secret second resources read");
+       });
+-    const raw = { ...envelope(), readText, readBody, readResources };
++    const candidate = Object.freeze({ parentId: "om_parent" });
++    const readQuotedMessageCandidate = vi
++      .fn<() => unknown>()
++      .mockReturnValueOnce(candidate)
++      .mockImplementation(() => {
++        throw new Error("secret second quote read");
++      });
++    const raw = {
++      ...envelope(),
++      readText,
++      readBody,
++      readResources,
++      readQuotedMessageCandidate,
++    } as RawEnvelope;
+     Object.defineProperty(raw.metadata, "text", {
+       enumerable: true,
+       get: readText,
+@@ -815,6 +921,8 @@ describe("assistant channel", () => {
+           expect(stableRaw.readBody()).toBe(body);
+           expect(stableRaw.readResources()).toBe(resources);
+           expect(stableRaw.readResources()).toBe(resources);
++          expect(quotedCandidate(stableRaw)).toBe(candidate);
++          expect(quotedCandidate(stableRaw)).toBe(candidate);
+           return dependencies().normalizer.toInboundEvent(stableRaw);
+         }),
+       },
+@@ -825,6 +933,59 @@ describe("assistant channel", () => {
+     expect(readText).toHaveBeenCalledOnce();
+     expect(readBody).toHaveBeenCalledOnce();
+     expect(readResources).toHaveBeenCalledOnce();
++    expect(readQuotedMessageCandidate).toHaveBeenCalledOnce();
++  });
++
++  it("keeps identical normalized resource descriptors on duplicate inbound without a second acknowledgement or wake", async () => {
++    const descriptors = Object.freeze([
++      Object.freeze({
++        sourceKind: "current",
++        messageId: "msg_a",
++        kind: "file",
++        fileKey: "file_v3_a",
++        displayName: "经营报告.pdf",
++      }),
++    ]);
++    const candidate = Object.freeze({ parentId: "om_parent" });
++    const raw = {
++      ...envelope(),
++      readResources: vi.fn(() => descriptors),
++      readQuotedMessageCandidate: vi.fn(() => candidate),
++    } as RawEnvelope;
++    const observed: unknown[] = [];
++    const baseNormalizer = dependencies().normalizer;
++    const firstTaskId = randomUUID();
++    const deps = dependencies({
++      normalizer: {
++        ...baseNormalizer,
++        toInboundEvent: vi.fn((stableRaw) => {
++          observed.push(
++            Object.freeze({
++              resources: stableRaw.readResources(),
++              candidate: quotedCandidate(stableRaw),
++            }),
++          );
++          return baseNormalizer.toInboundEvent(stableRaw);
++        }),
++      },
++      taskSink: {
++        ingest: vi
++          .fn()
++          .mockResolvedValueOnce({ taskId: firstTaskId, duplicate: false })
++          .mockResolvedValueOnce({ taskId: firstTaskId, duplicate: true }),
++      },
++    });
++
++    await createAssistantChannel(deps).handle(raw);
++    await createAssistantChannel(deps).handle(raw);
++
++    expect(observed).toEqual([
++      { resources: descriptors, candidate },
++      { resources: descriptors, candidate },
++    ]);
++    expect(deps.taskSink.ingest).toHaveBeenCalledTimes(2);
++    expect(deps.gateway.sendSystemReply).toHaveBeenCalledOnce();
++    expect(deps.scheduler.wake).toHaveBeenCalledOnce();
+   });
+ 
+   it("uses the same cached text for guard and exact cancellation", async () => {
+diff --git a/test/channel-adapter.test.ts b/test/channel-adapter.test.ts
+index 5afdece7be6f908cabe3d303de27d1799d66f6c4..f9034d806922b033e1d73abe4457615c41e00948 100644
+--- a/test/channel-adapter.test.ts
++++ b/test/channel-adapter.test.ts
+@@ -13,7 +13,11 @@ import {
+   type StartChannelDeps,
+   type TrustedCardEvidence,
+ } from "../src/bot/channel.js";
+-import type { AssistantChannelDependencies } from "../src/runtime/assistant-channel.js";
++import {
++  ASSISTANT_CHANNEL_ERROR,
++  type AssistantChannelDependencies,
++  type RawEnvelope,
++} from "../src/runtime/assistant-channel.js";
+ import { decideIngress } from "../src/security/ingress-guard.js";
+ import type { AccessPolicy } from "../src/security/policy.js";
+ 
+@@ -25,6 +29,10 @@ const CREATED_AT_MS = Date.parse("2026-07-21T00:00:00.000Z");
+ const CARD_ACTION_HASH =
+   "sha256:b2131b4cba33c3e696b4f6352fd928f7c7c68358ae291d069c18e5d68878ba63" as const;
+ 
++function quotedCandidate(raw: RawEnvelope): unknown {
++  return raw.readQuotedMessageCandidate();
++}
++
+ const policy: AccessPolicy = {
+   appId: APP_ID,
+   tenantKey: TENANT_KEY,
+@@ -336,6 +344,311 @@ describe("narrow SDK channel adapter", () => {
+     expect(harness.disconnect).toHaveBeenCalledOnce();
+   });
+ 
++  it("normalizes only current file/image descriptors and the original parent_id candidate", async () => {
++    const harness = sourceHarness();
++    const assistantRuntime = runtime();
++    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
++    let observedResources: unknown;
++    let observedCandidate: unknown;
++    assistantRuntime.normalizer = {
++      ...assistantRuntime.normalizer,
++      toInboundEvent(raw) {
++        observedResources = raw.readResources();
++        observedCandidate = quotedCandidate(raw);
++        return baseNormalizer(raw);
++      },
++    };
++    await startChannel(startDependencies(harness, assistantRuntime));
++    const event = messageEvent({
++      resources: [
++        {
++          type: "image",
++          fileKey: "img_v3_current_a",
++          fileName: "现场照片.png",
++        },
++        {
++          type: "file",
++          fileKey: "file_v3_current_b",
++          fileName: "经营报告.pdf",
++        },
++      ],
++    });
++    const rawMessage = (
++      event.raw as {
++        event: { message: Record<string, unknown> };
++      }
++    ).event.message;
++    rawMessage.parent_id = "om_parent_a";
++    rawMessage.root_id = "om_root_must_not_be_used";
++
++    await harness.message(event);
++
++    expect(observedResources).toEqual([
++      {
++        sourceKind: "current",
++        messageId: "msg_a",
++        kind: "image",
++        imageKey: "img_v3_current_a",
++        displayName: "现场照片.png",
++      },
++      {
++        sourceKind: "current",
++        messageId: "msg_a",
++        kind: "file",
++        fileKey: "file_v3_current_b",
++        displayName: "经营报告.pdf",
++      },
++    ]);
++    expect(observedCandidate).toEqual({ parentId: "om_parent_a" });
++    expect(Object.isFrozen(observedResources)).toBe(true);
++    expect(
++      (observedResources as readonly object[]).every(Object.isFrozen),
++    ).toBe(true);
++    expect(Object.getPrototypeOf(observedResources)).toBe(Array.prototype);
++    expect(
++      (observedResources as readonly object[]).every(
++        (resource) => Object.getPrototypeOf(resource) === Object.prototype,
++      ),
++    ).toBe(true);
++    expect(Object.isFrozen(observedCandidate)).toBe(true);
++    expect(Object.getPrototypeOf(observedCandidate)).toBe(Object.prototype);
++    expect(JSON.stringify(observedResources)).not.toMatch(
++      /url|absolutePath|model|om_root_must_not_be_used/,
++    );
++    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
++  });
++
++  it("reads parent_id lazily only after the ordinary-task guard allows normalization", async () => {
++    const harness = sourceHarness();
++    const event = messageEvent();
++    const rawMessage = (
++      event.raw as {
++        event: { message: Record<string, unknown> };
++      }
++    ).event.message;
++    const assistantRuntime = runtime();
++    assistantRuntime.ingressGuard = vi.fn(() => {
++      rawMessage.parent_id = "om_parent_added_after_guard";
++      return { kind: "allow_task" as const };
++    });
++    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
++    let observedCandidate: unknown = "unread";
++    assistantRuntime.normalizer = {
++      ...assistantRuntime.normalizer,
++      toInboundEvent(raw) {
++        observedCandidate = raw.readQuotedMessageCandidate();
++        return baseNormalizer(raw);
++      },
++    };
++    await startChannel(startDependencies(harness, assistantRuntime));
++
++    await harness.message(event);
++
++    expect(observedCandidate).toEqual({
++      parentId: "om_parent_added_after_guard",
++    });
++    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
++  });
++
++  it("does not promote quoted body attachments into the current resource path", async () => {
++    const harness = sourceHarness();
++    const assistantRuntime = runtime();
++    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
++    let observedResources: unknown;
++    let observedCandidate: unknown;
++    assistantRuntime.normalizer = {
++      ...assistantRuntime.normalizer,
++      toInboundEvent(raw) {
++        observedResources = raw.readResources();
++        observedCandidate = raw.readQuotedMessageCandidate();
++        return baseNormalizer(raw);
++      },
++    };
++    await startChannel(startDependencies(harness, assistantRuntime));
++    const event = messageEvent();
++    const rawMessage = (
++      event.raw as {
++        event: { message: Record<string, unknown> };
++      }
++    ).event.message;
++    rawMessage.parent_id = "om_parent_only_candidate";
++    rawMessage.content = JSON.stringify({
++      text: "quoted body",
++      attachments: [
++        {
++          file_key: "file_v3_forged_quoted",
++          url: "https://example.invalid/quoted",
++        },
++      ],
++    });
++
++    await harness.message(event);
++
++    expect(observedResources).toEqual([]);
++    expect(observedCandidate).toEqual({
++      parentId: "om_parent_only_candidate",
++    });
++    expect(JSON.stringify(observedResources)).not.toContain(
++      "file_v3_forged_quoted",
++    );
++    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
++  });
++
++  it("uses only an own-data parent_id and never promotes root_id", async () => {
++    const harness = sourceHarness();
++    const assistantRuntime = runtime();
++    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
++    let observedCandidate: unknown = "unread";
++    assistantRuntime.normalizer = {
++      ...assistantRuntime.normalizer,
++      toInboundEvent(raw) {
++        observedCandidate = quotedCandidate(raw);
++        return baseNormalizer(raw);
++      },
++    };
++    await startChannel(startDependencies(harness, assistantRuntime));
++    const event = messageEvent();
++    const rawMessage = (
++      event.raw as {
++        event: { message: Record<string, unknown> };
++      }
++    ).event.message;
++    rawMessage.root_id = "om_root_forbidden";
++    const parentGetter = vi.fn(() => "om_parent_accessor");
++    Object.defineProperty(rawMessage, "parent_id", {
++      enumerable: true,
++      get: parentGetter,
++    });
++
++    await harness.message(event);
++
++    expect(observedCandidate).toBeNull();
++    expect(parentGetter).not.toHaveBeenCalled();
++
++    const unsafeParent = messageEvent();
++    const unsafeRawMessage = (
++      unsafeParent.raw as {
++        event: { message: Record<string, unknown> };
++      }
++    ).event.message;
++    unsafeRawMessage.parent_id = "https://example.invalid/parent";
++    unsafeRawMessage.root_id = "om_root_still_forbidden";
++    observedCandidate = "unread";
++
++    await harness.message(unsafeParent);
++
++    expect(observedCandidate).toBeNull();
++
++    const proxyParent = messageEvent();
++    const proxyRawEvent = (
++      proxyParent.raw as {
++        event: { message: Record<string, unknown> };
++      }
++    ).event;
++    proxyRawEvent.message.parent_id = "om_parent_proxy";
++    proxyRawEvent.message = new Proxy(proxyRawEvent.message, {});
++    observedCandidate = "unread";
++
++    await harness.message(proxyParent);
++
++    expect(observedCandidate).toBeNull();
++    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledTimes(3);
++  });
++
++  it("skips stickers without reading their resource fields", async () => {
++    const harness = sourceHarness();
++    const assistantRuntime = runtime();
++    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
++    let observedResources: unknown;
++    assistantRuntime.normalizer = {
++      ...assistantRuntime.normalizer,
++      toInboundEvent(raw) {
++        observedResources = raw.readResources();
++        return baseNormalizer(raw);
++      },
++    };
++    await startChannel(startDependencies(harness, assistantRuntime));
++    const fileKey = vi.fn(() => {
++      throw new Error("sticker key must stay unread");
++    });
++    const sticker = { type: "sticker" } as Record<string, unknown>;
++    Object.defineProperty(sticker, "fileKey", {
++      enumerable: true,
++      get: fileKey,
++    });
++    sticker.url = "https://example.invalid/sticker";
++
++    await harness.message(messageEvent({ resources: [sticker] }));
++
++    expect(observedResources).toEqual([]);
++    expect(fileKey).not.toHaveBeenCalled();
++    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
++  });
++
++  it("fails closed on unbounded, exotic, authority-bearing, or unsafe current resource descriptors", async () => {
++    const harness = sourceHarness();
++    const assistantRuntime = runtime();
++    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
++    assistantRuntime.normalizer = {
++      ...assistantRuntime.normalizer,
++      toInboundEvent(raw) {
++        raw.readResources();
++        return baseNormalizer(raw);
++      },
++    };
++    await startChannel(startDependencies(harness, assistantRuntime));
++    const accessor = { type: "file", fileName: "报告.pdf" } as Record<
++      string,
++      unknown
++    >;
++    Object.defineProperty(accessor, "fileKey", {
++      enumerable: true,
++      get() {
++        throw new Error("resource accessor must stay unread");
++      },
++    });
++    const safe = {
++      type: "file",
++      fileKey: "file_v3_safe",
++      fileName: "报告.pdf",
++    };
++    const invalidResources: unknown[] = [
++      new Proxy([safe], {}),
++      [new Proxy(safe, {})],
++      [accessor],
++      [{ ...safe, url: "https://example.invalid/file" }],
++      [{ ...safe, absolutePath: "/tmp/report.pdf" }],
++      [{ ...safe, model: "forbidden" }],
++      [{ ...safe, fileKey: "https://example.invalid/file" }],
++      [{ ...safe, fileName: "/tmp/report.pdf" }],
++      Array.from({ length: 21 }, (_, index) => ({
++        type: "file",
++        fileKey: `file_v3_${index}`,
++        fileName: `报告-${index}.pdf`,
++      })),
++    ];
++
++    for (const resources of invalidResources) {
++      await expect(
++        harness.message(messageEvent({ resources })),
++      ).rejects.toThrow(ASSISTANT_CHANNEL_ERROR.TASK_NORMALIZATION_FAILED);
++    }
++    const unsafeMessageId = "https://example.invalid/message";
++    const unsafeMessage = messageEvent({
++      messageId: unsafeMessageId,
++      resources: [safe],
++    });
++    (
++      unsafeMessage.raw as {
++        event: { message: { message_id: string } };
++      }
++    ).event.message.message_id = unsafeMessageId;
++    await expect(harness.message(unsafeMessage)).rejects.toThrow(
++      ASSISTANT_CHANNEL_ERROR.TASK_NORMALIZATION_FAILED,
++    );
++    expect(assistantRuntime.taskSink.ingest).not.toHaveBeenCalled();
++  });
++
+   it("denies a group message without reading normalized content or resources", async () => {
+     const harness = sourceHarness();
+     const assistantRuntime = runtime();

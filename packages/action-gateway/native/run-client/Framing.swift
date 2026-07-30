@@ -348,7 +348,7 @@ func validateRunRequest(_ value: StrictJSONValue) throws -> String {
   let requestID = try stringValue(request["requestId"])
   guard isValidRequestID(requestID) else { throw ClientFailure.rejected }
   let kind = try stringValue(request["kind"])
-  guard ["read", "prepare", "system_reply"].contains(kind) else {
+  guard ["read", "prepare", "execute", "system_reply"].contains(kind) else {
     throw ClientFailure.rejected
   }
   let capability = try stringValue(request["capability"])

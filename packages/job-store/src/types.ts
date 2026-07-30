@@ -31,7 +31,10 @@ export interface DatabaseFileLock {
 }
 
 export type ActionIdentity = "bot" | "user";
-export type ActionApprovalMode = "president" | "system_policy";
+export type ActionApprovalMode =
+  | "president"
+  | "president_instruction"
+  | "system_policy";
 export type ActionState =
   | "PREPARED"
   | "APPROVED"
@@ -57,6 +60,213 @@ export interface ActionJsonObject {
   readonly [key: string]: ActionJsonValue;
 }
 
+export type ClarificationKind = "contact" | "base" | "table";
+
+/**
+ * Synchronous trusted-runtime assertion only. It is not a Gateway/model
+ * callback and must return exactly undefined.
+ */
+export type ClarificationValueValidator = (
+  value: ActionJsonValue,
+  index: number,
+) => undefined;
+
+export type ClarificationOption = Readonly<{
+  ordinal: number;
+  optionRef: string;
+  displayLabel: string;
+}>;
+
+export type ClarificationGroup = Readonly<{
+  groupId: string;
+  groupLabel: string;
+  kind: ClarificationKind;
+  expiresAt: string;
+  options: readonly ClarificationOption[];
+}>;
+
+export type WriteClarificationOptionInput = Readonly<{
+  value: unknown;
+  displayLabel: string;
+}>;
+
+export type WriteClarificationGroupForTaskInput = Readonly<{
+  taskId: string;
+  kind: ClarificationKind;
+  groupLabel: string;
+  options: readonly WriteClarificationOptionInput[];
+  now: Date;
+}>;
+
+export type ClarificationSelection = Readonly<{
+  selectionId: string;
+  groupId: string;
+  optionOrdinal: number;
+  optionRef: string;
+  kind: ClarificationKind;
+  value: ActionJsonValue;
+  selectedAt: string;
+}>;
+
+export type TaskResourceSourceKind = "current" | "quoted";
+export type TaskResourceKind = "text" | "image" | "file";
+
+export type TaskResourceDescriptor = Readonly<{
+  sourceKind: TaskResourceSourceKind;
+  sourceMessageHash: string;
+  kind: TaskResourceKind;
+  displayName: string;
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}>;
+
+export type TaskResourceSummary = Readonly<{
+  resourceRef: string;
+  kind: TaskResourceKind;
+  displayName: string;
+  sizeBytes: number;
+}>;
+
+export type ResolvedTaskResource = TaskResourceSummary &
+  Readonly<{
+    sourceKind: TaskResourceSourceKind;
+    sourceMessageHash: string;
+    relativePath: string;
+    sha256: string;
+  }>;
+
+export type NotificationBatchState =
+  | "PREPARED"
+  | "DISPATCHING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "UNKNOWN";
+
+export type NotificationPartState =
+  | "PENDING"
+  | "CLAIMED"
+  | "DISPATCHING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "UNKNOWN";
+
+export type NotificationRecipientDescriptor = Readonly<{
+  recipientRef: string;
+  recipientBinding: unknown;
+}>;
+
+export type NotificationAttachmentDescriptor = Readonly<{
+  resourceRef: string;
+  kind: "image" | "file";
+  resourceBinding: unknown;
+}>;
+
+export type CreateNotificationBatchInput = Readonly<{
+  taskId: string;
+  batchKey: string;
+  recipients: readonly NotificationRecipientDescriptor[];
+  content: unknown;
+  attachments: readonly NotificationAttachmentDescriptor[];
+  now: Date;
+}>;
+
+export type NotificationPartRecord = Readonly<{
+  partId: string;
+  recipientOrdinal: number;
+  actionId: string;
+  partOrdinal: number;
+  partKind: "content" | "image" | "file";
+  idempotencyKey: string;
+  state: NotificationPartState;
+  attemptCount: number;
+  remoteId: string | null;
+  result: ActionResult | null;
+  createdAt: string;
+  updatedAt: string;
+}>;
+
+export type NotificationDeliveryRecord = Readonly<{
+  recipientOrdinal: number;
+  actionId: string;
+  part: NotificationPartRecord;
+}>;
+
+export type NotificationBatchRecord = Readonly<{
+  batchId: string;
+  taskId: string;
+  recipientCount: number;
+  state: NotificationBatchState;
+  createdAt: string;
+  updatedAt: string;
+  deliveries: readonly NotificationDeliveryRecord[];
+}>;
+
+export type CreateNotificationBatchResult = Readonly<{
+  batch: NotificationBatchRecord;
+  created: boolean;
+}>;
+
+export type NotificationBatchSummary = Readonly<{
+  batchId: string;
+  state: NotificationBatchState;
+  total: number;
+  pending: number;
+  dispatching: number;
+  succeeded: number;
+  failed: number;
+  unknown: number;
+}>;
+
+export type ClaimNextNotificationDeliveryInput = Readonly<{
+  batchId: string;
+  owner: string;
+  now: Date;
+  ttlMs: number;
+}>;
+
+export type NotificationDeliveryClaim = Readonly<{
+  batchId: string;
+  recipientOrdinal: number;
+  action: ActionRecord;
+  leaseExpiresAt: string;
+  part: NotificationPartRecord;
+}>;
+
+export type MarkNotificationDeliveryDispatchingInput = Readonly<{
+  batchId: string;
+  partId: string;
+  actionId: string;
+  owner: string;
+  leaseExpiresAt: string;
+  now: Date;
+  attemptId: string;
+  requestDigest: string;
+}>;
+
+export type NotificationDeliveryDispatching = Readonly<{
+  action: ActionRecord;
+  part: NotificationPartRecord;
+}>;
+
+export type FinishNotificationDeliveryInput = Readonly<{
+  batchId: string;
+  partId: string;
+  actionId: string;
+  owner: string;
+  leaseExpiresAt: string;
+  now: Date;
+  attemptId: string;
+  outcome: DispatchOutcome;
+  remoteId?: string;
+}>;
+
+export type FinishedNotificationDelivery = Readonly<{
+  action: ActionRecord;
+  part: NotificationPartRecord;
+  summary: NotificationBatchSummary;
+}>;
+
 export type ActionRef = Readonly<{ actionId: string; version: 1 }>;
 
 export type PrepareActionInput = Readonly<{
@@ -75,6 +285,21 @@ export type PreparedActionWithNonce = Readonly<{
   nonce: string;
   expiresAt: string;
   state: "PREPARED";
+}>;
+
+export type AuthorizePresidentInstructionActionInput = Readonly<{
+  taskId: string;
+  capability: string;
+  identity: ActionIdentity;
+  itemKey: string;
+  payload: unknown;
+  preview: unknown;
+  now: Date;
+}>;
+
+export type AuthorizedPresidentInstructionAction = Readonly<{
+  action: ActionRecord & Readonly<{ approvalMode: "president_instruction" }>;
+  created: boolean;
 }>;
 
 export type ApproveActionInput = Readonly<{
@@ -170,9 +395,18 @@ export type ActionRecord = Readonly<{
 
 export type ApprovedAction = ActionRecord &
   Readonly<{ state: "APPROVED" | "FAILED" }>;
-export type ClaimedAction = ActionRecord & Readonly<{ state: "CLAIMED" }>;
+export type ClaimedAction = ActionRecord &
+  Readonly<{
+    state: "CLAIMED";
+    leaseOwner: string;
+    leaseExpiresAt: string;
+  }>;
 export type DispatchingAction = ActionRecord &
-  Readonly<{ state: "DISPATCHING" }>;
+  Readonly<{
+    state: "DISPATCHING";
+    leaseOwner: string;
+    leaseExpiresAt: string;
+  }>;
 export type FinishedAction = ActionRecord &
   Readonly<{ state: "SUCCEEDED" | "FAILED" | "UNKNOWN" }>;
 export type ReconciliationClaim = ActionRecord &
@@ -216,6 +450,62 @@ export interface JobStore {
   ): ReplacementTaskResult | null;
   cancelActiveTask(request: CancelActiveTaskRequest): CancelActiveTaskResult;
   prepareAction(input: PrepareActionInput): PreparedActionWithNonce;
+  authorizePresidentInstructionAction(
+    input: AuthorizePresidentInstructionActionInput,
+  ): AuthorizedPresidentInstructionAction;
+  writeClarificationGroupForTask(
+    input: WriteClarificationGroupForTaskInput,
+  ): ClarificationGroup;
+  /** Trusted runtime-only seam; never expose as a Gateway/model capability. */
+  registerTaskResourcesForTask(
+    taskId: string,
+    descriptors: readonly TaskResourceDescriptor[],
+    now: Date,
+  ): readonly TaskResourceSummary[];
+  /** Trusted runtime-only seam; returns a task-bound local resource path. */
+  resolveTaskResourceForTask(
+    taskId: string,
+    resourceRef: string,
+    expectedKind?: TaskResourceKind,
+  ): ResolvedTaskResource;
+  listTaskResourcesForTask(taskId: string): readonly ResolvedTaskResource[];
+  createNotificationBatch(
+    input: CreateNotificationBatchInput,
+  ): CreateNotificationBatchResult;
+  claimNextNotificationDelivery(
+    input: ClaimNextNotificationDeliveryInput,
+  ): NotificationDeliveryClaim | null;
+  markNotificationDeliveryDispatching(
+    input: MarkNotificationDeliveryDispatchingInput,
+  ): NotificationDeliveryDispatching | null;
+  finishNotificationDelivery(
+    input: FinishNotificationDeliveryInput,
+  ): FinishedNotificationDelivery | null;
+  getNotificationBatchSummary(batchId: string): NotificationBatchSummary;
+  listPendingClarificationsForTask(
+    taskId: string,
+    now: Date,
+  ): readonly ClarificationGroup[];
+  consumeClarificationForTask(
+    taskId: string,
+    optionRef: string,
+    expectedKind: ClarificationKind,
+    now: Date,
+  ): ClarificationSelection;
+  consumeClarificationsForTask(
+    taskId: string,
+    optionRefs: readonly string[],
+    expectedKind: ClarificationKind,
+    now: Date,
+  ): readonly ClarificationSelection[];
+  /** Trusted runtime-only seam; never expose as a Gateway/model capability. */
+  consumeClarificationsForTaskValidated(
+    taskId: string,
+    optionRefs: readonly string[],
+    expectedKind: ClarificationKind,
+    now: Date,
+    assertValue: ClarificationValueValidator,
+  ): readonly ClarificationSelection[];
   approveAction(input: ApproveActionInput): ApprovedAction;
   claimApprovedAction(input: ClaimApprovedActionInput): ClaimedAction | null;
   getAction(ref: ActionRef): ActionRecord | null;
@@ -382,6 +672,59 @@ export type JobStoreOperations = Readonly<{
   ): ReplacementTaskResult | null;
   cancelActiveTask(request: CancelActiveTaskRequest): CancelActiveTaskResult;
   prepareAction(input: PrepareActionInput): PreparedActionWithNonce;
+  authorizePresidentInstructionAction(
+    input: AuthorizePresidentInstructionActionInput,
+  ): AuthorizedPresidentInstructionAction;
+  writeClarificationGroupForTask(
+    input: WriteClarificationGroupForTaskInput,
+  ): ClarificationGroup;
+  registerTaskResourcesForTask(
+    taskId: string,
+    descriptors: readonly TaskResourceDescriptor[],
+    now: Date,
+  ): readonly TaskResourceSummary[];
+  resolveTaskResourceForTask(
+    taskId: string,
+    resourceRef: string,
+    expectedKind?: TaskResourceKind,
+  ): ResolvedTaskResource;
+  listTaskResourcesForTask(taskId: string): readonly ResolvedTaskResource[];
+  createNotificationBatch(
+    input: CreateNotificationBatchInput,
+  ): CreateNotificationBatchResult;
+  claimNextNotificationDelivery(
+    input: ClaimNextNotificationDeliveryInput,
+  ): NotificationDeliveryClaim | null;
+  markNotificationDeliveryDispatching(
+    input: MarkNotificationDeliveryDispatchingInput,
+  ): NotificationDeliveryDispatching | null;
+  finishNotificationDelivery(
+    input: FinishNotificationDeliveryInput,
+  ): FinishedNotificationDelivery | null;
+  getNotificationBatchSummary(batchId: string): NotificationBatchSummary;
+  listPendingClarificationsForTask(
+    taskId: string,
+    now: Date,
+  ): readonly ClarificationGroup[];
+  consumeClarificationForTask(
+    taskId: string,
+    optionRef: string,
+    expectedKind: ClarificationKind,
+    now: Date,
+  ): ClarificationSelection;
+  consumeClarificationsForTask(
+    taskId: string,
+    optionRefs: readonly string[],
+    expectedKind: ClarificationKind,
+    now: Date,
+  ): readonly ClarificationSelection[];
+  consumeClarificationsForTaskValidated(
+    taskId: string,
+    optionRefs: readonly string[],
+    expectedKind: ClarificationKind,
+    now: Date,
+    assertValue: ClarificationValueValidator,
+  ): readonly ClarificationSelection[];
   approveAction(input: ApproveActionInput): ApprovedAction;
   claimApprovedAction(input: ClaimApprovedActionInput): ClaimedAction | null;
   getAction(ref: ActionRef): ActionRecord | null;
@@ -522,6 +865,125 @@ export class SqliteJobStore implements JobStore {
 
   prepareAction(input: PrepareActionInput): PreparedActionWithNonce {
     return this.#operations.prepareAction(input);
+  }
+
+  authorizePresidentInstructionAction(
+    input: AuthorizePresidentInstructionActionInput,
+  ): AuthorizedPresidentInstructionAction {
+    return this.#operations.authorizePresidentInstructionAction(input);
+  }
+
+  writeClarificationGroupForTask(
+    input: WriteClarificationGroupForTaskInput,
+  ): ClarificationGroup {
+    return this.#operations.writeClarificationGroupForTask(input);
+  }
+
+  registerTaskResourcesForTask(
+    taskId: string,
+    descriptors: readonly TaskResourceDescriptor[],
+    now: Date,
+  ): readonly TaskResourceSummary[] {
+    return this.#operations.registerTaskResourcesForTask(
+      taskId,
+      descriptors,
+      now,
+    );
+  }
+
+  resolveTaskResourceForTask(
+    taskId: string,
+    resourceRef: string,
+    expectedKind?: TaskResourceKind,
+  ): ResolvedTaskResource {
+    return this.#operations.resolveTaskResourceForTask(
+      taskId,
+      resourceRef,
+      expectedKind,
+    );
+  }
+
+  listTaskResourcesForTask(taskId: string): readonly ResolvedTaskResource[] {
+    return this.#operations.listTaskResourcesForTask(taskId);
+  }
+
+  createNotificationBatch(
+    input: CreateNotificationBatchInput,
+  ): CreateNotificationBatchResult {
+    return this.#operations.createNotificationBatch(input);
+  }
+
+  claimNextNotificationDelivery(
+    input: ClaimNextNotificationDeliveryInput,
+  ): NotificationDeliveryClaim | null {
+    return this.#operations.claimNextNotificationDelivery(input);
+  }
+
+  markNotificationDeliveryDispatching(
+    input: MarkNotificationDeliveryDispatchingInput,
+  ): NotificationDeliveryDispatching | null {
+    return this.#operations.markNotificationDeliveryDispatching(input);
+  }
+
+  finishNotificationDelivery(
+    input: FinishNotificationDeliveryInput,
+  ): FinishedNotificationDelivery | null {
+    return this.#operations.finishNotificationDelivery(input);
+  }
+
+  getNotificationBatchSummary(batchId: string): NotificationBatchSummary {
+    return this.#operations.getNotificationBatchSummary(batchId);
+  }
+
+  listPendingClarificationsForTask(
+    taskId: string,
+    now: Date,
+  ): readonly ClarificationGroup[] {
+    return this.#operations.listPendingClarificationsForTask(taskId, now);
+  }
+
+  consumeClarificationForTask(
+    taskId: string,
+    optionRef: string,
+    expectedKind: ClarificationKind,
+    now: Date,
+  ): ClarificationSelection {
+    return this.#operations.consumeClarificationForTask(
+      taskId,
+      optionRef,
+      expectedKind,
+      now,
+    );
+  }
+
+  consumeClarificationsForTask(
+    taskId: string,
+    optionRefs: readonly string[],
+    expectedKind: ClarificationKind,
+    now: Date,
+  ): readonly ClarificationSelection[] {
+    return this.#operations.consumeClarificationsForTask(
+      taskId,
+      optionRefs,
+      expectedKind,
+      now,
+    );
+  }
+
+  consumeClarificationsForTaskValidated(
+    taskId: string,
+    optionRefs: readonly string[],
+    expectedKind: ClarificationKind,
+    now: Date,
+    assertValue: ClarificationValueValidator,
+  ): readonly ClarificationSelection[] {
+    return this.#operations.consumeClarificationsForTaskValidated(
+      taskId,
+      optionRefs,
+      expectedKind,
+      now,
+      assertValue,
+    );
   }
 
   approveAction(input: ApproveActionInput): ApprovedAction {

@@ -159,6 +159,11 @@ function parseExecutables(value: unknown): RuntimeExecutables {
       "executables.runtimeEntry",
       true,
     ),
+    userAuthHelper: absolutePath(
+      value.userAuthHelper ?? null,
+      "executables.userAuthHelper",
+      true,
+    ),
   });
 }
 

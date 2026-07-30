@@ -6,30 +6,59 @@
 
 ### Added
 
+- 实现总裁指令直执行与多维表格报告候选版：新增严格 Gateway `execute` 合同和
+  `president_instruction` 持久授权账本；按总裁所属组织、融创中国-直管业务-文旅事业部、
+  融创中国-热雪奇迹优先解析内部人员；支持单次主日历直建、最多 20 人文本/固定展示卡/
+  已登记附件通知、Base 有界只读与受限聚合，以及在 `my_library` 新建原生飞书云文档报告。
+  信息完整时不再生成二次执行确认，缺失或重名只追问相应信息；写入结果不确定时保持
+  `UNKNOWN` 且不自动重发。
+- 新增单一飞书权限合同与运行时一键 User OAuth 卡：锁定 14 项 User scope、4 项 Bot scope
+  和 14 个 CLI shortcut；后台 App scope 缺失时阻止能力启动，个人授权缺失时机器人发送
+  单按钮飞书授权卡，授权完成后只需重新发送原任务，不复制 URL、设备码或 Token。
+- 新增任务内 current/quoted 资源登记、下载、哈希复核和逐收件人 multipart 通知账本；
+  模型只使用 task-bound opaque ref，不接触 open ID、Base token、file key、任意本机路径、
+  原始 DSL、自由卡片 JSON 或 raw CLI 参数。
 - 新增总裁指令直执行与多维表格报告的实施计划，按严格 Gateway `execute` 合同、
   `president_instruction` 持久授权账本、三个组织优先联系人、日程与多人通知直执行、
   任务附件转发、Base 有界只读、原生飞书云文档报告及飞书一键增量授权分步推进。
-  本地实现和模拟测试已获授权，但本条不代表实现完成、真实飞书写入、验收或公开发布。
+  本提交用于形成目标 Mac 验收候选版；本条仍不代表目标机真实飞书验收或 production ready。
 - 记录已确认的总裁指令直执行与多维表格报告设计：约定总裁完整私聊可直接授权日程与
   通知执行，并明确组织优先联系人、文本/卡片/多人/附件通知、多维表格只读分析、原生
-  飞书云文档报告和一键增量授权边界。本次仅提交规格，不代表功能实现、权限开通、真实
-  验收或公开发布。
+  飞书云文档报告和一键增量授权边界。该规格现作为上述候选版的实现与验收合同；目标 Mac
+  真实验收仍未完成。
 - 新增面向单总裁、单 Mac mini 的最简更新入口：正常使用时每天至多检查一次公开
   `main`，只有出现新 commit 才提示，且仅在总裁私聊去除首尾空白后精确等于“更新”时
   fast-forward 并复用现有安装链。更新不新增守护进程、Release 系统或管理页面；脏工作区、
   非快进和安装失败均停止或恢复旧版本，App ID、Keychain、用户授权和单一 LaunchAgent
   继续复用；既有旧安装只需由本机 Codex 执行一次固定的 `--update-existing` 初始化。
-- 新增零复制飞书用户授权 helper：安装器只在 `--apply` 且 6 项 MVP 用户权限确有缺失时，消费锁定 CLI 的严格有界 JSON，核验完整飞书账户授权地址后以固定 `["--", url]` 参数直接调用 macOS opener。总裁只需在浏览器点击，不复制链接或设备码；helper 对 GUI、普通非符号链接可执行文件、权限差额、临时 cache 归属/权限/内容、完成回执和 child `close` 边界均 fail closed，异常或信号中止只清理本次确认拥有的 cache，并固定返回 `BLOCKED_USER_AUTH`。`--plan`、`--verify-only` 与 doctor 不打开浏览器；真实浏览器点击和目标租户验收仍待完成。
+- 新增零复制飞书用户授权 helper 与运行时 presenter：安装器不打开个人 OAuth 页面；服务
+  启动后可在总裁私聊发送单按钮授权卡，并在原进程内有界轮询。总裁只需点击，不复制链接或
+  设备码；helper 对普通非符号链接可执行文件、权限差额、临时 cache 归属/权限/内容、完成
+  回执和 child `close` 边界均 fail closed，异常或信号中止只清理本次确认拥有的 cache，
+  并固定返回 `BLOCKED_USER_AUTH`。`--plan`、`--verify-only` 与 doctor 不启动个人授权
+  流程；目标租户真实验收仍待完成。
 - 新增无凭据飞书网络 doctor：以配置中的 Node 绝对路径和固定三键子环境执行固定 DNS 与 HTTPS `HEAD` 探测，分别报告 `feishu-dns` 和 `feishu-https-rest`；任意 HTTP 状态只代表网络可达，不代表权限、业务 API 成功、配对或 24 小时就绪。子进程异常、超时、超量/非 UTF-8/畸形/重复键输出及未知字段均按固定分类 fail closed，安装器同时拒绝缺失、符号链接或非普通 helper 文件。
-- 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；完整门禁、公开 push 和真实飞书回放仍待完成。
+- 新增可恢复的单 FIFO ACK 协调器：接单回复改走锁定 Lark client 的一次性 raw reply，不使用带 retry/fallback 的 channel outbound sender；只有 unknown value 自身的 own-data `ENOTFOUND` / `EAI_AGAIN` 按 `1/2/4/8/15/30/60` 秒持久退避，后续消息可继续先入库。成功顺序固定为远端回复、严格 task-bound marker v2、数据库 `ACKNOWLEDGED`、worker wake；重复事件和重启恢复同一私有路由，marker/数据库/未知发送不确定性均不重发、不执行。runtime、transport、marker 与 job-store 本地定向测试已覆盖；目标 Mac 真实飞书回放仍待完成。
 - 新增校验和迁移的任务 ACK 账本，将数据库任务 claim 收紧为只允许持久 `ACKNOWLEDGED` 行，并接通单次新消息的发送、私有 marker、数据库 ACK、worker wake 与启动对账；本安全切片不代表 DNS retry、doctor、OAuth、marker v2 或真实 E2E 已完成。
 - 规格确认后新增 ACK 安全恢复与零复制授权的可执行实现计划：按持久 ACK 门禁、单 FIFO 协调器、无凭据网络 doctor、浏览器直接授权、全量门禁与公开 `main` 推送五个切片推进，并固定每个切片先红测、独立复核和不泄露临时授权数据的要求。
-- 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim，并要求安装器从锁定 CLI 的结构化输出取得授权地址后直接调用 macOS 浏览器。
+- 记录 ACK/DNS 安全恢复与零复制飞书 OAuth 的已确认补修设计：明确只有 `ENOTFOUND` / `EAI_AGAIN` 可自动恢复，ACK 文件与数据库事实完成前禁止 claim；最终交互改为运行时从锁定 CLI 的结构化输出取得授权地址，再由机器人发送一键授权卡。
+
+### Changed
+
+- 因开发机 App Secret 已重置、真实验收必须转移到高管目标 Mac，交付顺序经用户确认调整为：
+  本地完整门禁通过后先发布公开 `main` 验收候选版，再由目标 Mac 的 Codex 安全更新并完成
+  真实功能验收。本次顺序调整不把本地 mock、dry-run 或旧版 MacBook 验收写成新功能已通过。
 
 ### Fixed
 
+- 修复 doctor 使用 Apple 系统 `sqlite3` 检查 bundled SQLite 数据库时可能把正常文件误报为
+  `CANTOPEN` 的兼容问题；完整性检查改用与实际运行时一致的只读 SQLite 实现，同时保持固定
+  结果、严格路径/权限和不回显数据库内容的边界。
+- 为开发者后台重置 App Secret 后机器人已经离线的场景增加显式交互式恢复入口；目标 Mac
+  的 Codex 可让 macOS Keychain 自身重新安全收集并覆盖同一 service/account，普通
+  `--update-existing` 仍不读取、不显示也不覆盖 Secret。
 - 兼容锁定 `lark-cli` 在不同 macOS `codesign -d -r-` 版本中输出 `designated =>` 或 `# designated =>` 的差异，并把同一严格签名证据接入只读 doctor；确认卡升级为 Schema 2.0 原生 `button + behaviors.callback`，网关客户端等待窗口扩展到 180 秒，单个客户端提前断开产生的连接级错误不再击穿常驻服务。
-- 修复 ACK 审查发现的取消、崩溃、进度与超时闭环：取消期间的 `SENDING` 现在仍可落账且不复活任务，启动对账会把任意持久任务状态上的 orphan `SENDING` 按 marker 修复为 `ACKNOWLEDGED` 或 `AMBIGUOUS` 并释放全局唯一门禁；worker wake 改为 level-triggered accepted 握手，取消会中断当前退避并重读 FIFO 头，而普通新入站仍不能越过持久退避。内置 Lark channel 通过委托 SDK `defaultHttpInstance` 的有界 wrapper 给全部 generated HTTP 调用强制 30 秒 timeout，超时继续进入不重发、不执行的 `RESULT_AMBIGUOUS` 路径。legacy v1 只允许无账本或历史 `ACKNOWLEDGED + attemptCount=0` backfill，正常 attempt 不会降级接受。本地 job-store/runtime 定向与离线 E2E 已覆盖；完整仓库门禁、公开 push、目标 Mac mini 重装和真实飞书回放仍待完成。
+- 修复 ACK 审查发现的取消、崩溃、进度与超时闭环：取消期间的 `SENDING` 现在仍可落账且不复活任务，启动对账会把任意持久任务状态上的 orphan `SENDING` 按 marker 修复为 `ACKNOWLEDGED` 或 `AMBIGUOUS` 并释放全局唯一门禁；worker wake 改为 level-triggered accepted 握手，取消会中断当前退避并重读 FIFO 头，而普通新入站仍不能越过持久退避。内置 Lark channel 通过委托 SDK `defaultHttpInstance` 的有界 wrapper 给全部 generated HTTP 调用强制 30 秒 timeout，超时继续进入不重发、不执行的 `RESULT_AMBIGUOUS` 路径。legacy v1 只允许无账本或历史 `ACKNOWLEDGED + attemptCount=0` backfill，正常 attempt 不会降级接受。本地 job-store/runtime 定向与离线 E2E 已覆盖；目标 Mac mini 重装和真实飞书回放仍待完成。
 - 收紧零复制用户授权的独立审查边界：原始授权串现在只接受精确飞书账户 authority，后继仅允许 EOF、`/` 或 `?`，并在 URL 解析前拒绝显式端口、任意 userinfo/fragment、反斜杠、lone surrogate 及 Unicode control/format/separator/whitespace。no-wait 前以 same-UID `0700` 原子目录锁协调 helper 自身并发，scope-cache 基线必须为空；malformed/nonzero 输出只在 own lock 下清理唯一、same-UID `0600`、普通 canonical、bounded exact-scope 且身份稳定的新 entry，零 entry 可确认 absent，多项/未知/增长/替换均 fail closed 且不删。cache fd 最多读取 `MAX_CACHE_BYTES+1` 并在读前后及删除前复核身份；child、stdout 或 stderr error、timeout、abort 只标记失败并 kill，创建 child 后始终等 observed `close` 才结算；生产 SIGINT/SIGTERM/SIGHUP handler 保持到 child close 与 cache cleanup 完成。该锁只协调合作的 helper 实例；受 Node 无 `unlinkat` 限制，不宣称抵抗恶意同 UID 路径竞态。
 - 修复无凭据飞书网络 doctor 的两项边界：configured Node child 现在在五秒到期时使用不可忽略的强制终止，忽略普通终止信号也只返回固定失败分类；生产 HTTPS adapter 以单次结算处理 `information`、`upgrade` 与最终 response，100–599 任一状态均表示网络可达，后续 error 或重复事件不能改变结果。补齐 child 非零、超时、stderr、超量、畸形、非 UTF-8、重复/额外/未知字段的 fail-closed 回归。
 - 补齐网络 helper 与用户授权 helper 的交付边界回归：最小临时交付根在任一 helper 缺失或符号链接时会在 `--verify-only` 写入前固定停止；`--plan`、`--verify-only` 与 doctor 测试模式均通过 fake opener 调用日志验证为零调用。
@@ -40,7 +69,10 @@
 - 修复重复安装时旧 LaunchAgent 仍处于 launchd `removing` 过渡窗口，紧接执行 `bootstrap` 会返回 `Input/output error`：安装器现在等待同一服务确认卸载，再只对该次卸载后的精确过渡期 EIO 做有限重试；新安装或其他错误仍然 fail closed，并在启动前后核验服务状态。
 - 修复专用 `CODEX_HOME` 中已经安装同一官方 `openai-primary-runtime` 来源的旧版 Presentations 时，安装器把正常版本漂移误判为来源异常：现在直接从官方 marketplace 清单和插件 manifest 读取当前版本，仅允许数字版本严格向前升级；升级前把旧 cache 完整复制到权限 `0700` 的私有隔离区，官方安装失败或升级后精确复核失败时恢复旧 cache，来源、身份、版本方向或缓存结构不明时仍然拒绝覆盖。
 - 修复 LaunchAgent 渲染阶段把顶层只读 `REPOSITORY_ROOT` 再次作为临时环境变量赋值，导致 zsh 在生成 plist 前中止：渲染器现在通过位置参数接收仓库根，并新增真实 shell 行为回归，确保只读变量保持不变且 XML 正确转义。
-- 修复安装器与只读 doctor 错把 `lark-cli 1.0.72 auth status` 的真实用户身份结构当作旧 `ok` 字段读取：现在同时核验应用层与当前用户的 6 项 MVP 权限、用户身份及令牌有效性；已有有效授权只会通过 `auth check` 计算差额并申请缺失项，不会扩大权限。本次实机重跑预期仅增量申请 `calendar:calendar.event:create` 和 `calendar:calendar.event:update`。
+- 修复安装器与只读 doctor 错把 `lark-cli 1.0.72 auth status` 的真实用户身份结构当作旧 `ok`
+  字段读取：先完成旧版 6 项用户权限的身份与令牌核验，本轮再统一扩展为锁定合同中的
+  14 项 User scope、4 项 Bot scope 和 14 个 shortcut；已有有效授权只计算当前差额，不会请求
+  合同外权限。
 - 修复安装器把 `visual-first-ppt v0.3.0` 整个仓库放进 Skill 根目录，导致 Codex 找不到根 `SKILL.md`：现在额外锁定并核验 `skills/visual-first-ppt` 子树，只安装该子目录；对安装器早期生成且内容精确匹配的旧布局执行可恢复迁移，旧目录进入权限 `0700` 的私有隔离区，迁移失败会恢复，不直接删除。
 - 移除飞书自建应用安装时手工填写 Tenant Key 的多余门槛；新安装只需要 App ID 和通过 macOS Keychain 输入的 App Secret，企业标识由正确的一次性私聊配对事件自动绑定并持久化，旧的预绑定配置继续兼容；配对码过期或遗失时可重跑安装安全刷新，配对后紧接发送的首条指令也会按序缓冲处理。
 - 修复 GitHub Actions 中 Gitleaks 临时 SARIF 报告被 Prettier 当作项目文件检查，导致首次公开 `main` CI 误报失败。

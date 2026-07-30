@@ -12,8 +12,23 @@ export {
   type BuiltInLarkTransportOptions,
 } from "./lark-transport.js";
 export { createInstalledLarkCliRunnerFactory } from "./installed-lark-cli.js";
+export {
+  createInstalledUserAuthorizationAdapter,
+  type InstalledUserAuthorizationAdapter,
+  type InstalledUserAuthorizationAdapterDependencies,
+  type InstalledUserAuthorizationAdapterOptions,
+} from "./installed-user-auth.js";
 export { startProductionExecutiveRuntime } from "./production.js";
 export { startExecutiveRuntime } from "./runtime.js";
+export {
+  createRuntimeUserAuthorizationFlow,
+  type RuntimeUserAuthHelperHandle,
+  type RuntimeUserAuthorizationDecision,
+  type RuntimeUserAuthorizationFlow,
+  type RuntimeUserAuthorizationFlowDependencies,
+  type RuntimeUserAuthorizationInspection,
+  type RuntimeUserAuthorizationRoute,
+} from "./user-auth-flow.js";
 export type {
   BotSecretProvider,
   CodexRunEvent,
@@ -24,6 +39,7 @@ export type {
   ExecutiveRuntime,
   ProductionRuntimeDependencies,
   RuntimeConfirmationCard,
+  RuntimeDownloadResourceRequest,
   RuntimeAcknowledgement,
   RuntimeConfig,
   RuntimeDependencies,
@@ -31,9 +47,15 @@ export type {
   RuntimeFileReply,
   RuntimePairingConfig,
   RuntimePaths,
+  RuntimeQuotedFileResource,
+  RuntimeQuotedImageResource,
+  RuntimeQuotedMessage,
+  RuntimeQuotedMessageRequest,
+  RuntimeQuotedResource,
   RuntimeSecretRef,
   RuntimeTenantBindingRequest,
   RuntimeTextReply,
   RuntimeTransport,
+  RuntimeUserAuthorizationCard,
   MvpLarkCliRunnerFactory,
 } from "./types.js";

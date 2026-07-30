@@ -17,7 +17,10 @@
 ## 必须保持的安全边界
 
 - 只接受已配对总裁在原私聊中的受支持事件。群聊、错人、错 chat/app/tenant、未知事件或畸形 metadata 必须在读取正文、附件或产生任务副作用前拒绝。
-- bridge 与 Codex 不得直接调用飞书业务写 API、HTTP endpoint、raw `lark-cli` 或旧 adapter。业务读写只能经后续阶段提供的强类型 gateway；外部动作必须先进入持久账本和确认流程。
+- bridge 与 Codex 不得直接调用飞书业务写 API、HTTP endpoint、raw `lark-cli` 或旧 adapter。
+  业务读写只能经强类型 gateway。外部动作必须先进入持久账本；已配对总裁完整私聊仅能按已确认
+  规格直接授权日程、内部人员通知和基于当前 Base 证据的新建云文档，其他动作继续走不可变预览与
+  本人确认，不存在通用跳过确认开关。
 - Codex 的 argv、env、cwd、binary、socket 与 gateway client 不能由消息或 skill 自由覆盖。Secret、Token、完整人员 ID、客户正文、原始 SDK error、代理和 raw CLI 路径不得进入 Codex env、argv、日志、报告或测试快照。
 - task/workspace/socket/release 路径必须经过 canonical realpath、no-symlink、唯一边界和精确权限验证。不能回退到临时目录、当前目录或调用方自选路径。
 - 中断、失败或不确定的任务/动作不得静默重跑。未取得真实结果时保持失败、需确认或 `UNKNOWN`，不得伪造成功。

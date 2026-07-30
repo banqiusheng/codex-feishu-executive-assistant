@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 
 import {
   createAssistantChannel,
   type AssistantChannelDependencies,
+  type CurrentMessageResourceDescriptor,
+  type QuotedMessageCandidate,
   type RawEnvelope,
 } from "../runtime/assistant-channel.js";
 import type { RawIngressMetadata } from "../security/ingress-guard.js";
@@ -182,8 +185,20 @@ const CARD_EVIDENCE_KEYS = [
 ] as const;
 const MAX_CARD_ACTION_DEPTH = 32;
 const MAX_CARD_ACTION_NODES = 2_048;
+const MAX_CURRENT_MESSAGE_RESOURCES = 20;
+const RESOURCE_DESCRIPTOR_ALLOWED_KEYS = new Set([
+  "type",
+  "fileKey",
+  "fileName",
+  "durationMs",
+  "coverImageKey",
+]);
+const OPAQUE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,511}$/;
 const INVALID_CARD_ACTION = Symbol("INVALID_CARD_ACTION");
 const INVALID_CANONICAL_CARD_ACTION = Symbol("INVALID_CANONICAL_CARD_ACTION");
+const INVALID_CURRENT_MESSAGE_RESOURCES = Symbol(
+  "INVALID_CURRENT_MESSAGE_RESOURCES",
+);
 
 function fixedError(message: string): Error {
   return new Error(message);
@@ -492,6 +507,229 @@ function toReceivedAt(value: unknown): string | null {
   }
 }
 
+function isOpaqueToken(value: unknown): value is string {
+  return typeof value === "string" && OPAQUE_TOKEN.test(value);
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint !== undefined &&
+      (codePoint <= 0x1f || codePoint === 0x7f)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isSafeDisplayName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    value === value.trim() &&
+    value.normalize("NFC") === value &&
+    !hasControlCharacter(value) &&
+    !value.includes("/") &&
+    !value.includes("\\") &&
+    value !== "." &&
+    value !== ".."
+  );
+}
+
+function ownEnumerableDataValue(
+  value: object,
+  key: string,
+): { present: boolean; value?: unknown } | null {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined) return { present: false };
+  if (!("value" in descriptor) || !descriptor.enumerable) return null;
+  return { present: true, value: descriptor.value };
+}
+
+function snapshotCurrentMessageResource(
+  value: unknown,
+  messageId: string,
+): CurrentMessageResourceDescriptor | null | typeof INVALID_CURRENT_MESSAGE_RESOURCES {
+  try {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      utilTypes.isProxy(value)
+    ) {
+      return INVALID_CURRENT_MESSAGE_RESOURCES;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return INVALID_CURRENT_MESSAGE_RESOURCES;
+    }
+    const typeProperty = ownEnumerableDataValue(value, "type");
+    if (typeProperty === null || !typeProperty.present) {
+      return INVALID_CURRENT_MESSAGE_RESOURCES;
+    }
+    const type = typeProperty.value;
+    if (type === "sticker" || type === "audio" || type === "video") {
+      return null;
+    }
+    if (type !== "image" && type !== "file") {
+      return INVALID_CURRENT_MESSAGE_RESOURCES;
+    }
+
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.some(
+        (key) =>
+          typeof key !== "string" ||
+          !RESOURCE_DESCRIPTOR_ALLOWED_KEYS.has(key),
+      )
+    ) {
+      return INVALID_CURRENT_MESSAGE_RESOURCES;
+    }
+    for (const key of ownKeys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (
+        descriptor === undefined ||
+        !("value" in descriptor) ||
+        !descriptor.enumerable
+      ) {
+        return INVALID_CURRENT_MESSAGE_RESOURCES;
+      }
+    }
+
+    const fileKey = Object.getOwnPropertyDescriptor(value, "fileKey")?.value;
+    const fileName = Object.getOwnPropertyDescriptor(value, "fileName")?.value;
+    const durationMs = Object.getOwnPropertyDescriptor(
+      value,
+      "durationMs",
+    )?.value;
+    const coverImageKey = Object.getOwnPropertyDescriptor(
+      value,
+      "coverImageKey",
+    )?.value;
+    if (
+      !isOpaqueToken(messageId) ||
+      !isOpaqueToken(fileKey) ||
+      (fileName !== undefined && !isSafeDisplayName(fileName)) ||
+      (durationMs !== undefined &&
+        (!Number.isSafeInteger(durationMs) || (durationMs as number) < 0)) ||
+      (coverImageKey !== undefined && !isOpaqueToken(coverImageKey))
+    ) {
+      return INVALID_CURRENT_MESSAGE_RESOURCES;
+    }
+    const displayName =
+      fileName ?? (type === "image" ? "图片" : "附件");
+    return type === "image"
+      ? Object.freeze({
+          sourceKind: "current",
+          messageId,
+          kind: "image",
+          imageKey: fileKey,
+          displayName,
+        })
+      : Object.freeze({
+          sourceKind: "current",
+          messageId,
+          kind: "file",
+          fileKey,
+          displayName,
+        });
+  } catch {
+    return INVALID_CURRENT_MESSAGE_RESOURCES;
+  }
+}
+
+function snapshotCurrentMessageResources(
+  value: unknown,
+  messageId: string,
+): readonly CurrentMessageResourceDescriptor[] {
+  try {
+    if (
+      !Array.isArray(value) ||
+      utilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      throw new Error("invalid current message resources");
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      lengthDescriptor === undefined ||
+      !("value" in lengthDescriptor) ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0 ||
+      lengthDescriptor.value > MAX_CURRENT_MESSAGE_RESOURCES ||
+      lengthDescriptor.enumerable
+    ) {
+      throw new Error("invalid current message resource count");
+    }
+    const length = lengthDescriptor.value as number;
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.length !== length + 1 ||
+      !ownKeys.includes("length") ||
+      ownKeys.some(
+        (key) =>
+          key !== "length" &&
+          (typeof key !== "string" ||
+            !/^(0|[1-9]\d*)$/.test(key) ||
+            Number(key) >= length),
+      )
+    ) {
+      throw new Error("invalid current message resource collection");
+    }
+
+    const snapshot: CurrentMessageResourceDescriptor[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const property = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        property === undefined ||
+        !("value" in property) ||
+        !property.enumerable
+      ) {
+        throw new Error("invalid current message resource item");
+      }
+      const resource = snapshotCurrentMessageResource(
+        property.value,
+        messageId,
+      );
+      if (resource === INVALID_CURRENT_MESSAGE_RESOURCES) {
+        throw new Error("invalid current message resource descriptor");
+      }
+      if (resource !== null) snapshot.push(resource);
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    throw new Error("invalid current message resources");
+  }
+}
+
+function snapshotQuotedMessageCandidate(
+  rawMessage: object,
+): QuotedMessageCandidate | null {
+  try {
+    const prototype = Object.getPrototypeOf(rawMessage);
+    if (
+      utilTypes.isProxy(rawMessage) ||
+      (prototype !== Object.prototype && prototype !== null)
+    ) {
+      return null;
+    }
+    const parentId = ownEnumerableDataValue(rawMessage, "parent_id");
+    if (
+      parentId === null ||
+      !parentId.present ||
+      !isOpaqueToken(parentId.value)
+    ) {
+      return null;
+    }
+    return Object.freeze({ parentId: parentId.value });
+  } catch {
+    return null;
+  }
+}
+
 function messageEnvelope(
   input: SdkMessageEvent,
   appId: string,
@@ -559,6 +797,16 @@ function messageEnvelope(
     ) {
       return null;
     }
+    let quotedMessageCandidateRead = false;
+    let quotedMessageCandidate: QuotedMessageCandidate | null = null;
+    const readQuotedMessageCandidate = (): QuotedMessageCandidate | null => {
+      if (!quotedMessageCandidateRead) {
+        quotedMessageCandidate =
+          snapshotQuotedMessageCandidate(rawMessage);
+        quotedMessageCandidateRead = true;
+      }
+      return quotedMessageCandidate;
+    };
 
     const metadataBase = {
       appId,
@@ -582,7 +830,9 @@ function messageEnvelope(
       receivedAt,
       readText: () => input.content,
       readBody: () => rawMessage.content,
-      readResources: () => input.resources,
+      readResources: () =>
+        snapshotCurrentMessageResources(input.resources, messageId),
+      readQuotedMessageCandidate,
     });
   } catch {
     return null;
@@ -920,6 +1170,7 @@ function cardEnvelope(
     readText: () => undefined,
     readBody: () => action,
     readResources: () => [],
+    readQuotedMessageCandidate: () => null,
   });
 }
 

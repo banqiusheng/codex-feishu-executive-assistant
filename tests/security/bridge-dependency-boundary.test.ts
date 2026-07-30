@@ -44,7 +44,7 @@ const boundaryCases = [
       "packages/bridge/src/security/ingress-guard.ts",
       "packages/bridge/src/security/policy.ts",
     ],
-    externals: ["@executive-assistant/contracts", "node:crypto"],
+    externals: ["@executive-assistant/contracts", "node:crypto", "node:util"],
   },
   {
     name: "channel",
@@ -56,7 +56,7 @@ const boundaryCases = [
       "packages/bridge/src/security/ingress-guard.ts",
       "packages/bridge/src/security/policy.ts",
     ],
-    externals: ["@executive-assistant/contracts", "node:crypto"],
+    externals: ["@executive-assistant/contracts", "node:crypto", "node:util"],
   },
   {
     name: "runner",

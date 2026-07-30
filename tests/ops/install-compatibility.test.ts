@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 
 const repositoryRoot = resolve(import.meta.dirname, "../..");
+const installPath = join(repositoryRoot, "scripts", "install");
 const installSupportPath = join(
   repositoryRoot,
   "scripts",
@@ -37,6 +39,56 @@ function makeTemporaryRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
   temporaryRoots.push(root);
   return root;
+}
+
+function prepareExistingInstallerHome() {
+  const home = realpathSync(makeTemporaryRoot("assistant-secret-refresh."));
+  const runtimeRoot = join(home, "PresidentAssistant", "runtime");
+  const configRoot = join(runtimeRoot, "config");
+  const configPath = join(configRoot, "assistant.json");
+  const nodePath = realpathSync(process.execPath);
+  mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+  chmodSync(join(home, "PresidentAssistant"), 0o700);
+  chmodSync(runtimeRoot, 0o700);
+  chmodSync(configRoot, 0o700);
+  writeFileSync(
+    configPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      appId: "cli_TEST123456",
+      secretRef: {
+        type: "macos-keychain",
+        service: "com.codex-feishu-executive-assistant.bot",
+        account: "cli_TEST123456",
+      },
+      paths: { runtimeRoot },
+      executables: {
+        node: nodePath,
+        codex: nodePath,
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  chmodSync(configPath, 0o600);
+  return { configPath, home, nodePath };
+}
+
+function runInstaller(
+  args: readonly string[],
+  fixture: ReturnType<typeof prepareExistingInstallerHome>,
+  env: Record<string, string> = {},
+) {
+  return spawnSync("/bin/zsh", [installPath, ...args], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: fixture.home,
+      ASSISTANT_NODE_PATH: fixture.nodePath,
+      ...env,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 function officialEntry(
@@ -365,7 +417,121 @@ function reloadLaunchd(fixture: ReturnType<typeof prepareFakeLaunchctl>) {
 }
 
 describe("installer compatibility support", () => {
-  it("keeps browser authorization in the dedicated helper while final identity and scope checks remain in the installer", () => {
+  it("fails closed before Keychain access when Secret refresh is requested in test mode", () => {
+    const fixture = prepareExistingInstallerHome();
+    const originalConfig = readFileSync(fixture.configPath, "utf8");
+
+    const result = runInstaller(["--refresh-app-secret"], fixture, {
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status).toBe(64);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "测试模式禁止 --refresh-app-secret；未访问 Keychain",
+    );
+    expect(readFileSync(fixture.configPath, "utf8")).toBe(originalConfig);
+  });
+
+  it("rejects a Secret refresh when the protected config parent is a symlink", () => {
+    const fixture = prepareExistingInstallerHome();
+    const originalConfig = readFileSync(fixture.configPath, "utf8");
+    const runtimeRoot = join(fixture.home, "PresidentAssistant", "runtime");
+    const configRoot = join(runtimeRoot, "config");
+    const realConfigRoot = join(runtimeRoot, "real-config");
+
+    rmSync(configRoot, { recursive: true, force: true });
+    mkdirSync(realConfigRoot, { mode: 0o700 });
+    chmodSync(realConfigRoot, 0o700);
+    writeFileSync(join(realConfigRoot, "assistant.json"), originalConfig, {
+      mode: 0o600,
+    });
+    chmodSync(join(realConfigRoot, "assistant.json"), 0o600);
+    symlinkSync(realConfigRoot, configRoot);
+
+    const result = runInstaller(["--refresh-app-secret"], fixture, {
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status).toBe(64);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "现有安装配置无法安全读取；不会执行更新",
+    );
+    expect(readFileSync(fixture.configPath, "utf8")).toBe(originalConfig);
+  });
+
+  it("keeps the default existing-install update distinct from Secret refresh", () => {
+    const fixture = prepareExistingInstallerHome();
+
+    const result = runInstaller(["--update-existing"], fixture, {
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status).toBe(64);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "测试模式禁止 --update-existing",
+    );
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(
+      "测试模式禁止 --refresh-app-secret",
+    );
+  });
+
+  it("refuses an App ID override for the existing-install Secret refresh", () => {
+    const fixture = prepareExistingInstallerHome();
+
+    const result = runInstaller(
+      ["--refresh-app-secret", "--app-id", "cli_OTHER123456"],
+      fixture,
+    );
+
+    expect(result.status).toBe(64);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "只使用现有安装配置中的固定 App ID",
+    );
+  });
+
+  it("rejects a mismatched Keychain reference before Secret refresh", () => {
+    const fixture = prepareExistingInstallerHome();
+    const config = JSON.parse(readFileSync(fixture.configPath, "utf8"));
+    config.secretRef.service = "com.example.wrong-service";
+    const originalConfig = `${JSON.stringify(config)}\n`;
+    writeFileSync(fixture.configPath, originalConfig, { mode: 0o600 });
+    chmodSync(fixture.configPath, 0o600);
+
+    const result = runInstaller(["--refresh-app-secret"], fixture, {
+      ASSISTANT_TEST_MODE: "1",
+    });
+
+    expect(result.status).toBe(64);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "现有安装配置无法安全读取；不会执行更新",
+    );
+    expect(readFileSync(fixture.configPath, "utf8")).toBe(originalConfig);
+  });
+
+  it("requires a visible interactive terminal before Secret refresh", () => {
+    const fixture = prepareExistingInstallerHome();
+    const originalConfig = readFileSync(fixture.configPath, "utf8");
+
+    const result = runInstaller(["--refresh-app-secret"], fixture);
+
+    expect(result.status).toBe(64);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "--refresh-app-secret 必须在可见交互终端运行；未访问 Keychain",
+    );
+    expect(readFileSync(fixture.configPath, "utf8")).toBe(originalConfig);
+  });
+
+  it("uses the fixed Keychain identity and lets security collect the replacement Secret", () => {
+    const installer = readFileSync(installPath, "utf8");
+
+    expect(installer).toContain("./scripts/install --refresh-app-secret");
+    expect(installer).toMatch(
+      /\/usr\/bin\/security add-generic-password\s+\\\n\s+-U\s+\\\n\s+-a "\$\{app_id\}"\s+\\\n\s+-s "\$\{KEYCHAIN_SERVICE\}"\s+\\\n\s+-w(?:\s|$)/,
+    );
+    expect(installer).not.toMatch(/\b(?:APP_SECRET|SECRET_VALUE)=/);
+  });
+
+  it("leaves missing User OAuth to the runtime without launching browser authorization from the installer", () => {
     const installer = readFileSync(
       join(repositoryRoot, "scripts", "install"),
       "utf8",
@@ -373,10 +539,20 @@ describe("installer compatibility support", () => {
     expect(installer).toContain(
       'readonly FEISHU_USER_AUTH="${REPOSITORY_ROOT}/scripts/feishu-user-auth.mjs"',
     );
-    expect(installer).toContain('"${node_executable}" "${FEISHU_USER_AUTH}"');
+    expect(installer).toContain(
+      'FEISHU_USER_AUTH_HELPER="${FEISHU_USER_AUTH}"',
+    );
+    expect(installer).toContain(
+      '["__FEISHU_USER_AUTH_HELPER__", process.env.FEISHU_USER_AUTH_HELPER]',
+    );
+    expect(installer).not.toContain(
+      '"${node_executable}" "${FEISHU_USER_AUTH}"',
+    );
     expect(installer).toContain("auth status --json --verify");
     expect(installer).toContain("auth check --scope");
     expect(installer).not.toContain("auth login --scope");
+    expect(installer).toContain("ACTION_REQUIRED");
+    expect(installer).toContain("服务将继续启动");
   });
 
   it("atomically refreshes stale configured Node and Codex paths without changing pairing or secret references", () => {
@@ -386,6 +562,7 @@ describe("installer compatibility support", () => {
     const runtimeRoot = join(root, "runtime");
     const larkHome = join(runtimeRoot, "lark-home");
     const larkCli = join(runtimeRoot, "private-bin", "lark-cli");
+    const userAuthHelper = join(runtimeRoot, "feishu-user-auth.mjs");
     const configPath = join(runtimeRoot, "assistant.json");
     const codexPath = join(runtimeRoot, "codex-fixture.mjs");
     mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
@@ -450,6 +627,7 @@ describe("installer compatibility support", () => {
         runtimeRoot,
         larkHome,
         larkCli,
+        userAuthHelper,
         "26.723.12215",
         process.execPath,
         codexPath,
@@ -465,6 +643,7 @@ describe("installer compatibility support", () => {
       node: process.execPath,
       codex: codexPath,
       larkCli,
+      userAuthHelper,
     });
     expect(refreshed).toMatchObject({
       presidentOpenId: "ou_president",
@@ -491,6 +670,7 @@ describe("installer compatibility support", () => {
     const runtimeRoot = join(root, "runtime");
     const larkHome = join(runtimeRoot, "lark-home");
     const larkCli = join(runtimeRoot, "private-bin", "lark-cli");
+    const userAuthHelper = join(runtimeRoot, "feishu-user-auth.mjs");
     const codexPath = join(runtimeRoot, "codex-fixture.mjs");
     mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
     writeFileSync(codexPath, "#!/usr/bin/env node\nprocess.exit(0);\n", {
@@ -575,6 +755,7 @@ describe("installer compatibility support", () => {
           runtimeRoot,
           larkHome,
           larkCli,
+          userAuthHelper,
           "26.723.12215",
           process.execPath,
           codexPath,

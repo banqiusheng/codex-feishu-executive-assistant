@@ -37,6 +37,30 @@ export type CardBinding = Readonly<{
   payloadHash: `sha256:${string}`;
 }>;
 
+export type CurrentMessageImageResourceDescriptor = Readonly<{
+  sourceKind: "current";
+  messageId: string;
+  kind: "image";
+  imageKey: string;
+  displayName: string;
+}>;
+
+export type CurrentMessageFileResourceDescriptor = Readonly<{
+  sourceKind: "current";
+  messageId: string;
+  kind: "file";
+  fileKey: string;
+  displayName: string;
+}>;
+
+export type CurrentMessageResourceDescriptor =
+  | CurrentMessageImageResourceDescriptor
+  | CurrentMessageFileResourceDescriptor;
+
+export type QuotedMessageCandidate = Readonly<{
+  parentId: string;
+}>;
+
 export interface RawEnvelope {
   readonly metadata: RawIngressMetadata;
   readonly eventId: string;
@@ -45,6 +69,7 @@ export interface RawEnvelope {
   readText(): unknown;
   readBody(): unknown;
   readResources(): unknown;
+  readQuotedMessageCandidate(): unknown;
 }
 
 export interface AssistantNormalizer {
@@ -70,6 +95,7 @@ export interface AssistantChannel {
 }
 
 const CANCEL_PHRASES = new Set(["停一下", "停止当前任务", "取消这个任务"]);
+const EMPTY_TASK_RESOURCES: readonly never[] = Object.freeze([]);
 
 const DENY_REASONS = new Set<string>(Object.values(DENY_REASON));
 const RAW_METADATA_REQUIRED_KEYS = [
@@ -218,6 +244,7 @@ function stableEnvelope(
   readText: () => unknown,
   readBody: () => unknown,
   readResources: () => unknown,
+  readQuotedMessageCandidate: () => unknown,
 ): RawEnvelope {
   const readEventId = memoizeRead(() => raw.eventId);
   const readMessageId = memoizeRead(() => raw.messageId);
@@ -236,6 +263,26 @@ function stableEnvelope(
     readText,
     readBody,
     readResources,
+    readQuotedMessageCandidate,
+  });
+}
+
+function withoutTaskResources(raw: RawEnvelope): RawEnvelope {
+  return Object.freeze({
+    metadata: raw.metadata,
+    get eventId() {
+      return raw.eventId;
+    },
+    get messageId() {
+      return raw.messageId;
+    },
+    get receivedAt() {
+      return raw.receivedAt;
+    },
+    readText: () => raw.readText(),
+    readBody: () => raw.readBody(),
+    readResources: () => EMPTY_TASK_RESOURCES,
+    readQuotedMessageCandidate: () => null,
   });
 }
 
@@ -441,6 +488,9 @@ export function createAssistantChannel(
       const readText = memoizeRead(() => raw.readText());
       const readBody = memoizeRead(() => raw.readBody());
       const readResources = memoizeRead(() => raw.readResources());
+      const readQuotedMessageCandidate = memoizeRead(() =>
+        raw.readQuotedMessageCandidate(),
+      );
       let metadata: RawIngressMetadata;
       let decision: IngressDecision;
       try {
@@ -467,10 +517,12 @@ export function createAssistantChannel(
         readText,
         readBody,
         readResources,
+        readQuotedMessageCandidate,
       );
+      const nonTaskRaw = withoutTaskResources(stableRaw);
       if (decision.kind === "allow_pairing") {
         await callFixed(
-          () => dependencies.pairingSink.consume(stableRaw),
+          () => dependencies.pairingSink.consume(nonTaskRaw),
           ASSISTANT_CHANNEL_ERROR.PAIRING_SINK_FAILED,
         );
         return;
@@ -479,7 +531,7 @@ export function createAssistantChannel(
         await callFixed(
           () =>
             dependencies.confirmationSink.consume(
-              stableRaw,
+              nonTaskRaw,
               Object.freeze({
                 nonce: decision.nonce,
                 payloadHash: decision.payloadHash,
@@ -501,7 +553,7 @@ export function createAssistantChannel(
         let request: CancelActiveTaskRequest;
         try {
           const normalized =
-            dependencies.normalizer.toCancelActiveTaskRequest(stableRaw);
+            dependencies.normalizer.toCancelActiveTaskRequest(nonTaskRaw);
           const parsed = parseCancelRequest(normalized);
           if (parsed === null) throw new Error("invalid cancel request");
           request = parsed;

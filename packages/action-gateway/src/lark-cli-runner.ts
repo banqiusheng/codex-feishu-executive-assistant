@@ -3,12 +3,14 @@ import {
   type ChildProcess,
   type SpawnOptions,
 } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   constants as fsConstants,
   fstatSync,
   lstatSync,
   openSync,
+  readSync,
   realpathSync,
   type Stats,
 } from "node:fs";
@@ -39,6 +41,9 @@ const FIXED_PROFILE = "executive-assistant";
 const FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_INPUT_BYTES = 100 * 1024 * 1024;
+const MAX_TOTAL_FILE_INPUT_BYTES = 300 * 1024 * 1024;
+const MAX_FILE_INPUTS = 10;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_KILL_GRACE_MS = 5_000;
 const DEFAULT_CLOSE_CONFIRMATION_MS = 5_000;
@@ -50,6 +55,9 @@ const RESERVED_ARGUMENTS = Object.freeze([
   "--format",
   "--data",
   "--params",
+  "--content",
+  "--image",
+  "--file",
 ]);
 const OPERATION_PATTERN = /^[a-z][a-z0-9._-]{0,127}$/;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
@@ -62,9 +70,25 @@ export type LarkCliJsonInput = Readonly<{
   value: JsonValue;
 }>;
 
+export type LarkCliTextInput = Readonly<{
+  flag: "--content";
+  fileName: "content.xml";
+  value: string;
+}>;
+
+export type LarkCliFileInput = Readonly<{
+  flag: "--image" | "--file";
+  sourceRelativePath: string;
+  outputFileName: string;
+  sizeBytes: number;
+  sha256: `sha256:${string}`;
+}>;
+
 export type LarkCliInvocationPlan = Readonly<{
   operationArgs: readonly string[];
   jsonInputs: readonly LarkCliJsonInput[];
+  textInputs: readonly LarkCliTextInput[];
+  fileInputs: readonly LarkCliFileInput[];
 }>;
 
 export type LarkCliRoute = Readonly<{
@@ -359,6 +383,122 @@ function snapshotJsonInputs(value: unknown): readonly LarkCliJsonInput[] {
   return Object.freeze(inputs);
 }
 
+function strictUtf8Bytes(value: unknown): Buffer {
+  if (typeof value !== "string") {
+    throw new Error("invalid lark-cli invocation");
+  }
+  const bytes = Buffer.from(value, "utf8");
+  if (
+    bytes.length === 0 ||
+    bytes.length > MAX_INPUT_BYTES ||
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes) !== value
+  ) {
+    throw new Error("invalid lark-cli invocation");
+  }
+  return bytes;
+}
+
+function snapshotTextInputs(value: unknown): readonly LarkCliTextInput[] {
+  const raw = snapshotDenseArray(value, 1);
+  const inputs: LarkCliTextInput[] = [];
+  for (const entry of raw) {
+    const snapshot = snapshotExactOwnDataOptions(entry, [
+      "flag",
+      "fileName",
+      "value",
+    ]);
+    if (snapshot.flag !== "--content" || snapshot.fileName !== "content.xml") {
+      throw new Error("invalid lark-cli invocation");
+    }
+    const text = snapshot.value;
+    strictUtf8Bytes(text);
+    inputs.push(
+      Object.freeze({
+        flag: "--content",
+        fileName: "content.xml",
+        value: text as string,
+      }),
+    );
+  }
+  return Object.freeze(inputs);
+}
+
+function isPureRelativeSourcePath(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.includes("\0") ||
+    value.includes("\\") ||
+    isAbsolute(value)
+  ) {
+    return false;
+  }
+  const segments = value.split("/");
+  return segments.every(
+    (segment) => segment.length > 0 && segment !== "." && segment !== "..",
+  );
+}
+
+function isPureOutputFileName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    !value.includes("\0") &&
+    !value.includes("/") &&
+    !value.includes("\\") &&
+    value !== "." &&
+    value !== ".." &&
+    value !== "params.json" &&
+    value !== "data.json" &&
+    value !== "content.xml"
+  );
+}
+
+function snapshotFileInputs(value: unknown): readonly LarkCliFileInput[] {
+  const raw = snapshotDenseArray(value, MAX_FILE_INPUTS);
+  const inputs: LarkCliFileInput[] = [];
+  const outputNames = new Set<string>();
+  let totalBytes = 0;
+  for (const entry of raw) {
+    const snapshot = snapshotExactOwnDataOptions(entry, [
+      "flag",
+      "sourceRelativePath",
+      "outputFileName",
+      "sizeBytes",
+      "sha256",
+    ]);
+    if (
+      (snapshot.flag !== "--image" && snapshot.flag !== "--file") ||
+      !isPureRelativeSourcePath(snapshot.sourceRelativePath) ||
+      !isPureOutputFileName(snapshot.outputFileName) ||
+      outputNames.has(snapshot.outputFileName) ||
+      typeof snapshot.sizeBytes !== "number" ||
+      !Number.isSafeInteger(snapshot.sizeBytes) ||
+      snapshot.sizeBytes <= 0 ||
+      snapshot.sizeBytes > MAX_FILE_INPUT_BYTES ||
+      typeof snapshot.sha256 !== "string" ||
+      !SHA256_PATTERN.test(snapshot.sha256)
+    ) {
+      throw new Error("invalid lark-cli invocation");
+    }
+    totalBytes += snapshot.sizeBytes;
+    if (totalBytes > MAX_TOTAL_FILE_INPUT_BYTES) {
+      throw new Error("invalid lark-cli invocation");
+    }
+    outputNames.add(snapshot.outputFileName);
+    inputs.push(
+      Object.freeze({
+        flag: snapshot.flag,
+        sourceRelativePath: snapshot.sourceRelativePath,
+        outputFileName: snapshot.outputFileName,
+        sizeBytes: snapshot.sizeBytes,
+        sha256: snapshot.sha256 as `sha256:${string}`,
+      }),
+    );
+  }
+  return Object.freeze(inputs);
+}
+
 function buildPlan(
   route: StableLarkCliRoute,
   payload: JsonValue,
@@ -370,10 +510,14 @@ function buildPlan(
     plan = snapshotExactOwnDataOptions(route.buildInvocation(parsed), [
       "operationArgs",
       "jsonInputs",
+      "textInputs",
+      "fileInputs",
     ]);
     return Object.freeze({
       operationArgs: snapshotStringArguments(plan.operationArgs),
       jsonInputs: snapshotJsonInputs(plan.jsonInputs),
+      textInputs: snapshotTextInputs(plan.textInputs),
+      fileInputs: snapshotFileInputs(plan.fileInputs),
     });
   } catch {
     throw new Error("invalid lark-cli invocation");
@@ -544,15 +688,30 @@ type MaterializedPathEvidence = Readonly<{
   ino: number;
   uid: number;
   mode: number;
+  nlink: number;
   size: number;
   mtimeMs: number;
   ctimeMs: number;
+}>;
+
+type RegisteredSourceEvidence = Readonly<{
+  path: string;
+  dev: number;
+  ino: number;
+  uid: number;
+  mode: number;
+  nlink: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  sha256: `sha256:${string}`;
 }>;
 
 type MaterializedInputs = Readonly<{
   arguments: readonly string[];
   directory: MaterializedPathEvidence | null;
   files: readonly MaterializedPathEvidence[];
+  sources: readonly RegisteredSourceEvidence[];
 }>;
 
 function isMissingPathError(error: unknown): boolean {
@@ -584,7 +743,8 @@ function sameMaterializedIdentity(
     left.dev === right.dev &&
     left.ino === right.ino &&
     left.uid === right.uid &&
-    left.mode === right.mode
+    left.mode === right.mode &&
+    (left.kind === "directory" || left.nlink === right.nlink)
   );
 }
 
@@ -606,10 +766,298 @@ function materializedStatsMatch(
     stats.ino === evidence.ino &&
     stats.uid === evidence.uid &&
     stats.mode === evidence.mode &&
+    stats.nlink === evidence.nlink &&
     stats.size === evidence.size &&
     stats.mtimeMs === evidence.mtimeMs &&
     stats.ctimeMs === evidence.ctimeMs
   );
+}
+
+function registeredSourceStatsMatch(
+  stats: Stats,
+  evidence: RegisteredSourceEvidence,
+): boolean {
+  return (
+    stats.isFile() &&
+    !stats.isSymbolicLink() &&
+    stats.dev === evidence.dev &&
+    stats.ino === evidence.ino &&
+    stats.uid === evidence.uid &&
+    stats.mode === evidence.mode &&
+    stats.nlink === evidence.nlink &&
+    stats.size === evidence.size &&
+    stats.mtimeMs === evidence.mtimeMs &&
+    stats.ctimeMs === evidence.ctimeMs
+  );
+}
+
+function sameStatsIdentity(left: Stats, right: Stats): boolean {
+  return (
+    left.isFile() &&
+    right.isFile() &&
+    !left.isSymbolicLink() &&
+    !right.isSymbolicLink() &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.uid === right.uid &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs
+  );
+}
+
+async function copyRegisteredSource(
+  taskDirectory: string,
+  temporaryDirectory: string,
+  input: LarkCliFileInput,
+): Promise<
+  Readonly<{
+    materialized: MaterializedPathEvidence;
+    source: RegisteredSourceEvidence;
+  }>
+> {
+  const sourcePath = join(taskDirectory, input.sourceRelativePath);
+  const outputPath = join(temporaryDirectory, input.outputFileName);
+  const sourceBefore = await lstat(sourcePath);
+  if (
+    !sourceBefore.isFile() ||
+    sourceBefore.isSymbolicLink() ||
+    (sourceBefore.mode & 0o7777) !== 0o600 ||
+    sourceBefore.nlink !== 1 ||
+    (typeof process.getuid === "function" &&
+      sourceBefore.uid !== process.getuid()) ||
+    sourceBefore.size !== input.sizeBytes ||
+    (await realpath(sourcePath)) !== sourcePath
+  ) {
+    throw new Error("unsafe lark-cli registered source");
+  }
+  const source = await open(
+    sourcePath,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  let target: Awaited<ReturnType<typeof open>> | undefined;
+  let sourceOpened: Stats | undefined;
+  let targetOpened: Stats | undefined;
+  let actualSha256: `sha256:${string}` | undefined;
+  try {
+    sourceOpened = await source.stat();
+    if (!sameStatsIdentity(sourceBefore, sourceOpened)) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    target = await open(
+      outputPath,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_EXCL |
+        fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < input.sizeBytes) {
+      const maximum = Math.min(chunk.length, input.sizeBytes - position);
+      const { bytesRead } = await source.read(chunk, 0, maximum, position);
+      if (bytesRead <= 0) {
+        throw new Error("unsafe lark-cli registered source");
+      }
+      hash.update(chunk.subarray(0, bytesRead));
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await target.write(
+          chunk,
+          written,
+          bytesRead - written,
+          position + written,
+        );
+        if (result.bytesWritten <= 0) {
+          throw new Error("unsafe lark-cli materialized file");
+        }
+        written += result.bytesWritten;
+      }
+      position += bytesRead;
+    }
+    const trailing = await source.read(Buffer.allocUnsafe(1), 0, 1, position);
+    if (trailing.bytesRead !== 0) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    actualSha256 = `sha256:${hash.digest("hex")}`;
+    if (actualSha256 !== input.sha256) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    await target.sync();
+    targetOpened = await target.stat();
+    const sourceAfterDescriptor = await source.stat();
+    const sourceAfterPath = await lstat(sourcePath);
+    if (
+      !sameStatsIdentity(sourceBefore, sourceAfterDescriptor) ||
+      !sameStatsIdentity(sourceBefore, sourceAfterPath) ||
+      (await realpath(sourcePath)) !== sourcePath
+    ) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    if (
+      !targetOpened.isFile() ||
+      (targetOpened.mode & 0o7777) !== 0o600 ||
+      targetOpened.nlink !== 1 ||
+      (typeof process.getuid === "function" &&
+        targetOpened.uid !== process.getuid()) ||
+      targetOpened.size !== input.sizeBytes
+    ) {
+      throw new Error("unsafe lark-cli materialized file");
+    }
+  } finally {
+    try {
+      await target?.close();
+    } finally {
+      await source.close();
+    }
+  }
+  const materialized = await captureMaterializedPath(outputPath, "file", 0o600);
+  if (
+    sourceOpened === undefined ||
+    targetOpened === undefined ||
+    actualSha256 === undefined ||
+    !openedFileMatchesEvidence(targetOpened, materialized)
+  ) {
+    throw new Error("unsafe lark-cli materialized file");
+  }
+  return Object.freeze({
+    materialized,
+    source: freezeNullRecord<RegisteredSourceEvidence>({
+      path: sourcePath,
+      dev: sourceOpened.dev,
+      ino: sourceOpened.ino,
+      uid: sourceOpened.uid,
+      mode: sourceOpened.mode,
+      nlink: sourceOpened.nlink,
+      size: sourceOpened.size,
+      mtimeMs: sourceOpened.mtimeMs,
+      ctimeMs: sourceOpened.ctimeMs,
+      sha256: actualSha256,
+    }),
+  });
+}
+
+async function registeredSourceMatches(
+  evidence: RegisteredSourceEvidence,
+): Promise<boolean> {
+  let descriptor: Awaited<ReturnType<typeof open>> | undefined;
+  let valid = false;
+  try {
+    const before = await lstat(evidence.path);
+    if (
+      !registeredSourceStatsMatch(before, evidence) ||
+      (await realpath(evidence.path)) !== evidence.path
+    ) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    descriptor = await open(
+      evidence.path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    const opened = await descriptor.stat();
+    if (!registeredSourceStatsMatch(opened, evidence)) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < evidence.size) {
+      const maximum = Math.min(chunk.length, evidence.size - position);
+      const { bytesRead } = await descriptor.read(chunk, 0, maximum, position);
+      if (bytesRead <= 0) {
+        throw new Error("unsafe lark-cli registered source");
+      }
+      hash.update(chunk.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const trailing = await descriptor.read(
+      Buffer.allocUnsafe(1),
+      0,
+      1,
+      position,
+    );
+    if (trailing.bytesRead !== 0) {
+      throw new Error("unsafe lark-cli registered source");
+    }
+    const afterDescriptor = await descriptor.stat();
+    const afterPath = await lstat(evidence.path);
+    valid =
+      registeredSourceStatsMatch(afterDescriptor, evidence) &&
+      registeredSourceStatsMatch(afterPath, evidence) &&
+      (await realpath(evidence.path)) === evidence.path &&
+      `sha256:${hash.digest("hex")}` === evidence.sha256;
+  } catch {
+    valid = false;
+  } finally {
+    try {
+      await descriptor?.close();
+    } catch {
+      valid = false;
+    }
+  }
+  return valid;
+}
+
+function registeredSourceMatchesSynchronously(
+  evidence: RegisteredSourceEvidence,
+): boolean {
+  let descriptor: number | undefined;
+  let valid = false;
+  try {
+    const before = lstatSync(evidence.path);
+    if (
+      !registeredSourceStatsMatch(before, evidence) ||
+      realpathSync(evidence.path) !== evidence.path
+    ) {
+      return false;
+    }
+    descriptor = openSync(
+      evidence.path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    const opened = fstatSync(descriptor);
+    if (!registeredSourceStatsMatch(opened, evidence)) return false;
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < evidence.size) {
+      const maximum = Math.min(chunk.length, evidence.size - position);
+      const bytesRead = readSync(descriptor, chunk, 0, maximum, position);
+      if (bytesRead <= 0) return false;
+      hash.update(chunk.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const trailing = readSync(
+      descriptor,
+      Buffer.allocUnsafe(1),
+      0,
+      1,
+      position,
+    );
+    const afterDescriptor = fstatSync(descriptor);
+    const afterPath = lstatSync(evidence.path);
+    valid =
+      trailing === 0 &&
+      registeredSourceStatsMatch(afterDescriptor, evidence) &&
+      registeredSourceStatsMatch(afterPath, evidence) &&
+      realpathSync(evidence.path) === evidence.path &&
+      `sha256:${hash.digest("hex")}` === evidence.sha256;
+  } catch {
+    valid = false;
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        valid = false;
+      }
+    }
+  }
+  return valid;
 }
 
 async function captureMaterializedPath(
@@ -624,6 +1072,7 @@ async function captureMaterializedPath(
   if (
     !isExpectedPathKind(before, kind) ||
     before.isSymbolicLink() ||
+    (kind === "file" && before.nlink !== 1) ||
     (before.mode & 0o7777) !== requiredMode ||
     (typeof process.getuid === "function" && before.uid !== process.getuid()) ||
     (await realpath(path)) !== path
@@ -638,6 +1087,7 @@ async function captureMaterializedPath(
     after.ino !== before.ino ||
     after.uid !== before.uid ||
     after.mode !== before.mode ||
+    after.nlink !== before.nlink ||
     after.size !== before.size ||
     after.mtimeMs !== before.mtimeMs ||
     after.ctimeMs !== before.ctimeMs
@@ -651,6 +1101,7 @@ async function captureMaterializedPath(
     ino: after.ino,
     uid: after.uid,
     mode: after.mode,
+    nlink: after.nlink,
     size: after.size,
     mtimeMs: after.mtimeMs,
     ctimeMs: after.ctimeMs,
@@ -669,8 +1120,11 @@ async function materializedPathMatches(
       current.dev === evidence.dev &&
       current.ino === evidence.ino &&
       current.uid === evidence.uid &&
+      (evidence.kind === "directory" ||
+        (evidence.nlink === 1 && current.nlink === evidence.nlink)) &&
       (!requireExactMetadata ||
         (current.mode === evidence.mode &&
+          current.nlink === evidence.nlink &&
           current.size === evidence.size &&
           current.mtimeMs === evidence.mtimeMs &&
           current.ctimeMs === evidence.ctimeMs)) &&
@@ -683,9 +1137,10 @@ async function materializedPathMatches(
 
 async function verifyMaterializedInputs(
   inputs: MaterializedInputs,
+  includeSources = true,
 ): Promise<boolean> {
   if (inputs.directory === null) {
-    return inputs.files.length === 0;
+    return inputs.files.length === 0 && inputs.sources.length === 0;
   }
   if (!(await materializedPathMatches(inputs.directory, true))) {
     return false;
@@ -693,6 +1148,13 @@ async function verifyMaterializedInputs(
   for (const file of inputs.files) {
     if (!(await materializedPathMatches(file, true))) {
       return false;
+    }
+  }
+  if (includeSources) {
+    for (const source of inputs.sources) {
+      if (!(await registeredSourceMatches(source))) {
+        return false;
+      }
     }
   }
   return materializedPathMatches(inputs.directory, true);
@@ -743,13 +1205,18 @@ function verifyMaterializedInputsSynchronously(
   inputs: MaterializedInputs,
 ): boolean {
   if (inputs.directory === null) {
-    return inputs.files.length === 0;
+    return inputs.files.length === 0 && inputs.sources.length === 0;
   }
   if (!materializedPathMatchesSynchronously(inputs.directory)) {
     return false;
   }
   for (const file of inputs.files) {
     if (!materializedPathMatchesSynchronously(file)) {
+      return false;
+    }
+  }
+  for (const source of inputs.sources) {
+    if (!registeredSourceMatchesSynchronously(source)) {
       return false;
     }
   }
@@ -796,18 +1263,26 @@ async function cleanupKnownInputs(
 
 async function materializeInputs(
   taskDirectory: string,
-  inputs: readonly LarkCliJsonInput[],
+  jsonInputs: readonly LarkCliJsonInput[],
+  textInputs: readonly LarkCliTextInput[],
+  fileInputs: readonly LarkCliFileInput[],
 ): Promise<MaterializedInputs> {
-  if (inputs.length === 0) {
+  if (
+    jsonInputs.length === 0 &&
+    textInputs.length === 0 &&
+    fileInputs.length === 0
+  ) {
     return Object.freeze({
       arguments: Object.freeze([]),
       directory: null,
       files: Object.freeze([]),
+      sources: Object.freeze([]),
     });
   }
   let directoryPath: string | null = null;
   let directoryEvidence: MaterializedPathEvidence | null = null;
   const fileEvidence: MaterializedPathEvidence[] = [];
+  const sourceEvidence: RegisteredSourceEvidence[] = [];
   const knownFilePaths: string[] = [];
   try {
     directoryPath = await mkdtemp(join(taskDirectory, ".lark-cli-"));
@@ -826,7 +1301,7 @@ async function materializeInputs(
     const relativeDirectory = relative(taskDirectory, directoryPath);
     const arguments_: string[] = [];
     let totalInputBytes = 0;
-    for (const input of inputs) {
+    for (const input of jsonInputs) {
       const name = input.flag === "--params" ? "params.json" : "data.json";
       const path = join(directoryPath, name);
       knownFilePaths.push(path);
@@ -869,6 +1344,63 @@ async function materializeInputs(
       fileEvidence.push(captured);
       arguments_.push(input.flag, `@${relativeDirectory}/${name}`);
     }
+    for (const input of textInputs) {
+      const path = join(directoryPath, input.fileName);
+      knownFilePaths.push(path);
+      const body = strictUtf8Bytes(input.value);
+      totalInputBytes += body.length;
+      if (totalInputBytes > MAX_INPUT_BYTES) {
+        throw new Error("lark-cli input limit exceeded");
+      }
+      const descriptor = await open(
+        path,
+        fsConstants.O_WRONLY |
+          fsConstants.O_CREAT |
+          fsConstants.O_EXCL |
+          fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      let opened: Stats | undefined;
+      try {
+        await descriptor.writeFile(body);
+        await descriptor.sync();
+        opened = await descriptor.stat();
+        if (
+          !opened.isFile() ||
+          (opened.mode & 0o7777) !== 0o600 ||
+          (typeof process.getuid === "function" &&
+            opened.uid !== process.getuid())
+        ) {
+          throw new Error("unsafe lark-cli input file");
+        }
+      } finally {
+        await descriptor.close();
+      }
+      const captured = await captureMaterializedPath(path, "file", 0o600);
+      if (
+        opened === undefined ||
+        !openedFileMatchesEvidence(opened, captured)
+      ) {
+        throw new Error("unsafe lark-cli input file");
+      }
+      fileEvidence.push(captured);
+      arguments_.push(input.flag, `@${relativeDirectory}/${input.fileName}`);
+    }
+    for (const input of fileInputs) {
+      const outputPath = join(directoryPath, input.outputFileName);
+      knownFilePaths.push(outputPath);
+      const copied = await copyRegisteredSource(
+        taskDirectory,
+        directoryPath,
+        input,
+      );
+      fileEvidence.push(copied.materialized);
+      sourceEvidence.push(copied.source);
+      arguments_.push(
+        input.flag,
+        `@${relativeDirectory}/${input.outputFileName}`,
+      );
+    }
     const finalDirectoryEvidence = await captureMaterializedPath(
       directoryPath,
       "directory",
@@ -882,6 +1414,7 @@ async function materializeInputs(
       arguments: Object.freeze(arguments_),
       directory: directoryEvidence,
       files: Object.freeze(fileEvidence),
+      sources: Object.freeze(sourceEvidence),
     });
   } catch (error) {
     await cleanupKnownInputs(directoryPath, directoryEvidence, knownFilePaths);
@@ -1162,7 +1695,12 @@ export function createLarkCliRunner(options: LarkCliRunnerOptions) {
 
     let inputs: MaterializedInputs;
     try {
-      inputs = await materializeInputs(taskDirectory, plan.jsonInputs);
+      inputs = await materializeInputs(
+        taskDirectory,
+        plan.jsonInputs,
+        plan.textInputs,
+        plan.fileInputs,
+      );
     } catch {
       return failed("OUTPUT_INVALID");
     }
@@ -1237,7 +1775,9 @@ export function createLarkCliRunner(options: LarkCliRunnerOptions) {
       }
     } catch {
       await cleanupInputs(inputs);
-      return failed("SPAWN_FAILED");
+      return route.effect === "write"
+        ? unknown("IO_AFTER_SPAWN")
+        : failed("SPAWN_FAILED");
     }
 
     const outcome = await collectChild(
@@ -1251,7 +1791,7 @@ export function createLarkCliRunner(options: LarkCliRunnerOptions) {
       return unknown("TERMINATION_UNCONFIRMED");
     }
 
-    const inputsIntact = await verifyMaterializedInputs(inputs);
+    const inputsIntact = await verifyMaterializedInputs(inputs, false);
     let after: LarkCliReleaseEvidence | null = null;
     try {
       after = snapshotReleaseEvidence(

@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "userScopes": [
+    "calendar:calendar.event:create",
+    "calendar:calendar.event:update",
+    "contact:user:search",
+    "minutes:minutes.search:read",
+    "minutes:minutes.basic:read",
+    "minutes:minutes.artifacts:read",
+    "base:app:read",
+    "base:table:read",
+    "base:field:read",
+    "base:view:read",
+    "base:record:read",
+    "base:record:retrieve",
+    "search:docs:read",
+    "docx:document:create"
+  ],
+  "botScopes": [
+    "im:message:send_as_bot",
+    "im:message:readonly",
+    "im:message",
+    "im:resource"
+  ],
+  "shortcuts": [
+    {
+      "identity": "user",
+      "command": "minutes",
+      "shortcut": "+search"
+    },
+    {
+      "identity": "user",
+      "command": "minutes",
+      "shortcut": "+detail"
+    },
+    {
+      "identity": "user",
+      "command": "contact",
+      "shortcut": "+search-user"
+    },
+    {
+      "identity": "bot",
+      "command": "im",
+      "shortcut": "+messages-send"
+    },
+    {
+      "identity": "user",
+      "command": "calendar",
+      "shortcut": "+create"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+url-resolve"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+title-resolve"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+base-get"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+table-list"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+field-list"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+view-list"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+record-list"
+    },
+    {
+      "identity": "user",
+      "command": "base",
+      "shortcut": "+data-query"
+    },
+    {
+      "identity": "user",
+      "command": "docs",
+      "shortcut": "+create"
+    }
+  ]
+}

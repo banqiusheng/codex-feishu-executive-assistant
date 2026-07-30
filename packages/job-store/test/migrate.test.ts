@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -14,6 +17,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { applyChecksumVerifiedMigrationsInOneTransaction } from "../src/migrate.js";
+import { migrationDirectoryForModuleUrl } from "../src/open-store.js";
 
 const temporaryPaths: string[] = [];
 
@@ -37,6 +41,32 @@ function writeMigration(directory: string, name: string, sql: string): void {
 }
 
 describe("checksum-verified migrations", () => {
+  it("keeps the four historical checksums while appending migration 005", () => {
+    const migrationDirectory = migrationDirectoryForModuleUrl(import.meta.url);
+    const migrations = readdirSync(migrationDirectory)
+      .filter((name) => name.endsWith(".sql"))
+      .sort();
+    expect(migrations).toEqual([
+      "001_initial.sql",
+      "002_task_leases_and_control_outcomes.sql",
+      "003_task_acknowledgements.sql",
+      "004_single_inflight_task_acknowledgement.sql",
+      "005_direct_actions_resources_and_batches.sql",
+    ]);
+    expect(
+      migrations.slice(0, 4).map((name) =>
+        createHash("sha256")
+          .update(readFileSync(join(migrationDirectory, name)))
+          .digest("hex"),
+      ),
+    ).toEqual([
+      "1364dcd0d3260154fc43f17c698de8d724f5b2389ee1893597ddc50826356e91",
+      "5cb217a310e80619cc98ea8f60913a1df909528742ac42f9e70fed2c464797c1",
+      "75b43d38bb30ea4cfe31047a90637c1945170f2e781c18163f569250f36991db",
+      "7c7eaaa3fff6716df24b03039ab30d86dcda65c6c7b0aa6ab08e02cfc21c0712",
+    ]);
+  });
+
   it("rejects an empty migration manifest", () => {
     const migrationDirectory = createMigrationDirectory();
     const database = new Database(":memory:");

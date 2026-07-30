@@ -23,9 +23,10 @@
   UI 绕过状态机。
 - 每项实现先写失败测试，再写最小代码，再跑定向测试。每个任务的提交、推送、真实飞书写入仍是
   独立门禁；没有新授权时只运行本地 mock、fixture、dry-run 和只读检查。
-- Task 1–11 只形成未提交实现和本地验证证据，不做中间提交。只有 Task 12 真实验收全部通过、
-  README/BOOTSTRAP/CHANGELOG 已同步且用户再次授权后，才把完整实现作为一次本地提交；这保持
-  “实现与模拟测试 → 真实验收 → 交付文档 → 本地提交 → 推送”的既定顺序。
+- Task 1–11 只形成未提交实现和本地验证证据，不做中间提交。原定顺序为“实现与模拟测试 →
+  真实验收 → 交付文档 → 本地提交 → 推送”。2026-07-30 因本机 App Secret 已重置、真实验收
+  必须转移到高管目标 Mac，用户明确把顺序调整为“本地完整门禁 → 发布公开 `main` 验收候选版
+  → 目标 Mac 安全更新 → 真实验收”。这项顺序变更不等于目标机验收通过或 production ready。
 - 所有外部写操作启动后遇到超时、连接断开或本地落账失败均落为 `UNKNOWN`，绝不自动重发。
 - 锁定的 `lark-cli 1.0.72` 对 `/wiki/` URL 解析额外要求
   `wiki:node:retrieve`，但该 scope 不在已确认最小权限中。本轮不得静默扩大权限：直接
@@ -1075,13 +1076,13 @@
 
 ---
 
-## Task 12: 真实飞书验收、交付文档与发布门禁
+## Task 12: 目标 Mac 验收候选版、交付文档与发布门禁
 
 **Files:**
 
-- Modify only after all real acceptance passes: `README.md`
-- Modify only after all real acceptance passes: `BOOTSTRAP.md`
-- Modify only after all real acceptance passes: `CHANGELOG.md`
+- Modify: `README.md`
+- Modify: `BOOTSTRAP.md`
+- Modify: `CHANGELOG.md`
 - Modify: `tests/ops/delivery-surface.test.ts`
 
 - [ ] **Step 1: 先做固定 CLI dry-run/只读预检**
@@ -1089,12 +1090,76 @@
   使用安装目录内锁定的 1.0.72，不使用全局 CLI。验证 contact、calendar、IM、Base 和 docs
   shortcut 存在；写 route 只 dry-run，不产生真实外部影响。
 
-- [ ] **Step 2: 单独取得真实写入授权**
+- [ ] **Step 2: 修复候选版发布阻塞项**
+
+  本机只读预检若发现会阻塞目标 Mac 安装或产生假失败的交付缺陷，先按红测 → 最小修复 →
+  定向验证关闭。本轮已知阻塞项仅包括：
+
+  - doctor 必须使用与运行时一致的 SQLite 实现执行只读 `quick_check`，不能因 Apple 系统
+    `sqlite3` 与 bundled SQLite 文件兼容差异误报损坏；
+  - App Secret 已被开发者后台重置时，目标 Mac 的 Codex 必须能启动一次显式交互式
+    Keychain 刷新；Secret 仍不得进入 argv、环境、配置、日志或聊天。
+
+- [ ] **Step 3: 更新候选版交付文档**
+
+  README/BOOTSTRAP 只保留高管需要的最短路径：
+
+  - 首次安装按 GitHub 一条指令交给 Codex；
+  - 普通更新继续由总裁精确回复“更新”触发；
+  - App Secret 被重置、机器人已经离线时，由目标 Mac 的 Codex 运行一次显式安全刷新，不要求
+    高管复制 Secret、授权 URL 或终端输出；
+  - 日常只需自然语言下达日程、通知和 Base 报告任务；
+  - 明确标记当前是目标 Mac 验收候选版，不伪造真实验收结论。
+
+  CHANGELOG 明确 capability、权限增量、升级兼容、本地验证和待完成的目标机真实验收。
+
+- [ ] **Step 4: 最终本地验证**
+
+  ```bash
+  corepack pnpm format:check
+  corepack pnpm lint
+  corepack pnpm typecheck
+  corepack pnpm test
+  corepack pnpm build
+  ./scripts/vendor-bridge --offline-replay
+  ASSISTANT_TEST_MODE=1 ./scripts/install --verify-only
+  gitleaks git --config .gitleaks.toml --redact --no-banner .
+  git diff --check
+  git status --short --branch
+  ```
+
+- [ ] **Step 5: 本地提交并推送公开 `main` 验收候选版**
+
+  用户已明确授权本次候选版先发布到 GitHub，供高管目标 Mac 的 Codex 更新。提交前先用
+  `git status --short`、`git diff --name-status` 和
+  `git ls-files --others --exclude-standard` 取得实际文件集合，并逐项与 Task 1–12 的
+  **Files** 清单核对；只用显式 pathspec 暂存，不使用 `git add -A`、`.` 或目录级兜底。
+
+  ```bash
+  git add -- <逐项复核后的精确文件路径>
+  git diff --cached --name-status
+  git diff --cached --check
+  gitleaks protect --staged --redact --verbose
+  git commit -m "feat: add direct Feishu actions and Base reports"
+  git fetch origin main
+  git merge-base --is-ancestor origin/main HEAD
+  git push origin HEAD:main
+  ```
+
+  不创建 PR、Tag 或 Release；任一验证、密钥扫描或 fast-forward 条件失败时停在推送前。
+
+- [ ] **Step 6: 在目标 Mac 安全更新**
+
+  由目标 Mac 上的 Codex 从公开 `main` 做 fast-forward 更新，按 README/BOOTSTRAP 运行安全
+  更新入口。若 Bot App Secret 已被重置，先通过安装器的显式交互入口刷新 Keychain，再重建
+  当前安装并运行 doctor。不得让用户在聊天、命令参数或配置文件里粘贴 Secret。
+
+- [ ] **Step 7: 单独取得真实写入授权**
 
   明确测试总裁、测试联系人、测试 Base、测试附件、测试日程标题和清理责任。没有这项授权时停在
-  本地验证通过，不调用真实日程、通知或文档创建。
+  目标 Mac 安装/只读 doctor 通过，不调用真实日程、通知或文档创建。
 
-- [ ] **Step 3: 完成真实验收**
+- [ ] **Step 8: 完成目标 Mac 真实验收**
 
   按顺序验证并留脱敏证据：
 
@@ -1106,48 +1171,5 @@
   6. 在 `my_library` 创建一次原生飞书云文档并回传链接；
   7. 缺一项 User scope 时由飞书卡片直接打开授权页。
 
-  只判断功能是否达标，不为视觉微调反复阻塞。任何一项失败都不宣称完成，也不进入发布整理。
-
-- [ ] **Step 4: 更新交付文档**
-
-  README/BOOTSTRAP 只保留高管需要的最短路径：
-
-  - 首次安装按 GitHub 一条命令；
-  - App ID 和 Secret 仍由安全安装流程处理；
-  - 缺个人权限时在飞书点击授权；
-  - 日常只需自然语言下达日程、通知和 Base 报告任务；
-  - 看到版本提示后精确回复“更新”。
-
-  CHANGELOG 明确 capability、权限增量、升级兼容和真实验收结果。
-
-- [ ] **Step 5: 最终验证**
-
-  ```bash
-  corepack pnpm format:check
-  corepack pnpm lint
-  corepack pnpm typecheck
-  corepack pnpm test
-  corepack pnpm build
-  ./scripts/doctor --json
-  git diff --check
-  git status --short --branch
-  ```
-
-- [ ] **Step 6: 单独申请本地提交授权**
-
-  获得授权后，先用 `git status --short`、`git diff --name-status` 和
-  `git ls-files --others --exclude-standard` 取得实际文件集合，并逐项与 Task 1–12 的 **Files**
-  清单核对。只用显式 pathspec 暂存这些已复核文件，不使用 `git add -A`、`.` 或目录级兜底。
-
-  ```bash
-  git add -- <逐项复核后的精确文件路径>
-  git diff --cached --name-status
-  git diff --cached --check
-  gitleaks protect --staged --redact --verbose
-  git commit -m "feat: add direct Feishu actions and Base reports"
-  ```
-
-- [ ] **Step 7: 单独申请公开 `main` 推送授权**
-
-  推送前复核所有本地提交、无秘密扫描、工作树和远端 fast-forward 条件。没有明确推送授权时停止；
-  不创建 PR、Tag 或 Release。
+  只判断功能是否达标，不为视觉微调反复阻塞。任何一项失败都不宣称新功能已在目标机完成；
+  修复后仍通过同一公开 `main` 更新链交付。

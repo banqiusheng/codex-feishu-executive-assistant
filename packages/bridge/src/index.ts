@@ -20,6 +20,10 @@ export {
   type AssistantChannelDependencies,
   type AssistantNormalizer,
   type CardBinding,
+  type CurrentMessageFileResourceDescriptor,
+  type CurrentMessageImageResourceDescriptor,
+  type CurrentMessageResourceDescriptor,
+  type QuotedMessageCandidate,
   type RawEnvelope,
 } from "./runtime/assistant-channel.js";
 export {

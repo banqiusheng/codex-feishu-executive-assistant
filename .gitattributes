@@ -4,3 +4,4 @@ vendor/patches/lark-codex-bridge/0002-fail-closed-ingress.patch whitespace=-blan
 vendor/patches/lark-codex-bridge/0003-constrained-codex-runner.patch whitespace=-blank-at-eol
 vendor/patches/lark-codex-bridge/0004-ledger-first-assistant-channel.patch whitespace=-blank-at-eol
 vendor/patches/lark-codex-bridge/0005-static-dynamic-access-boundary.patch whitespace=-blank-at-eol
+vendor/patches/lark-codex-bridge/0007-task-resource-projection.patch whitespace=-blank-at-eol

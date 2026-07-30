@@ -79,7 +79,12 @@ function prepareFixture(): Fixture {
   git(seed, "config", "user.name", "Updater Test");
   git(seed, "config", "user.email", "updater@example.invalid");
   mkdirSync(join(seed, "scripts"), { recursive: true });
+  mkdirSync(join(seed, "config"), { recursive: true });
   writeFileSync(join(seed, "README.md"), "initial\n");
+  writeFileSync(
+    join(seed, "config", "feishu-scopes.json"),
+    readFileSync(join(repositoryRoot, "config", "feishu-scopes.json"), "utf8"),
+  );
   writeFileSync(
     join(seed, "scripts", "install"),
     installerSource(installLog, "old"),
@@ -118,6 +123,7 @@ function advanceRemote(
   options: Readonly<{
     installerLabel?: string;
     installerExitCode?: number;
+    scopeContract?: string;
   }> = {},
 ): string {
   writeFileSync(
@@ -135,6 +141,12 @@ function advanceRemote(
       { mode: 0o700 },
     );
     chmodSync(join(fixture.seed, "scripts", "install"), 0o700);
+  }
+  if (options.scopeContract !== undefined) {
+    writeFileSync(
+      join(fixture.seed, "config", "feishu-scopes.json"),
+      options.scopeContract,
+    );
   }
   git(fixture.seed, "add", ".");
   git(fixture.seed, "commit", "-m", "advance remote");
@@ -292,6 +304,56 @@ describe("simple GitHub main updater", () => {
     });
     expect(git(fixture.checkout, "rev-parse", "HEAD")).toBe(remoteCommit);
     expect(readFileSync(fixture.installLog, "utf8")).toBe("new\n");
+  });
+
+  it("keeps the new version when the installer reports pending User OAuth as a successful non-interactive install", () => {
+    const fixture = prepareFixture();
+    const remoteCommit = advanceRemote(fixture, {
+      installerLabel: "new-user-oauth-action-required",
+      installerExitCode: 0,
+    });
+
+    const result = runUpdater(fixture, "--apply");
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(jsonOutput(result)).toMatchObject({
+      status: "updated",
+      previousCommit: fixture.initialCommit,
+      currentCommit: remoteCommit,
+    });
+    expect(git(fixture.checkout, "rev-parse", "HEAD")).toBe(remoteCommit);
+    expect(readFileSync(fixture.installLog, "utf8")).toBe(
+      "new-user-oauth-action-required\n",
+    );
+  });
+
+  it("rolls back before installing when the fetched version replaces the Feishu scope contract", () => {
+    const fixture = prepareFixture();
+    const attemptedCommit = advanceRemote(fixture, {
+      installerLabel: "must-not-run",
+      scopeContract: `${JSON.stringify({
+        schemaVersion: 1,
+        userScopes: ["calendar:calendar.event:delete"],
+        botScopes: ["im:message"],
+        shortcuts: [],
+      })}\n`,
+    });
+
+    const result = runUpdater(fixture, "--apply");
+
+    expect(result.status).not.toBe(0);
+    expect(jsonOutput(result)).toEqual({
+      schemaVersion: 1,
+      command: "apply",
+      status: "rolled_back",
+      reason: "scope_contract_invalid",
+      restoredCommit: fixture.initialCommit,
+      attemptedCommit,
+    });
+    expect(git(fixture.checkout, "rev-parse", "HEAD")).toBe(
+      fixture.initialCommit,
+    );
+    expect(readFileSync(fixture.installLog, "utf8")).toBe("old\n");
   });
 
   it("rejects an untrusted origin without fetching or installing", () => {

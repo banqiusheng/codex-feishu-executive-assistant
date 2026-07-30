@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -28,6 +29,12 @@ const installSupportPath = join(
   "install-support.mjs",
 );
 const doctorPath = join(repositoryRoot, "scripts/doctor");
+const feishuScopesPath = join(repositoryRoot, "config", "feishu-scopes.json");
+const feishuScopeContractHelperPath = join(
+  repositoryRoot,
+  "scripts",
+  "feishu-scope-contract.mjs",
+);
 const feishuNetworkDoctorPath = join(
   repositoryRoot,
   "scripts",
@@ -38,6 +45,7 @@ const feishuUserAuthPath = join(
   "scripts",
   "feishu-user-auth.mjs",
 );
+const sqliteDoctorPath = join(repositoryRoot, "scripts", "doctor-sqlite.mjs");
 const restartPath = join(repositoryRoot, "scripts/restart");
 const temporaryRoots: string[] = [];
 
@@ -70,7 +78,9 @@ function copyMinimalInstallDelivery(root: string): string {
     "scripts/install",
     "scripts/install-support.mjs",
     "scripts/doctor-feishu-network.mjs",
+    "scripts/doctor-sqlite.mjs",
     "scripts/feishu-user-auth.mjs",
+    "scripts/feishu-scope-contract.mjs",
   ]) {
     cpSync(join(repositoryRoot, entry), join(root, entry), { recursive: true });
   }
@@ -87,6 +97,509 @@ afterEach(() => {
 });
 
 describe("lean delivery surface", () => {
+  it("extracts only tenant scopes from one valid app-info response", () => {
+    const result = spawnSync(
+      process.execPath,
+      [feishuScopeContractHelperPath, "app-info-bot-scopes"],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        input: JSON.stringify({
+          code: 0,
+          msg: "success",
+          data: {
+            app: {
+              scopes: [
+                {
+                  scope: "im:message:send_as_bot",
+                  token_types: ["tenant"],
+                },
+                {
+                  scope: "contact:user:search",
+                  token_types: ["user"],
+                },
+                {
+                  scope: "im:message",
+                  token_types: ["user", "tenant"],
+                },
+              ],
+            },
+          },
+        }),
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("im:message:send_as_bot\nim:message\n");
+    expect(result.stderr).toBe("");
+  });
+
+  it.each([
+    [
+      "nonzero top-level code",
+      {
+        code: 999,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant"],
+              },
+            ],
+          },
+        },
+      },
+    ],
+    ["missing data", { code: 0 }],
+    ["array data", { code: 0, data: [] }],
+    ["array app", { code: 0, data: { app: [] } }],
+    ["non-array scopes", { code: 0, data: { app: { scopes: {} } } }],
+    [
+      "array scope entry mixed with a required scope",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant"],
+              },
+              ["malformed"],
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "empty scope mixed with a required scope",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant"],
+              },
+              { scope: "", token_types: ["tenant"] },
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "invalid scope mixed with a required scope",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant"],
+              },
+              { scope: "im scope", token_types: ["tenant"] },
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "duplicate scope entries",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant"],
+              },
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["user"],
+              },
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "duplicate token types",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant", "tenant"],
+              },
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "empty token types",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: [],
+              },
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "non-string token type",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant", 1],
+              },
+            ],
+          },
+        },
+      },
+    ],
+    [
+      "unknown token type",
+      {
+        code: 0,
+        data: {
+          app: {
+            scopes: [
+              {
+                scope: "im:message:send_as_bot",
+                token_types: ["tenant", "root"],
+              },
+            ],
+          },
+        },
+      },
+    ],
+  ] as const)("rejects malformed app-info: %s", (_name, appInfo) => {
+    const result = spawnSync(
+      process.execPath,
+      [feishuScopeContractHelperPath, "app-info-bot-scopes"],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        input: JSON.stringify(appInfo),
+      },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toBe("");
+  });
+
+  it("rejects accessor-backed app-info instead of evaluating it", async () => {
+    const scopeModule = (await import(
+      pathToFileURL(feishuScopeContractHelperPath).href
+    )) as {
+      extractBotScopes(appInfo: unknown): string[];
+    };
+    let getterEvaluated = false;
+    const scopeEntry = {
+      get scope() {
+        getterEvaluated = true;
+        return "im:message:send_as_bot";
+      },
+      token_types: ["tenant"],
+    };
+
+    expect(() =>
+      scopeModule.extractBotScopes({
+        code: 0,
+        data: { app: { scopes: [scopeEntry] } },
+      }),
+    ).toThrow();
+    expect(getterEvaluated).toBe(false);
+  });
+
+  it.each([
+    "root",
+    "scopes-array",
+    "data",
+    "app",
+    "scope-entry",
+    "token-types",
+  ] as const)(
+    "rejects a %s Proxy without invoking any trap",
+    async (proxyPosition) => {
+      const scopeModule = (await import(
+        pathToFileURL(feishuScopeContractHelperPath).href
+      )) as {
+        extractBotScopes(appInfo: unknown): string[];
+      };
+      let trapCount = 0;
+      const wrap = <T extends object>(value: T): T =>
+        new Proxy(value, {
+          get() {
+            trapCount += 1;
+            throw new Error("proxy_get_trap");
+          },
+          getPrototypeOf() {
+            trapCount += 1;
+            throw new Error("proxy_get_prototype_trap");
+          },
+          ownKeys() {
+            trapCount += 1;
+            throw new Error("proxy_own_keys_trap");
+          },
+          getOwnPropertyDescriptor() {
+            trapCount += 1;
+            throw new Error("proxy_descriptor_trap");
+          },
+          has() {
+            trapCount += 1;
+            throw new Error("proxy_has_trap");
+          },
+        });
+      const scopeEntry = {
+        scope: "im:message:send_as_bot",
+        token_types: ["tenant"],
+      };
+      const appInfo = {
+        code: 0,
+        msg: "success",
+        data: {
+          app: {
+            scopes: [scopeEntry],
+          },
+        },
+      };
+      let candidate: unknown = appInfo;
+      if (proxyPosition === "root") {
+        candidate = wrap(appInfo);
+      } else if (proxyPosition === "scopes-array") {
+        appInfo.data.app.scopes = wrap(appInfo.data.app.scopes);
+      } else if (proxyPosition === "data") {
+        appInfo.data = wrap(appInfo.data);
+      } else if (proxyPosition === "app") {
+        appInfo.data.app = wrap(appInfo.data.app);
+      } else if (proxyPosition === "scope-entry") {
+        appInfo.data.app.scopes[0] = wrap(scopeEntry);
+      } else {
+        scopeEntry.token_types = wrap(scopeEntry.token_types);
+      }
+
+      expect(() => scopeModule.extractBotScopes(candidate)).toThrow();
+      expect(trapCount).toBe(0);
+    },
+  );
+
+  it("ships one ordered Feishu permission and shortcut contract", () => {
+    const contract = JSON.parse(readFileSync(feishuScopesPath, "utf8")) as {
+      schemaVersion: number;
+      userScopes: string[];
+      botScopes: string[];
+      shortcuts: Array<{
+        identity: string;
+        command: string;
+        shortcut: string;
+      }>;
+    };
+
+    expect(contract).toEqual({
+      schemaVersion: 1,
+      userScopes: [
+        "calendar:calendar.event:create",
+        "calendar:calendar.event:update",
+        "contact:user:search",
+        "minutes:minutes.search:read",
+        "minutes:minutes.basic:read",
+        "minutes:minutes.artifacts:read",
+        "base:app:read",
+        "base:table:read",
+        "base:field:read",
+        "base:view:read",
+        "base:record:read",
+        "base:record:retrieve",
+        "search:docs:read",
+        "docx:document:create",
+      ],
+      botScopes: [
+        "im:message:send_as_bot",
+        "im:message:readonly",
+        "im:message",
+        "im:resource",
+      ],
+      shortcuts: [
+        { identity: "user", command: "minutes", shortcut: "+search" },
+        { identity: "user", command: "minutes", shortcut: "+detail" },
+        { identity: "user", command: "contact", shortcut: "+search-user" },
+        { identity: "bot", command: "im", shortcut: "+messages-send" },
+        { identity: "user", command: "calendar", shortcut: "+create" },
+        { identity: "user", command: "base", shortcut: "+url-resolve" },
+        { identity: "user", command: "base", shortcut: "+title-resolve" },
+        { identity: "user", command: "base", shortcut: "+base-get" },
+        { identity: "user", command: "base", shortcut: "+table-list" },
+        { identity: "user", command: "base", shortcut: "+field-list" },
+        { identity: "user", command: "base", shortcut: "+view-list" },
+        { identity: "user", command: "base", shortcut: "+record-list" },
+        { identity: "user", command: "base", shortcut: "+data-query" },
+        { identity: "user", command: "docs", shortcut: "+create" },
+      ],
+    });
+    expect(new Set(contract.userScopes).size).toBe(contract.userScopes.length);
+    expect(new Set(contract.botScopes).size).toBe(contract.botScopes.length);
+    expect(
+      new Set(
+        contract.shortcuts.map(
+          (entry) => `${entry.identity}:${entry.command}:${entry.shortcut}`,
+        ),
+      ).size,
+    ).toBe(contract.shortcuts.length);
+  });
+
+  it("fails verify-only when the single Feishu contract is missing, replaced, duplicated, or reordered", () => {
+    for (const mutation of [
+      "missing",
+      "replacement",
+      "duplicate",
+      "reordered",
+    ] as const) {
+      const root = temporaryHome();
+      const localInstall = copyMinimalInstallDelivery(root);
+      const contractPath = join(root, "config", "feishu-scopes.json");
+      const original = JSON.parse(readFileSync(feishuScopesPath, "utf8")) as {
+        userScopes: string[];
+      };
+      if (mutation === "missing") {
+        rmSync(contractPath);
+      } else if (mutation === "replacement") {
+        writeFileSync(
+          contractPath,
+          `${JSON.stringify({
+            ...original,
+            userScopes: original.userScopes.map((scope, index) =>
+              index === 0 ? "calendar:calendar.event:delete" : scope,
+            ),
+          })}\n`,
+        );
+      } else if (mutation === "duplicate") {
+        writeFileSync(
+          contractPath,
+          `${JSON.stringify({
+            ...original,
+            userScopes: [original.userScopes[0], ...original.userScopes],
+          })}\n`,
+        );
+      } else {
+        writeFileSync(
+          contractPath,
+          `${JSON.stringify({
+            ...original,
+            userScopes: [
+              original.userScopes[1],
+              original.userScopes[0],
+              ...original.userScopes.slice(2),
+            ],
+          })}\n`,
+        );
+      }
+
+      const result = spawnSync("/bin/zsh", [localInstall, "--verify-only"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          ASSISTANT_TEST_MODE: "1",
+        },
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "飞书权限与 shortcut 合同",
+      );
+      expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
+    }
+  });
+
+  it.each(["missing", "replaced"] as const)(
+    "fails verify-only when the shared Feishu scope parser is %s",
+    (mutation) => {
+      const root = temporaryHome();
+      const localInstall = copyMinimalInstallDelivery(root);
+      const helperPath = join(root, "scripts", "feishu-scope-contract.mjs");
+      if (mutation === "missing") {
+        rmSync(helperPath);
+      } else {
+        writeFileSync(helperPath, "process.exit(0);\n");
+      }
+
+      const result = spawnSync("/bin/zsh", [localInstall, "--verify-only"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          ASSISTANT_TEST_MODE: "1",
+        },
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "飞书权限共享解析器",
+      );
+      expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
+    },
+  );
+
+  it("doctor fails its scope-contract check when the shared parser is missing", () => {
+    const root = temporaryHome();
+    const scriptsRoot = join(root, "scripts");
+    mkdirSync(scriptsRoot, { recursive: true });
+    cpSync(doctorPath, join(scriptsRoot, "doctor"));
+    cpSync(
+      feishuNetworkDoctorPath,
+      join(scriptsRoot, "doctor-feishu-network.mjs"),
+    );
+    cpSync(join(repositoryRoot, "config"), join(root, "config"), {
+      recursive: true,
+    });
+
+    const result = spawnSync(
+      "/bin/zsh",
+      [
+        join(scriptsRoot, "doctor"),
+        "--json",
+        "--config",
+        join(root, "missing-assistant.json"),
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          ASSISTANT_TEST_MODE: "1",
+        },
+      },
+    );
+    const report = JSON.parse(result.stdout) as {
+      checks: Array<{ id: string; status: string }>;
+    };
+
+    expect(
+      report.checks.find((check) => check.id === "feishu-scope-contract"),
+    ).toMatchObject({ status: "FAIL" });
+  });
+
   it("keeps every shell entry syntactically valid", () => {
     for (const script of [installPath, doctorPath, restartPath]) {
       expect(() => execFileSync("/bin/zsh", ["-n", script])).not.toThrow();
@@ -166,6 +679,12 @@ describe("lean delivery surface", () => {
     expect(stat.isSymbolicLink()).toBe(false);
   });
 
+  it("delivers the SQLite doctor helper as a regular non-symlink file", () => {
+    const stat = lstatSync(sqliteDoctorPath);
+    expect(stat.isFile()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
+  });
+
   it("rejects a missing or symlinked Feishu helper before verify-only can write installation state", () => {
     for (const mode of ["missing", "symlink"] as const) {
       const root = temporaryHome();
@@ -221,6 +740,32 @@ describe("lean delivery surface", () => {
       expect(result.status).not.toBe(0);
       expect(`${result.stdout}\n${result.stderr}`).toContain(
         "飞书用户授权 helper 缺失或不是可信普通文件",
+      );
+      expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
+    }
+  });
+
+  it("rejects a missing or symlinked SQLite doctor helper before verify-only", () => {
+    for (const mode of ["missing", "symlink"] as const) {
+      const root = temporaryHome();
+      const localInstall = copyMinimalInstallDelivery(root);
+      const helper = join(root, "scripts", "doctor-sqlite.mjs");
+      rmSync(helper);
+      if (mode === "symlink") {
+        symlinkSync(sqliteDoctorPath, helper);
+      }
+      const result = spawnSync("/bin/zsh", [localInstall, "--verify-only"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          ASSISTANT_TEST_MODE: "1",
+        },
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "SQLite doctor helper 缺失或不是可信普通文件",
       );
       expect(existsSync(join(root, "home", "PresidentAssistant"))).toBe(false);
     }
@@ -557,6 +1102,9 @@ process.exit(64);
       /"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/,
     );
     expect(serialized).toContain('"larkCli":"__LARK_CLI_EXECUTABLE__"');
+    expect(serialized).toContain(
+      '"userAuthHelper":"__FEISHU_USER_AUTH_HELPER__"',
+    );
     expect(serialized).toContain('"id":"presentations@openai-primary-runtime"');
     expect(serialized).toContain(
       '"version":"__PRESENTATIONS_PLUGIN_VERSION__"',
@@ -654,9 +1202,9 @@ process.exit(64);
       '"$ASSISTANT_GATEWAY_CLIENT" < gateway-request.json',
       '"capability": "minutes.search"',
       '"capability": "minutes.detail"',
-      '"capability": "contact.search"',
-      '"capability": "message.send"',
-      '"capability": "calendar.create"',
+      '"capability": "contact.resolve"',
+      '"capability": "notification.send.direct"',
+      '"capability": "calendar.create.direct"',
       "result.state",
       "PREPARED",
     ]) {
@@ -731,29 +1279,29 @@ process.exit(64);
     expect(installer).not.toContain('REPOSITORY_ROOT="${REPOSITORY_ROOT}"');
   });
 
-  it("configures and verifies the dedicated Feishu user authorization", () => {
+  it("configures app scopes and leaves only missing User OAuth as an action-required runtime step", () => {
     const installer = readFileSync(installPath, "utf8");
     const doctor = readFileSync(doctorPath, "utf8");
-    const requiredUserScopes = [
-      "calendar:calendar.event:create",
-      "calendar:calendar.event:update",
-      "contact:user:search",
-      "minutes:minutes.search:read",
-      "minutes:minutes.basic:read",
-      "minutes:minutes.artifacts:read",
-    ];
+    const scopeHelper = readFileSync(feishuScopeContractHelperPath, "utf8");
 
     expect(installer).toContain(
       'readonly lark_home="${runtime_root}/lark-home"',
     );
     expect(installer).toContain('readonly lark_profile="executive-assistant"');
     expect(installer).toContain("config strict-mode off");
-    for (const scope of requiredUserScopes) {
-      expect(installer).toContain(scope);
-      expect(doctor).toContain(scope);
-    }
+    expect(installer).toContain("FEISHU_SCOPE_CONTRACT");
+    expect(doctor).toContain("FEISHU_SCOPE_CONTRACT");
+    expect(installer).toContain("FEISHU_SCOPE_HELPER");
+    expect(doctor).toContain("FEISHU_SCOPE_HELPER");
     expect(installer).not.toContain("auth login --domain");
     expect(installer).toContain("auth scopes --json");
+    expect(installer).toContain(
+      "/open-apis/application/v6/applications/${app_id}",
+    );
+    expect(installer).not.toContain("/app_versions");
+    expect(installer).toContain("--as bot");
+    expect(scopeHelper).toContain("token_types");
+    expect(installer).not.toContain("result?.botScopes");
     expect(installer).toContain("auth status --json --verify");
     expect(installer).toContain("auth check --scope");
     expect(installer).toContain('result?.identity !== "user"');
@@ -765,10 +1313,23 @@ process.exit(64);
     expect(installer).toContain('if [[ -n "${missing_app_scope_output}" ]]');
     expect(installer).toContain('if [[ -n "${missing_user_scope_output}" ]]');
     expect(installer).not.toContain("auth login --scope");
-    expect(installer).toContain('"${FEISHU_USER_AUTH}"');
+    expect(installer).not.toContain(
+      '"${node_executable}" "${FEISHU_USER_AUTH}"',
+    );
+    expect(installer).toContain("ACTION_REQUIRED");
     expect(doctor).toMatch(/"auth",\s*"status",\s*"--json",\s*"--verify"/);
     expect(doctor).toMatch(/"auth",\s*"check",\s*"--scope"/);
     expect(doctor).toMatch(/"auth",\s*"scopes",\s*"--json"/);
+    expect(doctor).toContain(
+      "/open-apis/application/v6/applications/${config.appId}",
+    );
+    expect(doctor).not.toContain("/app_versions");
+    expect(doctor).toContain('"--as", "bot"');
+    expect(scopeHelper).toContain("findMissingAppScopes");
+    expect(doctor).not.toContain("report?.botScopes");
     expect(doctor).toContain("report?.missing == null ? [] : report.missing");
+    expect(doctor).toContain('"ACTION_REQUIRED"');
+    expect(doctor).toContain("shortcut-help");
+    expect(doctor).toContain('"user-auth-helper"');
   });
 });

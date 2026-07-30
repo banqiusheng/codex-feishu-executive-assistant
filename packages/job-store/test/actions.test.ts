@@ -206,7 +206,7 @@ type ActionStore = Omit<
     preview: unknown;
     capability: string;
     identity: "bot" | "user";
-    approvalMode: "president" | "system_policy";
+    approvalMode: "president" | "president_instruction" | "system_policy";
     taskId: string | null;
     controlEventId: string | null;
     expiresAt: string;

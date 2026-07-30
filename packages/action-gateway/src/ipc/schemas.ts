@@ -83,7 +83,12 @@ export type GatewayResponse =
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const RUN_KINDS = new Set<GatewayKind>(["read", "prepare", "system_reply"]);
+const RUN_KINDS = new Set<GatewayKind>([
+  "read",
+  "prepare",
+  "execute",
+  "system_reply",
+]);
 const ROUTE_KEYS = [
   "channel",
   "kind",
@@ -180,7 +185,7 @@ function snapshotRoute(value: unknown): RouteSnapshot {
     throw schemaError("invalid route channel");
   if (
     typeof kind !== "string" ||
-    !["read", "prepare", "system_reply", "control"].includes(kind)
+    !["read", "prepare", "execute", "system_reply", "control"].includes(kind)
   ) {
     throw schemaError("invalid route kind");
   }

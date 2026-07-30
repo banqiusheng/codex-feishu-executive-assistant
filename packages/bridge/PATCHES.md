@@ -197,5 +197,36 @@
   binary/profile to every effective config layer and live wiring; Stage D must
   repeat the matrix on the customer Mac mini before production startup.
 
+## `0007-task-resource-projection.patch`
+
+- Purpose: extend the supported assistant ingress seam with a bounded,
+  authority-free projection of current-message files/images and one quoted
+  message `parent_id` candidate for downstream task-resource registration.
+- Runtime or business logic: only ordinary task normalization may observe the
+  projected resources. Pairing, card confirmation, and cancellation receive an
+  empty resource/candidate view without reading the raw values. Current-message
+  resources are limited to 20 plain file/image descriptors with opaque Feishu
+  keys and safe display names; stickers, audio, and video are ignored. Proxies,
+  accessors, exotic prototypes, unknown or authority-bearing fields, unsafe
+  names/keys, sparse arrays, and excessive collections fail closed. The quoted
+  candidate is read lazily after the ingress guard and accepts only an own,
+  enumerable data `parent_id`; `root_id` and quoted-body attachments are never
+  promoted.
+- Applies after `0001-workspace-adapter.patch` through
+  `0006-task-scoped-unix-socket-permission.patch` to upstream commit
+  `e8b0dc0cdfe2fb378bef7081618138a20d934aa9`.
+- Exact paths: `PATCHES.md`, `src/bot/channel.ts`, `src/index.ts`,
+  `src/runtime/assistant-channel.ts`, `test/assistant-channel.test.ts`, and
+  `test/channel-adapter.test.ts`.
+- Verification: guard-before-read tests, non-task route isolation, stable
+  duplicate normalization, bounded immutable projections, parent/root
+  separation, quoted-body non-promotion, proxy/accessor/path/URL/unknown-field
+  rejection, bridge unit/type tests, static dependency-boundary checks,
+  deterministic reverse/forward vendor replay, strict manifest, and repository
+  gates.
+- Evidence boundary: these tests use synthetic SDK envelopes only. They do not
+  read or write a real Feishu tenant, prove quoted-message retrieval through
+  the Lark CLI, or establish target-Mac production readiness.
+
 Every future upstream modification must use a separately named patch file and
 record its reason and verification here.

@@ -5,8 +5,10 @@ import {
   GatewayRequestSchema,
   InboundEventSchema,
   TaskStateSchema,
+  type ExecuteActionRequest,
   type PreparedAction,
   type ApprovalDecision,
+  type RunGatewayClient,
 } from "../src/index.js";
 
 const validInboundEvent = {
@@ -150,6 +152,20 @@ describe("shared contracts", () => {
     expect(GatewayRequestSchema.parse(validGatewayRequest).version).toBe(1);
   });
 
+  it("accepts execute through the generic run client contract", () => {
+    const request = {
+      ...validGatewayRequest,
+      kind: "execute",
+      capability: "calendar.schedule",
+      payload: { title: "季度复盘" },
+    };
+
+    expect(GatewayRequestSchema.safeParse(request).success).toBe(true);
+    expectTypeOf<RunGatewayClient>().toMatchTypeOf<{
+      execute<T>(request: ExecuteActionRequest): Promise<T>;
+    }>();
+  });
+
   it.each([
     ["an unsupported protocol version", { ...validGatewayRequest, version: 2 }],
     [
@@ -200,6 +216,16 @@ describe("shared contracts", () => {
     [
       "a caller-supplied identity",
       { ...validGatewayRequest, identity: "user" },
+    ],
+    ["a caller-supplied actor", { ...validGatewayRequest, actor: "user" }],
+    ["a caller-supplied chat", { ...validGatewayRequest, chat: "oc_other" }],
+    [
+      "a caller-supplied confirmation bypass",
+      { ...validGatewayRequest, skipConfirmation: true },
+    ],
+    [
+      "a caller-supplied automatic approval",
+      { ...validGatewayRequest, autoApprove: true },
     ],
     ["another unknown field", { ...validGatewayRequest, unexpected: true }],
   ])("rejects gateway request with %s", (_caseName, request) => {

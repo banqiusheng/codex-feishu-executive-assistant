@@ -21,10 +21,15 @@ import { types as utilTypes } from "node:util";
 import type {
   RuntimeConfirmationCard,
   RuntimeAcknowledgement,
+  RuntimeDownloadResourceRequest,
   RuntimeFileReply,
+  RuntimeQuotedMessage,
+  RuntimeQuotedMessageRequest,
+  RuntimeQuotedResource,
   RuntimeTenantBindingRequest,
   RuntimeTextReply,
   RuntimeTransport,
+  RuntimeUserAuthorizationCard,
 } from "./types.js";
 
 type CreateLarkChannel = (options: LarkChannelOptions) => LarkChannel;
@@ -173,6 +178,248 @@ function isExactIdentifier(value: unknown): value is string {
     value === value.trim() &&
     !value.includes("\0")
   );
+}
+
+function validatedAuthorizationUrl(card: RuntimeUserAuthorizationCard): string {
+  if (
+    !isExactIdentifier(card.chatId) ||
+    !isExactIdentifier(card.replyToMessageId) ||
+    typeof card.authorizationUrl !== "string" ||
+    Buffer.byteLength(card.authorizationUrl, "utf8") > 8_192
+  ) {
+    throw new Error("LARK_USER_AUTHORIZATION_CARD_INVALID");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(card.authorizationUrl);
+  } catch {
+    throw new Error("LARK_USER_AUTHORIZATION_CARD_INVALID");
+  }
+  if (
+    parsed.origin !== "https://accounts.feishu.cn" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw new Error("LARK_USER_AUTHORIZATION_CARD_INVALID");
+  }
+  return parsed.href;
+}
+
+function ownDataValue(
+  value: unknown,
+  key: string,
+): unknown | typeof INVALID_OWN_DATA {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value)
+  ) {
+    return INVALID_OWN_DATA;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && "value" in descriptor
+    ? descriptor.value
+    : INVALID_OWN_DATA;
+}
+
+const INVALID_OWN_DATA = Symbol("INVALID_OWN_DATA");
+
+function safeDisplayName(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 512 ||
+    value !== value.trim() ||
+    value.normalize("NFC") !== value ||
+    value === "." ||
+    value === ".."
+  ) {
+    return false;
+  }
+  return [...value].every((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint > 0x1f && (codePoint < 0x7f || codePoint > 0x9f);
+  });
+}
+
+function parseQuotedContent(
+  messageType: string,
+  rawContent: unknown,
+): Readonly<{ text: string; resources: readonly RuntimeQuotedResource[] }> {
+  if (messageType === "sticker") {
+    return Object.freeze({ text: "", resources: Object.freeze([]) });
+  }
+  if (
+    typeof rawContent !== "string" ||
+    Buffer.byteLength(rawContent, "utf8") > 256 * 1024
+  ) {
+    throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawContent) as unknown;
+  } catch {
+    throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    utilTypes.isProxy(parsed)
+  ) {
+    throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+  }
+  if (messageType === "text") {
+    const text = ownDataValue(parsed, "text");
+    if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > 200_000) {
+      throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+    }
+    return Object.freeze({ text, resources: Object.freeze([]) });
+  }
+  if (messageType === "image") {
+    const imageKey = ownDataValue(parsed, "image_key");
+    if (!isExactIdentifier(imageKey)) {
+      throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+    }
+    return Object.freeze({
+      text: "",
+      resources: Object.freeze([
+        Object.freeze({
+          kind: "image" as const,
+          imageKey,
+          displayName: "引用图片",
+        }),
+      ]),
+    });
+  }
+  if (messageType === "file") {
+    const fileKey = ownDataValue(parsed, "file_key");
+    const fileName = ownDataValue(parsed, "file_name");
+    if (!isExactIdentifier(fileKey) || !safeDisplayName(fileName)) {
+      throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+    }
+    return Object.freeze({
+      text: "",
+      resources: Object.freeze([
+        Object.freeze({
+          kind: "file" as const,
+          fileKey,
+          displayName: fileName,
+        }),
+      ]),
+    });
+  }
+  throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+}
+
+function quotedMessageFromResponse(
+  value: unknown,
+  expectedMessageId: string,
+): RuntimeQuotedMessage {
+  try {
+    if (ownDataValue(value, "code") !== 0) {
+      throw new Error("invalid response");
+    }
+    const data = ownDataValue(value, "data");
+    const items = ownDataValue(data, "items");
+    if (
+      !Array.isArray(items) ||
+      utilTypes.isProxy(items) ||
+      Object.getPrototypeOf(items) !== Array.prototype ||
+      items.length !== 1
+    ) {
+      throw new Error("invalid items");
+    }
+    const item = Object.getOwnPropertyDescriptor(items, "0");
+    if (item === undefined || !("value" in item)) {
+      throw new Error("invalid item");
+    }
+    const message = item.value;
+    const messageId = ownDataValue(message, "message_id");
+    const messageType = ownDataValue(message, "msg_type");
+    const chatId = ownDataValue(message, "chat_id");
+    const sender = ownDataValue(message, "sender");
+    const senderOpenId = ownDataValue(sender, "id");
+    const senderIdType = ownDataValue(sender, "id_type");
+    const senderType = ownDataValue(sender, "sender_type");
+    const body = ownDataValue(message, "body");
+    if (
+      messageId !== expectedMessageId ||
+      typeof messageType !== "string" ||
+      !isExactIdentifier(chatId) ||
+      !isExactIdentifier(senderOpenId) ||
+      senderIdType !== "open_id" ||
+      senderType !== "user" ||
+      body === INVALID_OWN_DATA
+    ) {
+      throw new Error("invalid identity");
+    }
+    const projected = parseQuotedContent(
+      messageType,
+      messageType === "sticker" ? undefined : ownDataValue(body, "content"),
+    );
+    return Object.freeze({
+      messageId,
+      chatId,
+      senderOpenId,
+      text: projected.text,
+      resources: projected.resources,
+    });
+  } catch {
+    throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+  }
+}
+
+function snapshotQuotedRequest(
+  value: RuntimeQuotedMessageRequest,
+): RuntimeQuotedMessageRequest {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Reflect.ownKeys(value).length !== 1
+  ) {
+    throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+  }
+  const messageId = ownDataValue(value, "messageId");
+  if (!isExactIdentifier(messageId)) {
+    throw new Error("LARK_QUOTED_MESSAGE_INVALID");
+  }
+  return Object.freeze({ messageId });
+}
+
+function snapshotDownloadRequest(
+  value: RuntimeDownloadResourceRequest,
+): RuntimeDownloadResourceRequest {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value)
+  ) {
+    throw new Error("LARK_RESOURCE_DOWNLOAD_INVALID");
+  }
+  const messageId = ownDataValue(value, "messageId");
+  const kind = ownDataValue(value, "kind");
+  if (!isExactIdentifier(messageId)) {
+    throw new Error("LARK_RESOURCE_DOWNLOAD_INVALID");
+  }
+  if (kind === "image" && Reflect.ownKeys(value).length === 3) {
+    const imageKey = ownDataValue(value, "imageKey");
+    if (isExactIdentifier(imageKey)) {
+      return Object.freeze({ messageId, kind, imageKey });
+    }
+  }
+  if (kind === "file" && Reflect.ownKeys(value).length === 3) {
+    const fileKey = ownDataValue(value, "fileKey");
+    if (isExactIdentifier(fileKey)) {
+      return Object.freeze({ messageId, kind, fileKey });
+    }
+  }
+  throw new Error("LARK_RESOURCE_DOWNLOAD_INVALID");
 }
 
 function rawTenantKey(message: NormalizedMessage): string | null {
@@ -717,12 +964,120 @@ export function createBuiltInLarkTransport(
       );
       return Object.freeze({ messageId: result.messageId });
     },
+    async sendUserAuthorizationCard(card: RuntimeUserAuthorizationCard) {
+      const authorizationUrl = validatedAuthorizationUrl(card);
+      const result = await channel.send(
+        card.chatId,
+        {
+          card: {
+            schema: "2.0",
+            config: { wide_screen_mode: true },
+            header: {
+              template: "blue",
+              title: { tag: "plain_text", content: "完成飞书授权" },
+            },
+            body: {
+              elements: [
+                {
+                  tag: "markdown",
+                  content:
+                    "需要补充总裁个人飞书权限。点击下方按钮完成授权，无需复制链接。",
+                },
+                {
+                  tag: "button",
+                  type: "primary",
+                  text: { tag: "plain_text", content: "点击授权" },
+                  behaviors: [
+                    {
+                      type: "open_url",
+                      default_url: authorizationUrl,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        { replyTo: card.replyToMessageId },
+      );
+      return Object.freeze({ messageId: result.messageId });
+    },
     async verifyCardAction(input: CardVerificationInput) {
       return (
         cardEvidence.get(
           cardEvidenceKey(input.messageId, input.chatId, input.senderOpenId),
         ) ?? null
       );
+    },
+    async readQuotedMessage(request: RuntimeQuotedMessageRequest) {
+      const stableRequest = snapshotQuotedRequest(request);
+      let response: unknown;
+      try {
+        response = await channel.rawClient.im.v1.message.get({
+          params: { user_id_type: "open_id" },
+          path: { message_id: stableRequest.messageId },
+        });
+      } catch {
+        throw new Error("LARK_QUOTED_MESSAGE_FAILED");
+      }
+      return quotedMessageFromResponse(response, stableRequest.messageId);
+    },
+    async downloadResource(request: RuntimeDownloadResourceRequest) {
+      const stableRequest = snapshotDownloadRequest(request);
+      let response: unknown;
+      try {
+        response = await channel.rawClient.im.v1.messageResource.get({
+          params: { type: stableRequest.kind },
+          path: {
+            message_id: stableRequest.messageId,
+            file_key:
+              stableRequest.kind === "image"
+                ? stableRequest.imageKey
+                : stableRequest.fileKey,
+          },
+        });
+      } catch {
+        throw new Error("LARK_RESOURCE_DOWNLOAD_FAILED");
+      }
+      if (
+        response === null ||
+        typeof response !== "object" ||
+        typeof (response as { getReadableStream?: unknown })
+          .getReadableStream !== "function"
+      ) {
+        throw new Error("LARK_RESOURCE_DOWNLOAD_FAILED");
+      }
+      let stream: unknown;
+      try {
+        stream = (
+          response as {
+            getReadableStream(): unknown;
+          }
+        ).getReadableStream();
+      } catch {
+        throw new Error("LARK_RESOURCE_DOWNLOAD_FAILED");
+      }
+      if (
+        stream === null ||
+        typeof stream !== "object" ||
+        typeof (stream as { [Symbol.asyncIterator]?: unknown })[
+          Symbol.asyncIterator
+        ] !== "function"
+      ) {
+        throw new Error("LARK_RESOURCE_DOWNLOAD_FAILED");
+      }
+      return (async function* (): AsyncIterable<Uint8Array> {
+        try {
+          for await (const chunk of stream as AsyncIterable<unknown>) {
+            if (!(chunk instanceof Uint8Array) || utilTypes.isProxy(chunk)) {
+              throw new Error("invalid resource chunk");
+            }
+            yield chunk;
+          }
+        } catch {
+          throw new Error("LARK_RESOURCE_DOWNLOAD_FAILED");
+        }
+      })();
     },
   });
 }

@@ -8,6 +8,8 @@ import type {
 import type { MvpLarkCliRunner } from "@executive-assistant/action-gateway";
 import type { JobStore, TaskRecord } from "@executive-assistant/job-store";
 
+import type { RuntimeUserAuthorizationFlow } from "./user-auth-flow.js";
+
 export type RuntimePairingConfig = Readonly<{
   enabled: boolean;
   codeHash: string | null;
@@ -29,6 +31,7 @@ export type RuntimeExecutables = Readonly<{
   gatewayClient: string;
   larkCli: string | null;
   runtimeEntry: string | null;
+  userAuthHelper: string | null;
 }>;
 
 export type RuntimeSecretRef = Readonly<{
@@ -79,6 +82,12 @@ export type RuntimeConfirmationCard = Readonly<{
   preview: Readonly<Record<string, unknown>>;
 }>;
 
+export type RuntimeUserAuthorizationCard = Readonly<{
+  chatId: string;
+  replyToMessageId: string;
+  authorizationUrl: string;
+}>;
+
 export type RuntimeTenantBindingRequest = Readonly<{
   expectedTenantKey: string | null;
   presidentOpenId: string | null;
@@ -86,6 +95,46 @@ export type RuntimeTenantBindingRequest = Readonly<{
   pairingCodeHash: string | null;
   pairingExpiresAt: string | null;
 }>;
+
+export type RuntimeQuotedMessageRequest = Readonly<{
+  messageId: string;
+}>;
+
+export type RuntimeQuotedImageResource = Readonly<{
+  kind: "image";
+  imageKey: string;
+  displayName: string;
+}>;
+
+export type RuntimeQuotedFileResource = Readonly<{
+  kind: "file";
+  fileKey: string;
+  displayName: string;
+}>;
+
+export type RuntimeQuotedResource =
+  | RuntimeQuotedImageResource
+  | RuntimeQuotedFileResource;
+
+export type RuntimeQuotedMessage = Readonly<{
+  messageId: string;
+  chatId: string;
+  senderOpenId: string;
+  text: string;
+  resources: readonly RuntimeQuotedResource[];
+}>;
+
+export type RuntimeDownloadResourceRequest =
+  | Readonly<{
+      messageId: string;
+      kind: "image";
+      imageKey: string;
+    }>
+  | Readonly<{
+      messageId: string;
+      kind: "file";
+      fileKey: string;
+    }>;
 
 export interface RuntimeTransport {
   resolveTenantKey(request: RuntimeTenantBindingRequest): Promise<string>;
@@ -112,9 +161,18 @@ export interface RuntimeTransport {
   sendConfirmationCard(
     card: RuntimeConfirmationCard,
   ): Promise<void | Readonly<{ messageId: string }>>;
+  sendUserAuthorizationCard(
+    card: RuntimeUserAuthorizationCard,
+  ): Promise<void | Readonly<{ messageId: string }>>;
   verifyCardAction(
     input: CardVerificationInput,
   ): Promise<TrustedCardEvidence | null>;
+  readQuotedMessage(
+    request: RuntimeQuotedMessageRequest,
+  ): Promise<RuntimeQuotedMessage | null>;
+  downloadResource(
+    request: RuntimeDownloadResourceRequest,
+  ): Promise<AsyncIterable<Uint8Array>>;
 }
 
 export type CodexRunEvent = Readonly<Record<string, unknown>>;
@@ -178,6 +236,7 @@ export type RuntimeDependencies = Readonly<{
   transport: RuntimeTransport;
   runner: CodexRunner;
   larkRunnerFactory: MvpLarkCliRunnerFactory;
+  userAuthorizationFlow?: RuntimeUserAuthorizationFlow;
   now?: () => Date;
   instanceId?: string;
   acknowledgementDelay?: (

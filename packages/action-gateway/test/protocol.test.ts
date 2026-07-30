@@ -49,6 +49,19 @@ function strictSearchPayload(value: unknown) {
   return { query: (value as { query: string }).query };
 }
 
+function strictExecutePayload(value: unknown) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Reflect.ownKeys(value).length !== 1 ||
+    typeof (value as { title?: unknown }).title !== "string"
+  ) {
+    throw new Error("invalid execute payload");
+  }
+  return { title: (value as { title: string }).title };
+}
+
 describe("strict framing", () => {
   it("encodes a four-byte big-endian length prefix", () => {
     const frame = encodeFrame({ ok: true });
@@ -217,10 +230,94 @@ describe("strict framing", () => {
 });
 
 describe("strict request registry", () => {
+  it("accepts execute only through a registered and allowlisted runtime capability", async () => {
+    const handler = vi.fn(async (_context, payload) => payload);
+    const registry = createGatewayRouteRegistry([
+      {
+        channel: "run",
+        kind: "execute",
+        capability: "calendar.schedule",
+        parsePayload: strictExecutePayload,
+        handler,
+      },
+    ]);
+    const request = validRequest({
+      kind: "execute",
+      capability: "calendar.schedule",
+      payload: { title: "季度复盘" },
+    });
+    const context = {
+      channel: "run" as const,
+      taskId: randomUUID(),
+      presidentOpenId: "ou_president",
+      presidentChatId: "oc_private",
+      capabilities: ["calendar.schedule"],
+    };
+
+    await expect(
+      dispatchGatewayRequest("run", request, registry, context),
+    ).resolves.toMatchObject({ ok: true, result: { title: "季度复盘" } });
+    expect(handler).toHaveBeenCalledOnce();
+
+    await expect(
+      dispatchGatewayRequest("run", request, registry, {
+        ...context,
+        capabilities: ["minutes.search"],
+      }),
+    ).resolves.toEqual({
+      version: 1,
+      requestId: REQUEST_ID,
+      ok: false,
+      error: { code: "CAPABILITY_DENIED" },
+    });
+  });
+
+  it.each(["actor", "chat", "identity", "skipConfirmation", "autoApprove"])(
+    "denies execute payload carrying %s through its concrete capability parser",
+    async (field) => {
+      const handler = vi.fn(async () => ({ ok: true }));
+      const registry = createGatewayRouteRegistry([
+        {
+          channel: "run",
+          kind: "execute",
+          capability: "calendar.schedule",
+          parsePayload: strictExecutePayload,
+          handler,
+        },
+      ]);
+      const response = await dispatchGatewayRequest(
+        "run",
+        validRequest({
+          kind: "execute",
+          capability: "calendar.schedule",
+          payload: { title: "季度复盘", [field]: true },
+        }),
+        registry,
+        {
+          channel: "run",
+          taskId: randomUUID(),
+          presidentOpenId: "ou_president",
+          presidentChatId: "oc_private",
+          capabilities: ["calendar.schedule"],
+        },
+      );
+
+      expect(response).toMatchObject({
+        ok: false,
+        error: { code: "CAPABILITY_DENIED" },
+      });
+      expect(handler).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     validRequest({ version: 2 }),
     validRequest({ taskId: randomUUID() }),
     validRequest({ identity: "user" }),
+    validRequest({ actor: "user" }),
+    validRequest({ chat: "oc_other" }),
+    validRequest({ skipConfirmation: true }),
+    validRequest({ autoApprove: true }),
     validRequest({ targetChatId: "oc_other" }),
     validRequest({
       kind: "shell",

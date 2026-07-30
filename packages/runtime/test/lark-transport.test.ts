@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 
 import type {
   CardActionEvent,
@@ -147,11 +148,40 @@ class FakeLarkChannel {
     }>
   > = [];
   rawReplyCalls: unknown[] = [];
+  rawGetCalls: unknown[] = [];
+  rawResourceCalls: unknown[] = [];
   rawReplyFailure: unknown;
   rawReplyResult: unknown = {
     code: 0,
     msg: "success",
     data: { message_id: "fixture-ack-reply" },
+  };
+  rawGetResult: unknown = {
+    code: 0,
+    msg: "success",
+    data: {
+      items: [
+        {
+          message_id: "om_quoted",
+          msg_type: "file",
+          chat_id: "oc_fixture_private_chat",
+          sender: {
+            id: "ou_fixture_president",
+            id_type: "open_id",
+            sender_type: "user",
+          },
+          body: {
+            content: JSON.stringify({
+              file_key: "file_quoted",
+              file_name: "经营报告.pdf",
+            }),
+          },
+        },
+      ],
+    },
+  };
+  rawResourceResult: unknown = {
+    getReadableStream: () => Readable.from([Buffer.from("fixture-resource")]),
   };
   readonly rawClient = {
     im: {
@@ -163,6 +193,16 @@ class FakeLarkChannel {
               throw this.rawReplyFailure;
             }
             return this.rawReplyResult;
+          },
+          get: async (input: unknown) => {
+            this.rawGetCalls.push(input);
+            return this.rawGetResult;
+          },
+        },
+        messageResource: {
+          get: async (input: unknown) => {
+            this.rawResourceCalls.push(input);
+            return this.rawResourceResult;
           },
         },
       },
@@ -254,6 +294,125 @@ function normalizedMessage(
 }
 
 describe("built-in Lark transport tenant binding", () => {
+  it("reads one quoted message through the fixed bot API and projects only verified identity fields", async () => {
+    const channel = new FakeLarkChannel();
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+
+    await expect(
+      transport.readQuotedMessage({ messageId: "om_quoted" }),
+    ).resolves.toEqual({
+      messageId: "om_quoted",
+      chatId: "oc_fixture_private_chat",
+      senderOpenId: "ou_fixture_president",
+      text: "",
+      resources: [
+        {
+          kind: "file",
+          fileKey: "file_quoted",
+          displayName: "经营报告.pdf",
+        },
+      ],
+    });
+    expect(channel.rawGetCalls).toEqual([
+      {
+        params: { user_id_type: "open_id" },
+        path: { message_id: "om_quoted" },
+      },
+    ]);
+  });
+
+  it("downloads only a caller-typed message resource through the fixed SDK route", async () => {
+    const channel = new FakeLarkChannel();
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+
+    const downloaded = await transport.downloadResource({
+      messageId: "om_quoted",
+      kind: "file",
+      fileKey: "file_quoted",
+    });
+    const chunks: Buffer[] = [];
+    for await (const chunk of downloaded) chunks.push(Buffer.from(chunk));
+
+    expect(Buffer.concat(chunks).toString("utf8")).toBe("fixture-resource");
+    expect(channel.rawResourceCalls).toEqual([
+      {
+        params: { type: "file" },
+        path: {
+          message_id: "om_quoted",
+          file_key: "file_quoted",
+        },
+      },
+    ]);
+  });
+
+  it("skips quoted stickers and fails closed on substituted or malformed message responses", async () => {
+    const channel = new FakeLarkChannel();
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+    channel.rawGetResult = {
+      code: 0,
+      msg: "success",
+      data: {
+        items: [
+          {
+            message_id: "om_sticker",
+            msg_type: "sticker",
+            chat_id: "oc_fixture_private_chat",
+            sender: {
+              id: "ou_fixture_president",
+              id_type: "open_id",
+              sender_type: "user",
+            },
+            body: { content: JSON.stringify({ file_key: "must_not_escape" }) },
+          },
+        ],
+      },
+    };
+
+    await expect(
+      transport.readQuotedMessage({ messageId: "om_sticker" }),
+    ).resolves.toEqual({
+      messageId: "om_sticker",
+      chatId: "oc_fixture_private_chat",
+      senderOpenId: "ou_fixture_president",
+      text: "",
+      resources: [],
+    });
+
+    channel.rawGetResult = {
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_substituted",
+            msg_type: "text",
+            chat_id: "oc_fixture_private_chat",
+            sender: {
+              id: "ou_fixture_president",
+              id_type: "open_id",
+              sender_type: "user",
+            },
+            body: { content: JSON.stringify({ text: "forbidden" }) },
+          },
+        ],
+      },
+    };
+    await expect(
+      transport.readQuotedMessage({ messageId: "om_expected" }),
+    ).rejects.toThrow("LARK_QUOTED_MESSAGE_INVALID");
+  });
+
   it("binds a fixed-timeout HTTP wrapper that overrides caller timeout zero on every method", async () => {
     const channel = new FakeLarkChannel();
     const delegate = new RecordingHttpInstance();
@@ -543,6 +702,91 @@ describe("built-in Lark transport tenant binding", () => {
       },
     ]);
   });
+
+  it("sends user authorization as one Schema 2.0 OpenLink button with no callback behavior", async () => {
+    const channel = new FakeLarkChannel();
+    const transport = createBuiltInLarkTransport({
+      appId: "cli_fixture_app",
+      appSecret: "fixture",
+      createChannel: () => channel as unknown as LarkChannel,
+    });
+    const authorizationUrl =
+      "https://accounts.feishu.cn/open-apis/authen/v1/authorize?state=opaque";
+
+    await expect(
+      transport.sendUserAuthorizationCard({
+        chatId: "oc_fixture_private_chat",
+        replyToMessageId: "message-fixture",
+        authorizationUrl,
+      }),
+    ).resolves.toEqual({ messageId: "fixture-reply" });
+
+    expect(channel.sendArguments).toEqual([
+      {
+        to: "oc_fixture_private_chat",
+        input: {
+          card: {
+            schema: "2.0",
+            config: { wide_screen_mode: true },
+            header: {
+              template: "blue",
+              title: { tag: "plain_text", content: "完成飞书授权" },
+            },
+            body: {
+              elements: [
+                {
+                  tag: "markdown",
+                  content:
+                    "需要补充总裁个人飞书权限。点击下方按钮完成授权，无需复制链接。",
+                },
+                {
+                  tag: "button",
+                  type: "primary",
+                  text: { tag: "plain_text", content: "点击授权" },
+                  behaviors: [
+                    {
+                      type: "open_url",
+                      default_url: authorizationUrl,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        options: { replyTo: "message-fixture" },
+      },
+    ]);
+    expect(JSON.stringify(channel.sendArguments[0]?.input)).not.toContain(
+      "callback",
+    );
+  });
+
+  it.each([
+    "http://accounts.feishu.cn/authorize",
+    "https://evil.example/authorize",
+    "https://user:password@accounts.feishu.cn/authorize",
+    "https://accounts.feishu.cn/authorize#secret",
+  ])(
+    "rejects an unsafe authorization card URL without sending: %s",
+    async (authorizationUrl) => {
+      const channel = new FakeLarkChannel();
+      const transport = createBuiltInLarkTransport({
+        appId: "cli_fixture_app",
+        appSecret: "fixture",
+        createChannel: () => channel as unknown as LarkChannel,
+      });
+
+      await expect(
+        transport.sendUserAuthorizationCard({
+          chatId: "oc_fixture_private_chat",
+          replyToMessageId: "message-fixture",
+          authorizationUrl,
+        }),
+      ).rejects.toThrow("LARK_USER_AUTHORIZATION_CARD_INVALID");
+      expect(channel.sendCalls).toBe(0);
+    },
+  );
 
   it("binds only from the correct unexpired private pairing message and replays it once", async () => {
     const channel = new FakeLarkChannel();

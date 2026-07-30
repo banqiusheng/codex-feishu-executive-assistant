@@ -211,6 +211,17 @@ describe("vendored bridge provenance", () => {
           "test/codex-runner.test.ts",
         ]),
       ],
+      [
+        "vendor/patches/lark-codex-bridge/0007-task-resource-projection.patch",
+        new Set([
+          "PATCHES.md",
+          "src/bot/channel.ts",
+          "src/index.ts",
+          "src/runtime/assistant-channel.ts",
+          "test/assistant-channel.test.ts",
+          "test/channel-adapter.test.ts",
+        ]),
+      ],
     ]);
 
     expect(lock.patches.map(({ path }) => path)).toEqual([

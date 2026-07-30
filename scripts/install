@@ -9,17 +9,22 @@ readonly SCRIPT_DIR="${0:A:h}"
 readonly REPOSITORY_ROOT="${SCRIPT_DIR:h}"
 readonly DEPENDENCY_LOCK="${REPOSITORY_ROOT}/dependencies.lock.json"
 readonly CONFIG_TEMPLATE="${REPOSITORY_ROOT}/config/assistant.example.json"
+readonly FEISHU_SCOPE_CONTRACT="${REPOSITORY_ROOT}/config/feishu-scopes.json"
+readonly FEISHU_SCOPE_CONTRACT_SHA256="40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e"
+readonly FEISHU_SCOPE_HELPER="${REPOSITORY_ROOT}/scripts/feishu-scope-contract.mjs"
 readonly PLIST_TEMPLATE="${REPOSITORY_ROOT}/launchd/com.codex-feishu.executive-assistant.plist.template"
 readonly EXECUTIVE_SKILL_SOURCE="${REPOSITORY_ROOT}/skills/executive-assistant"
 readonly PPT_LICENSE_NOTICE="${REPOSITORY_ROOT}/LICENSES/visual-first-ppt-MIT.txt"
 readonly INSTALL_SUPPORT="${REPOSITORY_ROOT}/scripts/install-support.mjs"
 readonly FEISHU_NETWORK_DOCTOR="${REPOSITORY_ROOT}/scripts/doctor-feishu-network.mjs"
 readonly FEISHU_USER_AUTH="${REPOSITORY_ROOT}/scripts/feishu-user-auth.mjs"
+readonly SQLITE_DOCTOR_HELPER="${REPOSITORY_ROOT}/scripts/doctor-sqlite.mjs"
 readonly LAUNCHD_LABEL="com.codex-feishu.executive-assistant"
 readonly KEYCHAIN_SERVICE="com.codex-feishu-executive-assistant.bot"
 
 typeset mode="auto"
 typeset app_id=""
+typeset refresh_requested="no"
 typeset pairing_code=""
 typeset pairing_hash=""
 typeset pairing_expires_at=""
@@ -30,12 +35,16 @@ usage() {
   print -r -- "  ./scripts/install --plan"
   print -r -- "  ./scripts/install --verify-only"
   print -r -- "  ./scripts/install --apply [--app-id cli_xxx]"
+  print -r -- "  ./scripts/install --update-existing"
+  print -r -- "  ./scripts/install --refresh-app-secret"
   print -r -- ""
   print -r -- "说明："
-  print -r -- "  --plan         只显示计划，不修改电脑。"
-  print -r -- "  --verify-only  只校验仓库锁和交付文件，不修改电脑。"
-  print -r -- "  --apply        执行安装；Keychain 和 LaunchAgent 只在此模式变更。"
-  print -r -- "  --app-id       可提前给出非秘密 App ID；App Secret 永远不能作为参数。"
+  print -r -- "  --plan               只显示计划，不修改电脑。"
+  print -r -- "  --verify-only        只校验仓库锁和交付文件，不修改电脑。"
+  print -r -- "  --apply              执行首次安装。"
+  print -r -- "  --update-existing    更新现有安装，但绝不覆盖 Keychain 中的 App Secret。"
+  print -r -- "  --refresh-app-secret 显式刷新现有安装的 App Secret，并继续既有更新安装链。"
+  print -r -- "  --app-id             可提前给出非秘密 App ID；App Secret 永远不能作为参数。"
 }
 
 die() {
@@ -82,6 +91,12 @@ while (( $# > 0 )); do
       mode="update"
       shift
       ;;
+    --refresh-app-secret)
+      [[ "${mode}" == "auto" ]] || die "只能选择一种运行模式。" 64
+      mode="update"
+      refresh_requested="yes"
+      shift
+      ;;
     --app-id)
       (( $# >= 2 )) || die "--app-id 缺少值。" 64
       app_id="$2"
@@ -100,10 +115,17 @@ while (( $# > 0 )); do
   esac
 done
 
+[[ "${refresh_requested}" != "yes" || -z "${app_id}" ]] ||
+  die "--refresh-app-secret 只使用现有安装配置中的固定 App ID，不能同时传入 --app-id。" 64
+
 [[ -f "${DEPENDENCY_LOCK}" && ! -L "${DEPENDENCY_LOCK}" ]] ||
   die "dependencies.lock.json 缺失或不是可信普通文件。"
 [[ -f "${CONFIG_TEMPLATE}" && ! -L "${CONFIG_TEMPLATE}" ]] ||
   die "配置模板缺失或不是可信普通文件。"
+[[ -f "${FEISHU_SCOPE_CONTRACT}" && ! -L "${FEISHU_SCOPE_CONTRACT}" ]] ||
+  die "飞书权限与 shortcut 合同缺失或不是可信普通文件。"
+[[ -f "${FEISHU_SCOPE_HELPER}" && ! -L "${FEISHU_SCOPE_HELPER}" ]] ||
+  die "飞书权限共享解析器缺失或不是可信普通文件。"
 [[ -f "${PLIST_TEMPLATE}" && ! -L "${PLIST_TEMPLATE}" ]] ||
   die "LaunchAgent 模板缺失或不是可信普通文件。"
 [[ -f "${EXECUTIVE_SKILL_SOURCE}/SKILL.md" && ! -L "${EXECUTIVE_SKILL_SOURCE}/SKILL.md" ]] ||
@@ -116,6 +138,8 @@ done
   die "飞书网络 doctor helper 缺失或不是可信普通文件。"
 [[ -f "${FEISHU_USER_AUTH}" && ! -L "${FEISHU_USER_AUTH}" ]] ||
   die "飞书用户授权 helper 缺失或不是可信普通文件。"
+[[ -f "${SQLITE_DOCTOR_HELPER}" && ! -L "${SQLITE_DOCTOR_HELPER}" ]] ||
+  die "SQLite doctor helper 缺失或不是可信普通文件。"
 
 typeset node_executable=""
 typeset codex_executable=""
@@ -146,17 +170,53 @@ if [[ "${mode}" == "update" ]]; then
   typeset -a update_identity
   update_identity=("${(@f)$(
     "${node_executable}" --input-type=module - \
-      "${update_config_path}" "${update_runtime_root}" "${node_executable}" <<'NODE'
+      "${update_config_path}" "${update_runtime_root}" "${node_executable}" \
+      "${refresh_requested}" "${KEYCHAIN_SERVICE}" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 
-const [configPath, expectedRuntimeRoot, expectedNode] = process.argv.slice(2);
+const [
+  configPath,
+  expectedRuntimeRoot,
+  expectedNode,
+  refreshAppSecret,
+  expectedKeychainService,
+] = process.argv.slice(2);
+
+function requireProtectedDirectory(candidate) {
+  const stat = fs.lstatSync(candidate);
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    stat.uid !== process.getuid() ||
+    (stat.mode & 0o777) !== 0o700 ||
+    fs.realpathSync(candidate) !== candidate
+  ) {
+    throw new Error("update_config_parent_identity_invalid");
+  }
+}
+
+const assistantRoot = path.dirname(expectedRuntimeRoot);
+const configRoot = path.dirname(configPath);
+if (
+  path.basename(expectedRuntimeRoot) !== "runtime" ||
+  configRoot !== path.join(expectedRuntimeRoot, "config") ||
+  configPath !== path.join(configRoot, "assistant.json")
+) {
+  throw new Error("update_config_path_invalid");
+}
+requireProtectedDirectory(assistantRoot);
+requireProtectedDirectory(expectedRuntimeRoot);
+requireProtectedDirectory(configRoot);
+
 const stat = fs.lstatSync(configPath);
 if (
   !stat.isFile() ||
   stat.isSymbolicLink() ||
   stat.uid !== process.getuid() ||
-  (stat.mode & 0o077) !== 0
+  (stat.mode & 0o777) !== 0o600 ||
+  stat.nlink !== 1 ||
+  fs.realpathSync(configPath) !== configPath
 ) {
   throw new Error("update_config_identity_invalid");
 }
@@ -166,6 +226,7 @@ const runtimeRoot = config?.paths?.runtimeRoot;
 const node = config?.executables?.node;
 const codex = config?.executables?.codex;
 if (
+  !["yes", "no"].includes(refreshAppSecret) ||
   config?.schemaVersion !== 1 ||
   typeof appId !== "string" ||
   !/^cli_[A-Za-z0-9_-]{6,128}$/.test(appId) ||
@@ -182,6 +243,14 @@ if (
   codex.includes("\0")
 ) {
   throw new Error("update_config_contract_invalid");
+}
+if (
+  refreshAppSecret === "yes" &&
+  (config?.secretRef?.type !== "macos-keychain" ||
+    config.secretRef.service !== expectedKeychainService ||
+    config.secretRef.account !== appId)
+) {
+  throw new Error("update_secret_ref_identity_invalid");
 }
 const serialized = JSON.stringify(config);
 if (/"(?:appSecret|app_secret|secretValue|accessToken|refreshToken|token)"\s*:/.test(serialized)) {
@@ -308,6 +377,36 @@ NODE
 }
 
 verify_repository_contract
+
+load_feishu_scope_contract() {
+  typeset output
+  output="$(
+    "${node_executable}" "${FEISHU_SCOPE_HELPER}" \
+      contract-lines \
+      "${FEISHU_SCOPE_CONTRACT}" \
+      "${FEISHU_SCOPE_CONTRACT_SHA256}"
+  )" ||
+    die "飞书权限与 shortcut 合同被飞书权限共享解析器拒绝：无效、乱序、重复或已被替换。"
+
+  typeset -ga REQUIRED_USER_SCOPES=()
+  typeset -ga REQUIRED_BOT_SCOPES=()
+  typeset -ga REQUIRED_SHORTCUTS=()
+  typeset line
+  for line in "${(@f)output}"; do
+    case "${line}" in
+      USER:*) REQUIRED_USER_SCOPES+=("${line#USER:}") ;;
+      BOT:*) REQUIRED_BOT_SCOPES+=("${line#BOT:}") ;;
+      SHORTCUT:*) REQUIRED_SHORTCUTS+=("${line#SHORTCUT:}") ;;
+      *) die "飞书权限共享解析器输出无法识别。" ;;
+    esac
+  done
+  (( ${#REQUIRED_USER_SCOPES[@]} == 14 &&
+    ${#REQUIRED_BOT_SCOPES[@]} == 4 &&
+    ${#REQUIRED_SHORTCUTS[@]} == 14 )) ||
+    die "飞书权限共享解析器返回的合同数量不符合固定版本。"
+}
+
+load_feishu_scope_contract
 /usr/bin/plutil -lint "${PLIST_TEMPLATE}" >/dev/null ||
   die "LaunchAgent 模板不是合法 plist。"
 
@@ -321,8 +420,12 @@ print_plan() {
   note "从当前 Codex 可见的官方 primary-runtime marketplace 安装 Presentations。"
   note "安装 executive-assistant 和精确核验的 visual-first-ppt v0.3.0。"
   note "imagegen 只做真实可见性判断；无法用本机证据确认时保持 WARN。"
-  note "App Secret 由 /usr/bin/security 自己安全提示，不进入 argv、环境或配置文件。"
-  note "初始化独立飞书 CLI 配置；缺少用户权限时自动打开可信飞书授权页。"
+  if [[ "${refresh_requested}" == "yes" ]]; then
+    note "显式刷新同一 Keychain service/account；App Secret 只由 /usr/bin/security 自己安全提示。"
+  else
+    note "App Secret 由 /usr/bin/security 自己安全提示，不进入 argv、环境或配置文件。"
+  fi
+  note "初始化独立飞书 CLI 配置；个人 User OAuth 待授权时服务继续启动并由运行时发授权卡。"
   note "生成一个用户级 RunAtLoad + KeepAlive LaunchAgent。"
   note "最后运行只读 doctor；真实飞书连接、配对和能力仍以 doctor/运行时结果为准。"
   print -r -- ""
@@ -356,12 +459,18 @@ fi
 [[ "${mode}" == "apply" || "${mode}" == "update" ]] ||
   die "内部运行模式无效。"
 if [[ "${ASSISTANT_TEST_MODE:-0}" == "1" ]]; then
+  if [[ "${refresh_requested}" == "yes" ]]; then
+    die "测试模式禁止 --refresh-app-secret；未访问 Keychain、未执行构建或安装。" 64
+  fi
   if [[ "${mode}" == "update" ]]; then
     die "测试模式禁止 --update-existing；未执行构建、安装或 LaunchAgent 变更。" 64
   fi
   die "测试模式禁止 --apply；未执行 Keychain、launchctl、构建或目录写入。" 64
 fi
-if [[ "${mode}" == "apply" ]]; then
+if [[ "${refresh_requested}" == "yes" ]]; then
+  [[ -t 0 && -t 1 ]] ||
+    die "--refresh-app-secret 必须在可见交互终端运行；未访问 Keychain。" 64
+elif [[ "${mode}" == "apply" ]]; then
   [[ -t 0 && -t 1 ]] || die "--apply 必须在交互终端运行。" 64
 fi
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || die "只支持 macOS。"
@@ -372,6 +481,22 @@ if [[ -z "${app_id}" ]]; then
 fi
 [[ "${app_id}" =~ '^cli_[A-Za-z0-9_-]{6,128}$' ]] ||
   die "App ID 格式不正确，应以 cli_ 开头。"
+
+if [[ "${refresh_requested}" == "yes" ]]; then
+  print -r -- ""
+  print -r -- "macOS 即将安全提示输入重置后的 App Secret。输入内容不会进入脚本 argv、环境、配置或日志。"
+  /usr/bin/security add-generic-password \
+    -U \
+    -a "${app_id}" \
+    -s "${KEYCHAIN_SERVICE}" \
+    -w ||
+    die "App Secret 刷新未完成；未继续既有安装链。"
+  /usr/bin/security find-generic-password \
+    -a "${app_id}" \
+    -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1 ||
+    die "刷新后的 Keychain item 无法核验；未继续既有安装链。"
+  note "Bot App Secret 已在同一固定 Keychain service/account 中刷新；继续既有更新安装链。"
+fi
 
 typeset corepack_executable=""
 if [[ "${mode}" == "update" ]]; then
@@ -420,15 +545,7 @@ readonly config_dir="${runtime_root}/config"
 readonly config_path="${config_dir}/assistant.json"
 readonly lark_cli_version="${dependency_contract[1]}"
 readonly lark_profile="executive-assistant"
-typeset -ar MVP_USER_SCOPES=(
-  "calendar:calendar.event:create"
-  "calendar:calendar.event:update"
-  "contact:user:search"
-  "minutes:minutes.search:read"
-  "minutes:minutes.basic:read"
-  "minutes:minutes.artifacts:read"
-)
-readonly mvp_user_scope_arg="${(j: :)MVP_USER_SCOPES}"
+readonly mvp_user_scope_arg="${(j: :)REQUIRED_USER_SCOPES}"
 readonly lark_home="${runtime_root}/lark-home"
 readonly lark_cli_install_root="${runtime_root}/lark-cli-${lark_cli_version}"
 readonly lark_cli_private_bin="${lark_cli_install_root}/private-bin"
@@ -922,7 +1039,9 @@ CODEX_HOME="${codex_home}" "${codex_executable}" login status >/dev/null 2>&1 ||
   die "专用 Codex 登录未完成。"
 
 if /usr/bin/security find-generic-password -a "${app_id}" -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1; then
-  note "Bot App Secret 的 Keychain item 已存在；安装器不会显示或覆盖。"
+  if [[ "${refresh_requested}" != "yes" ]]; then
+    note "Bot App Secret 的 Keychain item 已存在；安装器不会显示或覆盖。"
+  fi
 else
   [[ "${mode}" != "update" ]] ||
     die "现有 Bot App Secret 不在 Keychain；自动更新不会请求或写入秘密。"
@@ -955,27 +1074,35 @@ HOME="${lark_home}" "${lark_cli_executable}" \
   die "飞书 CLI 无法启用 Bot 与 User 双身份能力。"
 
 lark_app_missing_scopes() {
-  local app_scope_json
+  local app_scope_json app_info_json
   app_scope_json="$(
     HOME="${lark_home}" "${lark_cli_executable}" \
       --profile "${lark_profile}" \
       auth scopes --json 2>/dev/null
   )" || return 1
-  print -rn -- "${app_scope_json}" |
-    "${node_executable}" --input-type=module -e '
-      let raw = "";
-      for await (const chunk of process.stdin) raw += chunk;
-      const result = JSON.parse(raw);
-      const required = process.argv.slice(1);
-      if (!Array.isArray(result?.userScopes)) process.exit(2);
-      const enabled = new Set(result.userScopes);
-      process.stdout.write(required.filter((scope) => !enabled.has(scope)).join("\n"));
-    ' "${MVP_USER_SCOPES[@]}"
+  app_info_json="$(
+    HOME="${lark_home}" "${lark_cli_executable}" \
+      --profile "${lark_profile}" \
+      api GET \
+      "/open-apis/application/v6/applications/${app_id}" \
+      --as bot \
+      --params '{"lang":"zh_cn"}' \
+      --json 2>/dev/null
+  )" || return 1
+  {
+    print -rn -- "${app_scope_json}"
+    /usr/bin/printf '\036'
+    print -rn -- "${app_info_json}"
+  } |
+    "${node_executable}" "${FEISHU_SCOPE_HELPER}" \
+      missing-app-scopes \
+      "${FEISHU_SCOPE_CONTRACT}" \
+      "${FEISHU_SCOPE_CONTRACT_SHA256}"
 }
 
 typeset missing_app_scope_output
 missing_app_scope_output="$(lark_app_missing_scopes)" ||
-  die "无法读取飞书应用已生效的用户权限。"
+  die "无法读取飞书应用已生效的 User/Bot 权限。"
 typeset -a missing_app_scopes=()
 if [[ -n "${missing_app_scope_output}" ]]; then
   missing_app_scopes=(${(f)missing_app_scope_output})
@@ -983,7 +1110,7 @@ fi
 if (( ${#missing_app_scopes[@]} > 0 )); then
   die "BLOCKED_SCOPE：飞书应用尚未生效以下 MVP 权限：${(j:, :)missing_app_scopes}。请发布并批准应用版本后重跑安装。"
 fi
-note "飞书应用层 6 项 MVP 用户权限已生效。"
+note "飞书应用层所需 User/Bot 权限已生效。"
 
 lark_user_auth_is_healthy() {
   local auth_json
@@ -1067,7 +1194,7 @@ lark_user_missing_scopes() {
           .filter((scope) => missingSet.has(scope))
           .join("\n"),
       );
-    ' "${MVP_USER_SCOPES[@]}"
+    ' "${REQUIRED_USER_SCOPES[@]}"
 }
 
 typeset user_identity_healthy="no"
@@ -1078,10 +1205,8 @@ fi
 if [[ "${user_identity_healthy}" == "yes" ]] && lark_user_scopes_are_healthy; then
   note "飞书用户授权仍然有效，复用现有授权。"
 else
-  [[ "${mode}" != "update" ]] ||
-    die "现有飞书用户授权无效或权限不足；自动更新不会打开授权流程。"
   typeset -a missing_user_scopes=()
-  typeset -a requested_user_scopes=("${MVP_USER_SCOPES[@]}")
+  typeset -a requested_user_scopes=("${REQUIRED_USER_SCOPES[@]}")
   if [[ "${user_identity_healthy}" == "yes" ]]; then
     typeset missing_user_scope_output
     missing_user_scope_output="$(lark_user_missing_scopes)" ||
@@ -1089,20 +1214,12 @@ else
     if [[ -n "${missing_user_scope_output}" ]]; then
       missing_user_scopes=(${(f)missing_user_scope_output})
     fi
-    (( ${#missing_user_scopes[@]} > 0 )) ||
-      die "飞书用户授权状态异常，但没有可安全申请的缺失 MVP 权限。"
-    requested_user_scopes=("${missing_user_scopes[@]}")
+    if (( ${#missing_user_scopes[@]} > 0 )); then
+      requested_user_scopes=("${missing_user_scopes[@]}")
+    fi
   fi
-  print -r -- ""
-  print -r -- "仅请求当前缺失的 MVP 用户权限：${(j: :)requested_user_scopes}"
-  "${node_executable}" "${FEISHU_USER_AUTH}" \
-    "${lark_cli_executable}" \
-    "${lark_home}" \
-    "${requested_user_scopes[@]}" ||
-    die "BLOCKED_USER_AUTH：请在这台 Mac 的可见终端重跑安装。"
+  note "ACTION_REQUIRED：总裁个人 User OAuth 待授权；服务将继续启动，运行时会在飞书私聊发送一次授权卡。待授权权限：${(j: :)requested_user_scopes}"
 fi
-lark_user_auth_is_healthy && lark_user_scopes_are_healthy ||
-  die "飞书用户授权健康检查或 6 项 MVP 权限检查未通过。"
 
 generate_pairing_contract() {
   typeset -a generated
@@ -1128,7 +1245,7 @@ if [[ -e "${config_path}" ]]; then
   typeset existing_config_state
   existing_config_state="$("${node_executable}" --input-type=module - \
     "${config_path}" "${app_id}" "${runtime_root}" "${lark_home}" \
-    "${lark_cli_executable}" \
+    "${lark_cli_executable}" "${FEISHU_USER_AUTH}" \
     "${presentations_plugin_version}" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
@@ -1138,6 +1255,7 @@ const [
   expectedRuntimeRoot,
   expectedLarkHome,
   expectedLarkCli,
+  expectedUserAuthHelper,
   expectedPresentationsVersion,
 ] = process.argv.slice(2);
 const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
@@ -1150,6 +1268,8 @@ if (
   config.paths?.runtimeRoot !== expectedRuntimeRoot ||
   config.paths?.larkHome !== expectedLarkHome ||
   config.executables?.larkCli !== expectedLarkCli ||
+  (config.executables?.userAuthHelper !== undefined &&
+    config.executables.userAuthHelper !== expectedUserAuthHelper) ||
   config.visualFirstPpt?.presentationsPlugin?.id !==
     "presentations@openai-primary-runtime" ||
   config.visualFirstPpt?.presentationsPlugin?.version !==
@@ -1174,7 +1294,8 @@ NODE
   executable_refresh_result="$(
     "${node_executable}" "${INSTALL_SUPPORT}" refresh-runtime-executables \
       "${config_path}" "${app_id}" "${runtime_root}" "${lark_home}" \
-      "${lark_cli_executable}" "${presentations_plugin_version}" \
+      "${lark_cli_executable}" "${FEISHU_USER_AUTH}" \
+      "${presentations_plugin_version}" \
       "${node_executable}" "${codex_executable}"
   )" || die "无法安全刷新运行配置中的 Node/Codex 启动路径。"
   if [[ "${executable_refresh_result}" == '{"action":"updated"}' ]]; then
@@ -1250,6 +1371,7 @@ else
   LARK_CLI_EXECUTABLE="${lark_cli_executable}" \
   GATEWAY_CLIENT="${gateway_client}" \
   RUNTIME_ENTRY="${runtime_entry}" \
+  FEISHU_USER_AUTH_HELPER="${FEISHU_USER_AUTH}" \
   PPT_SKILL_ROOT="${ppt_skill_root}" \
   PRESENTATIONS_PLUGIN_VERSION="${presentations_plugin_version}" \
     "${node_executable}" --input-type=module <<'NODE'
@@ -1275,6 +1397,7 @@ const replacements = new Map([
   ["__LARK_CLI_EXECUTABLE__", process.env.LARK_CLI_EXECUTABLE],
   ["__GATEWAY_CLIENT__", process.env.GATEWAY_CLIENT],
   ["__RUNTIME_ENTRY__", process.env.RUNTIME_ENTRY],
+  ["__FEISHU_USER_AUTH_HELPER__", process.env.FEISHU_USER_AUTH_HELPER],
   ["__VISUAL_FIRST_PPT_ROOT__", process.env.PPT_SKILL_ROOT],
   ["__PRESENTATIONS_PLUGIN_VERSION__", process.env.PRESENTATIONS_PLUGIN_VERSION],
 ]);

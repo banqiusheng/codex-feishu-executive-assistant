@@ -9,8 +9,15 @@ if [[ -z "${node_executable}" ]]; then
   exit 1
 fi
 node_executable="${node_executable:A}"
+readonly FEISHU_SCOPE_CONTRACT="${0:A:h}/../config/feishu-scopes.json"
+readonly FEISHU_SCOPE_HELPER="${0:A:h}/feishu-scope-contract.mjs"
+readonly SQLITE_DOCTOR_HELPER="${0:A:h}/doctor-sqlite.mjs"
 
-exec "${node_executable}" --input-type=module - "${0:A:h}/doctor-feishu-network.mjs" "$@" <<'NODE'
+exec "${node_executable}" --input-type=module - \
+  "${0:A:h}/doctor-feishu-network.mjs" \
+  "${FEISHU_SCOPE_HELPER}" \
+  "${FEISHU_SCOPE_CONTRACT}" \
+  "${SQLITE_DOCTOR_HELPER}" "$@" <<'NODE'
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,14 +29,8 @@ const LABEL = "com.codex-feishu.executive-assistant";
 const KEYCHAIN_SERVICE = "com.codex-feishu-executive-assistant.bot";
 const PRESENTATIONS_PLUGIN_ID = "presentations@openai-primary-runtime";
 const MINIMAL_RUNTIME_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
-const REQUIRED_USER_SCOPES = Object.freeze([
-  "calendar:calendar.event:create",
-  "calendar:calendar.event:update",
-  "contact:user:search",
-  "minutes:minutes.search:read",
-  "minutes:minutes.basic:read",
-  "minutes:minutes.artifacts:read",
-]);
+const FEISHU_SCOPE_CONTRACT_SHA256 =
+  "40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e";
 const EXPECTED_PPT = Object.freeze({
   schemaVersion: 2,
   repository: "https://github.com/banqiusheng/visual-first-ppt.git",
@@ -59,9 +60,12 @@ function usage() {
 }
 
 const helperPath = process.argv[2];
+const scopeHelperPath = process.argv[3];
+const scopeContractPath = process.argv[4];
+const sqliteDoctorHelperPath = process.argv[5];
 let json = false;
 let configPath = path.join(os.homedir(), "PresidentAssistant", "runtime", "config", "assistant.json");
-const args = process.argv.slice(3);
+const args = process.argv.slice(6);
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
   if (arg === "--json") {
@@ -111,6 +115,56 @@ function isPlainFile(candidate) {
 function safeMode(candidate) {
   return fs.lstatSync(candidate).mode & 0o777;
 }
+
+function existsWithoutFollowing(candidate) {
+  try {
+    fs.lstatSync(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let scopeContract = null;
+let scopeTools = null;
+try {
+  if (
+    typeof scopeHelperPath !== "string" ||
+    !path.isAbsolute(scopeHelperPath) ||
+    !isPlainFile(scopeHelperPath) ||
+    typeof scopeContractPath !== "string" ||
+    !path.isAbsolute(scopeContractPath) ||
+    !isPlainFile(scopeContractPath)
+  ) {
+    throw new Error("scope_contract_path");
+  }
+  const importedScopeTools = await import(pathToFileURL(scopeHelperPath).href);
+  if (
+    typeof importedScopeTools?.readScopeContract !== "function" ||
+    typeof importedScopeTools?.findMissingAppScopes !== "function"
+  ) {
+    throw new Error("scope_helper_exports");
+  }
+  scopeTools = importedScopeTools;
+  scopeContract = scopeTools.readScopeContract(
+    scopeContractPath,
+    FEISHU_SCOPE_CONTRACT_SHA256,
+  );
+  add(
+    "feishu-scope-contract",
+    "PASS",
+    "飞书权限与 shortcut 单一来源完整且未被替换。",
+  );
+} catch {
+  add(
+    "feishu-scope-contract",
+    "FAIL",
+    "飞书权限与 shortcut 合同缺失、乱序、重复或已被替换。",
+  );
+}
+
+const REQUIRED_USER_SCOPES = scopeContract?.userScopes ?? Object.freeze([]);
+const REQUIRED_BOT_SCOPES = scopeContract?.botScopes ?? Object.freeze([]);
 
 function hasSecretField(value) {
   if (!value || typeof value !== "object") return false;
@@ -261,6 +315,24 @@ if (typeof runtimeEntry === "string" && path.isAbsolute(runtimeEntry) && isPlain
   add("runtime-entry", "PASS", "runtime 构建入口存在。");
 } else {
   add("runtime-entry", "FAIL", "packages/runtime/dist/cli.js 不存在或不是可信普通文件。");
+}
+
+const configuredUserAuthHelper = config?.executables?.userAuthHelper;
+const expectedUserAuthHelper = path.join(
+  path.dirname(scopeHelperPath),
+  "feishu-user-auth.mjs",
+);
+if (
+  configuredUserAuthHelper === expectedUserAuthHelper &&
+  isPlainFile(configuredUserAuthHelper)
+) {
+  add("user-auth-helper", "PASS", "运行时一键授权 helper 路径已锁定。");
+} else {
+  add(
+    "user-auth-helper",
+    "FAIL",
+    "运行时一键授权 helper 缺失、被替换或配置路径不一致。",
+  );
 }
 
 const codexExecutable = config?.executables?.codex;
@@ -505,8 +577,13 @@ if (
   }
 }
 
-if (!larkCliVerified || typeof larkHome !== "string") {
+if (
+  !larkCliVerified ||
+  typeof larkHome !== "string" ||
+  scopeContract === null
+) {
   add("app-user-scopes", "FAIL", "无法在可信飞书 CLI 环境中核验应用层 MVP 用户权限。");
+  add("shortcut-help", "FAIL", "无法在可信飞书 CLI 环境中核验固定 shortcut。");
   add("user-oauth", "FAIL", "无法在可信飞书 CLI 环境中核验总裁用户授权。");
 } else {
   const larkEnvironment = {
@@ -515,19 +592,40 @@ if (!larkCliVerified || typeof larkHome !== "string") {
     LANG: "C",
     LC_ALL: "C",
   };
-  const appScopeResult = run(
+  const userScopeResult = run(
     larkCliExecutable,
     ["--profile", "executive-assistant", "auth", "scopes", "--json"],
     { env: larkEnvironment },
   );
+  const appInfoResult = run(
+    larkCliExecutable,
+    [
+      "--profile",
+      "executive-assistant",
+      "api",
+      "GET",
+      `/open-apis/application/v6/applications/${config.appId}`,
+      "--as", "bot",
+      "--params",
+      '{"lang":"zh_cn"}',
+      "--json",
+    ],
+    { env: larkEnvironment },
+  );
   let appScopesHealthy = false;
   try {
-    const report = JSON.parse(appScopeResult.stdout);
-    const enabled = new Set(report?.userScopes);
+    const userReport = JSON.parse(userScopeResult.stdout);
+    const appInfoReport = JSON.parse(appInfoResult.stdout);
+    const missingScopes = scopeTools.findMissingAppScopes(
+      scopeContract,
+      userReport,
+      appInfoReport,
+    );
     appScopesHealthy =
-      appScopeResult.status === 0 &&
-      Array.isArray(report?.userScopes) &&
-      REQUIRED_USER_SCOPES.every((scope) => enabled.has(scope));
+      userScopeResult.status === 0 &&
+      appInfoResult.status === 0 &&
+      Array.isArray(missingScopes) &&
+      missingScopes.length === 0;
   } catch {
     appScopesHealthy = false;
   }
@@ -535,8 +633,30 @@ if (!larkCliVerified || typeof larkHome !== "string") {
     "app-user-scopes",
     appScopesHealthy ? "PASS" : "FAIL",
     appScopesHealthy
-      ? "飞书应用层 6 项 MVP 用户权限已生效。"
-      : "飞书应用层缺少 MVP 用户权限；请发布并批准应用版本后重跑安装。",
+      ? "飞书应用层所需 User/Bot 权限已生效。"
+      : "飞书应用层缺少所需 User/Bot 权限；请发布并批准应用版本后重跑安装。",
+  );
+
+  const shortcutsHealthy = scopeContract.shortcuts.every((shortcut) => {
+    const result = run(
+      larkCliExecutable,
+      [
+        "--profile",
+        "executive-assistant",
+        shortcut.command,
+        shortcut.shortcut,
+        "--help",
+      ],
+      { env: larkEnvironment },
+    );
+    return result.status === 0 && !result.error && !result.signal;
+  });
+  add(
+    "shortcut-help",
+    shortcutsHealthy ? "PASS" : "FAIL",
+    shortcutsHealthy
+      ? "锁定的 lark-cli 1.0.72 本地 help 已覆盖全部固定 shortcut。"
+      : "锁定的 lark-cli 1.0.72 缺少计划所需 shortcut；未调用任何真实 Base 或文档操作。",
   );
 
   const statusResult = run(
@@ -596,28 +716,50 @@ if (!larkCliVerified || typeof larkHome !== "string") {
   const healthy = identityHealthy && scopesHealthy;
   add(
     "user-oauth",
-    healthy ? "PASS" : "FAIL",
+    healthy ? "PASS" : "ACTION_REQUIRED",
     healthy
-      ? "总裁的日历、通讯录和妙记用户授权已配置；doctor 未输出任何令牌。"
-      : "总裁用户授权不存在或已失效；请重新运行安装程序完成授权。",
+      ? "总裁的日历、通讯录、妙记、Base 和云文档用户授权已配置；doctor 未输出任何令牌。"
+      : "总裁个人 User OAuth 待授权；服务可启动，运行时会在飞书私聊发送一次授权卡。",
   );
 }
 
 const databasePath = config?.paths?.databasePath;
 if (typeof databasePath !== "string" || !path.isAbsolute(databasePath)) {
   add("sqlite", "FAIL", "SQLite 路径配置无效。");
-} else if (!fs.existsSync(databasePath)) {
+} else if (!existsWithoutFollowing(databasePath)) {
   add("sqlite", "WARN", "运行时尚未创建 SQLite 数据库。");
 } else if (!isPlainFile(databasePath) || safeMode(databasePath) !== 0o600) {
   add("sqlite", "FAIL", "SQLite 必须是权限 0600 的普通文件。");
-} else if (!isPlainFile("/usr/bin/sqlite3")) {
-  add("sqlite", "WARN", "系统没有 /usr/bin/sqlite3，无法执行只读 quick_check。");
+} else if (
+  !configuredNodeHealthy ||
+  typeof configuredNode !== "string" ||
+  !isPlainFile(sqliteDoctorHelperPath)
+) {
+  add("sqlite", "FAIL", "SQLite 只读完整性检查器不可用。");
 } else {
-  const result = run("/usr/bin/sqlite3", ["-readonly", databasePath, "PRAGMA quick_check;"]);
+  const result = run(configuredNode, [sqliteDoctorHelperPath, databasePath], {
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+    maxBuffer: 4_096,
+    encoding: "buffer",
+    env: {
+      PATH: MINIMAL_RUNTIME_PATH,
+      LANG: "C",
+      LC_ALL: "C",
+    },
+  });
+  const healthy =
+    result.status === 0 &&
+    result.signal === null &&
+    result.error === undefined &&
+    Buffer.isBuffer(result.stdout) &&
+    result.stdout.equals(Buffer.from("ok\n", "utf8")) &&
+    Buffer.isBuffer(result.stderr) &&
+    result.stderr.byteLength === 0;
   add(
     "sqlite",
-    result.status === 0 && result.stdout.trim() === "ok" ? "PASS" : "FAIL",
-    result.status === 0 && result.stdout.trim() === "ok"
+    healthy ? "PASS" : "FAIL",
+    healthy
       ? "SQLite quick_check 返回 ok。"
       : "SQLite quick_check 未通过。",
   );
@@ -774,7 +916,10 @@ if (typeof pptRoot !== "string" || !path.isAbsolute(pptRoot) || !isPlainFile(pat
 
 const overall = checks.some((check) => check.status === "FAIL")
   ? "FAIL"
-  : checks.some((check) => check.status === "WARN")
+  : checks.some(
+        (check) =>
+          check.status === "WARN" || check.status === "ACTION_REQUIRED",
+      )
     ? "WARN"
     : "PASS";
 const report = Object.freeze({
@@ -789,7 +934,12 @@ if (json) {
 } else {
   process.stdout.write(`总裁助理 doctor：${overall}\n\n`);
   for (const check of checks) {
-    const mark = check.status === "PASS" ? "✓" : check.status === "WARN" ? "!" : "✗";
+    const mark =
+      check.status === "PASS"
+        ? "✓"
+        : check.status === "WARN" || check.status === "ACTION_REQUIRED"
+          ? "!"
+          : "✗";
     process.stdout.write(`${mark} ${check.id}：${check.detail}\n`);
   }
 }

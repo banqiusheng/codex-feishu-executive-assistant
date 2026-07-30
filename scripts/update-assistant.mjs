@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -24,6 +24,8 @@ const CACHE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_STATE_BYTES = 4096;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+const FEISHU_SCOPE_CONTRACT_SHA256 =
+  "40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e";
 
 class UpdateFailure extends Error {
   constructor(reason) {
@@ -309,6 +311,49 @@ function worktreeIsClean(repositoryRoot) {
   return result.stdout.length === 0;
 }
 
+function validateScopeContract(repositoryRoot) {
+  const contractPath = join(repositoryRoot, "config", "feishu-scopes.json");
+  if (!existsSync(contractPath)) {
+    throw new UpdateFailure("scope_contract_invalid");
+  }
+  const stat = lstatSync(contractPath);
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    stat.size < 1 ||
+    stat.size > 64 * 1024
+  ) {
+    throw new UpdateFailure("scope_contract_invalid");
+  }
+  const bytes = readFileSync(contractPath);
+  if (
+    createHash("sha256").update(bytes).digest("hex") !==
+    FEISHU_SCOPE_CONTRACT_SHA256
+  ) {
+    throw new UpdateFailure("scope_contract_invalid");
+  }
+  try {
+    const value = JSON.parse(bytes.toString("utf8"));
+    if (
+      value?.schemaVersion !== 1 ||
+      Object.keys(value).join(",") !==
+        "schemaVersion,userScopes,botScopes,shortcuts" ||
+      !Array.isArray(value.userScopes) ||
+      value.userScopes.length !== 14 ||
+      new Set(value.userScopes).size !== value.userScopes.length ||
+      !Array.isArray(value.botScopes) ||
+      value.botScopes.length !== 4 ||
+      new Set(value.botScopes).size !== value.botScopes.length ||
+      !Array.isArray(value.shortcuts) ||
+      value.shortcuts.length !== 14
+    ) {
+      throw new Error("invalid");
+    }
+  } catch {
+    throw new UpdateFailure("scope_contract_invalid");
+  }
+}
+
 function fetchMain(repositoryRoot) {
   const result = git(repositoryRoot, [
     "fetch",
@@ -390,6 +435,7 @@ function apply(repositoryRoot, root) {
     return blocked(error instanceof UpdateFailure ? error.reason : "unknown");
   }
   try {
+    validateScopeContract(repositoryRoot);
     if (!worktreeIsClean(repositoryRoot)) return blocked("worktree_dirty");
     const targetCommit = fetchMain(repositoryRoot);
     if (targetCommit === currentCommit) {
@@ -407,6 +453,36 @@ function apply(repositoryRoot, root) {
       return blocked("non_fast_forward");
     }
     fastForward(repositoryRoot, targetCommit);
+    try {
+      validateScopeContract(repositoryRoot);
+    } catch {
+      const restored = restore(repositoryRoot, currentCommit);
+      const oldInstallRestored = restored && runInstaller(repositoryRoot);
+      if (restored && oldInstallRestored) {
+        return {
+          payload: {
+            schemaVersion: 1,
+            command: "apply",
+            status: "rolled_back",
+            reason: "scope_contract_invalid",
+            restoredCommit: currentCommit,
+            attemptedCommit: targetCommit,
+          },
+          exitCode: 1,
+        };
+      }
+      return {
+        payload: {
+          schemaVersion: 1,
+          command: "apply",
+          status: "recovery_failed",
+          reason: restored ? "old_install_failed" : "rollback_failed",
+          previousCommit: currentCommit,
+          attemptedCommit: targetCommit,
+        },
+        exitCode: 1,
+      };
+    }
     if (runInstaller(repositoryRoot)) {
       try {
         writeState(root, {

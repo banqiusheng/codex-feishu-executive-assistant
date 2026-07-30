@@ -14,6 +14,8 @@ import type {
   MvpMutationProvider,
 } from "../src/mvp/index.js";
 import {
+  createLarkCliDirectActionProvider,
+  createLarkCliDirectCalendarProvider,
   createLarkCliMutationProvider,
   createMvpConfirmationCoordinator,
 } from "../src/mvp/index.js";
@@ -75,6 +77,37 @@ function calendarDispatchAction(): MvpDispatchAction {
       zone: "Asia/Shanghai",
       attendeeOpenIds: [],
       recurrence: "none",
+    },
+    payloadHash: HASH,
+    idempotencyKey: ACTION_ID,
+  };
+}
+
+function directCalendarDispatchAction(): MvpDispatchAction {
+  return {
+    ...calendarDispatchAction(),
+    capability: "calendar.create.direct",
+  };
+}
+
+function reportDispatchAction(): MvpDispatchAction {
+  return {
+    actionId: ACTION_ID,
+    version: 1,
+    capability: "document.report.create",
+    identity: "user",
+    payload: {
+      docFormat: "xml",
+      parentPosition: "my_library",
+      title: "经营驾驶舱分析报告｜2026-07-31",
+      content:
+        '<?xml version="1.0" encoding="UTF-8"?><doc><title>经营驾驶舱分析报告｜2026-07-31</title>' +
+        "<section><heading>核心结论</heading><list><item>收入保持增长</item></list></section>" +
+        "<section><heading>关键数据</heading><paragraph>暂无</paragraph></section>" +
+        "<section><heading>异常与风险</heading><paragraph>暂无</paragraph></section>" +
+        "<section><heading>建议动作</heading><paragraph>暂无</paragraph></section>" +
+        "<section><heading>数据来源与口径</heading><source><paragraph>Base：经营驾驶舱</paragraph></source></section>" +
+        "</doc>",
     },
     payloadHash: HASH,
     idempotencyKey: ACTION_ID,
@@ -269,6 +302,23 @@ describe("MVP confirmation coordinator", () => {
     );
   });
 
+  it("fails closed when finishAction returns a different action", async () => {
+    const fixture = coordinatorFixture();
+    fixture.finishAction.mockReturnValueOnce(
+      messageAction("SUCCEEDED", {
+        actionId: "018f7d72-7a2b-7f45-8a12-8e20b8426a99",
+      }) as FinishedAction,
+    );
+
+    await expect(
+      fixture.coordinator.approveAndDispatch(callback()),
+    ).resolves.toEqual({
+      state: "UNKNOWN",
+      actionId: ACTION_ID,
+    });
+    expect(fixture.dispatch).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { ...callback(), identity: "user" },
     { ...callback(), url: "https://open.feishu.cn/anything" },
@@ -395,4 +445,210 @@ describe("MVP lark-cli mutation provider", () => {
     expect(runBot).not.toHaveBeenCalled();
     expect(runUser).not.toHaveBeenCalled();
   });
+});
+
+describe("MVP direct calendar lark-cli provider", () => {
+  it("maps the internal direct capability to calendar.create and requires the locked success envelope", async () => {
+    const runBot = vi.fn<MvpLarkCliRunner["runBot"]>();
+    const runUser = vi.fn<MvpLarkCliRunner["runUser"]>(async () => ({
+      state: "SUCCEEDED",
+      value: {
+        ok: true,
+        identity: "user",
+        data: {
+          event_id: "event_direct_1",
+          summary: "经营会",
+          start: "2026-07-24T10:00:00+08:00",
+          end: "2026-07-24T11:00:00+08:00",
+        },
+      },
+    }));
+    const provider = createLarkCliDirectCalendarProvider({ runBot, runUser });
+
+    await expect(
+      provider.dispatch(directCalendarDispatchAction()),
+    ).resolves.toEqual({
+      state: "SUCCEEDED",
+      remoteId: "event_direct_1",
+    });
+    expect(runUser).toHaveBeenCalledWith({
+      version: 1,
+      operation: "calendar.create",
+      payload: directCalendarDispatchAction().payload,
+    });
+    expect(runBot).not.toHaveBeenCalled();
+  });
+
+  it("rejects a legacy or mismatched success envelope without retry", async () => {
+    const runBot = vi.fn<MvpLarkCliRunner["runBot"]>();
+    const runUser = vi.fn<MvpLarkCliRunner["runUser"]>(async () => ({
+      state: "SUCCEEDED",
+      value: {
+        event_id: "event_direct_1",
+        summary: "经营会",
+        start: "2026-07-24T10:00:00+08:00",
+        end: "2026-07-24T11:00:00+08:00",
+      },
+    }));
+    const provider = createLarkCliDirectCalendarProvider({ runBot, runUser });
+
+    await expect(
+      provider.dispatch(directCalendarDispatchAction()),
+    ).rejects.toThrow("invalid mvp confirmation");
+    expect(runUser).toHaveBeenCalledOnce();
+  });
+});
+
+describe("MVP composite direct action lark-cli provider", () => {
+  it("preserves direct calendar support in the composite provider", async () => {
+    const runBot = vi.fn<MvpLarkCliRunner["runBot"]>();
+    const runUser = vi.fn<MvpLarkCliRunner["runUser"]>(async () => ({
+      state: "SUCCEEDED",
+      value: {
+        ok: true,
+        identity: "user",
+        data: {
+          event_id: "event_direct_1",
+          summary: "经营会",
+          start: "2026-07-24T10:00:00+08:00",
+          end: "2026-07-24T11:00:00+08:00",
+        },
+      },
+    }));
+    const provider = createLarkCliDirectActionProvider({ runBot, runUser });
+
+    await expect(
+      provider.dispatch(directCalendarDispatchAction()),
+    ).resolves.toEqual({
+      state: "SUCCEEDED",
+      remoteId: "event_direct_1",
+    });
+    expect(runUser).toHaveBeenCalledWith({
+      version: 1,
+      operation: "calendar.create",
+      payload: directCalendarDispatchAction().payload,
+    });
+    expect(runBot).not.toHaveBeenCalled();
+  });
+
+  it("creates a report through the fixed User operation and persists only the matched document ID", async () => {
+    const runBot = vi.fn<MvpLarkCliRunner["runBot"]>();
+    const runUser = vi.fn<MvpLarkCliRunner["runUser"]>(async () => ({
+      state: "SUCCEEDED",
+      value: {
+        ok: true,
+        identity: "user",
+        data: {
+          document: {
+            document_id: "J7ExampleDocumentToken",
+            revision_id: 1,
+            url: "https://example.feishu.cn/docx/J7ExampleDocumentToken",
+          },
+        },
+      },
+    }));
+    const provider = createLarkCliDirectActionProvider({ runBot, runUser });
+    const action = reportDispatchAction();
+
+    await expect(provider.dispatch(action)).resolves.toEqual({
+      state: "SUCCEEDED",
+      remoteId: "J7ExampleDocumentToken",
+    });
+    expect(runUser).toHaveBeenCalledWith({
+      version: 1,
+      operation: "document.report.create",
+      payload: action.payload,
+    });
+    expect(runBot).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "mismatched document URL",
+      {
+        ok: true,
+        identity: "user",
+        data: {
+          document: {
+            document_id: "doxcnReportDocument1",
+            revision_id: 1,
+            url: "https://example.feishu.cn/docx/doxcnDifferentDocument",
+          },
+        },
+      },
+    ],
+    [
+      "untrusted document URL",
+      {
+        ok: true,
+        identity: "user",
+        data: {
+          document: {
+            document_id: "doxcnReportDocument1",
+            revision_id: 1,
+            url: "https://evil.example/docx/doxcnReportDocument1",
+          },
+        },
+      },
+    ],
+    [
+      "extra success metadata",
+      {
+        ok: true,
+        identity: "user",
+        data: {
+          document: {
+            document_id: "doxcnReportDocument1",
+            revision_id: 1,
+            url: "https://example.feishu.cn/docx/doxcnReportDocument1",
+            token: "must-not-be-accepted",
+          },
+        },
+      },
+    ],
+    [
+      "legacy flat shape",
+      {
+        ok: true,
+        identity: "user",
+        data: {
+          document_id: "doxcnReportDocument1",
+          revision_id: 1,
+          url: "https://example.feishu.cn/docx/doxcnReportDocument1",
+        },
+      },
+    ],
+  ] as const)("rejects %s without retrying", async (_label, value) => {
+    const runBot = vi.fn<MvpLarkCliRunner["runBot"]>();
+    const runUser = vi.fn<MvpLarkCliRunner["runUser"]>(async () => ({
+      state: "SUCCEEDED",
+      value,
+    }));
+    const provider = createLarkCliDirectActionProvider({ runBot, runUser });
+
+    await expect(provider.dispatch(reportDispatchAction())).rejects.toThrow(
+      "invalid mvp confirmation",
+    );
+    expect(runUser).toHaveBeenCalledOnce();
+    expect(runBot).not.toHaveBeenCalled();
+  });
+
+  it.each(["FAILED", "UNKNOWN"] as const)(
+    "maps a report runner %s terminal result without retrying",
+    async (state) => {
+      const runBot = vi.fn<MvpLarkCliRunner["runBot"]>();
+      const runUser = vi.fn<MvpLarkCliRunner["runUser"]>(async () =>
+        state === "FAILED"
+          ? { state, code: "CLI_EXITED" as const }
+          : { state, code: "TIMEOUT" as const },
+      );
+      const provider = createLarkCliDirectActionProvider({ runBot, runUser });
+
+      await expect(provider.dispatch(reportDispatchAction())).resolves.toEqual({
+        state,
+      });
+      expect(runUser).toHaveBeenCalledOnce();
+      expect(runBot).not.toHaveBeenCalled();
+    },
+  );
 });

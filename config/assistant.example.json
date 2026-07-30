@@ -30,7 +30,8 @@
     "codex": "__CODEX_EXECUTABLE__",
     "larkCli": "__LARK_CLI_EXECUTABLE__",
     "gatewayClient": "__GATEWAY_CLIENT__",
-    "runtimeEntry": "__RUNTIME_ENTRY__"
+    "runtimeEntry": "__RUNTIME_ENTRY__",
+    "userAuthHelper": "__FEISHU_USER_AUTH_HELPER__"
   },
   "visualFirstPpt": {
     "skillRoot": "__VISUAL_FIRST_PPT_ROOT__",

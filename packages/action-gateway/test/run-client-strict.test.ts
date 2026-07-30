@@ -313,6 +313,10 @@ describe("strict native public run client", () => {
     ["version", 2],
     ["taskId", randomUUID()],
     ["identity", "user"],
+    ["actor", "user"],
+    ["chat", "oc_other"],
+    ["skipConfirmation", true],
+    ["autoApprove", true],
     ["target", "another-chat"],
     ["path", "/tmp/out"],
     ["shell", "sh"],
@@ -332,6 +336,25 @@ describe("strict native public run client", () => {
     await expectRejectedBeforeConnect(
       JSON.stringify({ ...validRequest(), ...override }),
     );
+  });
+
+  it("accepts an execute request with the same five-field envelope", async () => {
+    const requestId = randomUUID();
+    const request = JSON.stringify({
+      ...validRequest(requestId),
+      kind: "execute",
+      capability: "calendar.schedule",
+      payload: { title: "季度复盘" },
+    });
+    const response = successResponse(requestId);
+
+    await expect(
+      invokeAgainstResponse(request, frameText(response)),
+    ).resolves.toEqual({
+      status: 0,
+      stdout: response,
+      stderr: "",
+    });
   });
 
   it("enforces JSON depth 64 at the request boundary", async () => {

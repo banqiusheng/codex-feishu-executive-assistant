@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   appendFileSync,
   chmodSync,
+  constants as fsConstants,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -10,6 +13,8 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
+  type Stats,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -24,7 +29,52 @@ const fileSystemBarrier = vi.hoisted(() => ({
   afterClose: undefined as ((path: string) => void) | undefined,
   trackedSuffix: undefined as string | undefined,
   trackedLstatCalls: 0,
+  openFlags: [] as Array<Readonly<{ path: string; flags: number }>>,
+  mismatchedOwnerSuffix: undefined as string | undefined,
+  maskedHardLinkInode: undefined as number | undefined,
+  maskedHardLinkCtimeMs: undefined as number | undefined,
 }));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const maskHardLinkCtime = (stats: Stats): Stats => {
+    if (
+      fileSystemBarrier.maskedHardLinkInode === undefined ||
+      fileSystemBarrier.maskedHardLinkCtimeMs === undefined ||
+      stats.ino !== fileSystemBarrier.maskedHardLinkInode
+    ) {
+      return stats;
+    }
+    return new Proxy(stats, {
+      get(target, property) {
+        if (property === "ctimeMs") {
+          return fileSystemBarrier.maskedHardLinkCtimeMs;
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+  const controlledLstatSync = new Proxy(actual.lstatSync, {
+    apply(target, thisArgument, argumentsList) {
+      return maskHardLinkCtime(
+        Reflect.apply(target, thisArgument, argumentsList) as Stats,
+      );
+    },
+  });
+  const controlledFstatSync = new Proxy(actual.fstatSync, {
+    apply(target, thisArgument, argumentsList) {
+      return maskHardLinkCtime(
+        Reflect.apply(target, thisArgument, argumentsList) as Stats,
+      );
+    },
+  });
+  return {
+    ...actual,
+    lstatSync: controlledLstatSync,
+    fstatSync: controlledFstatSync,
+  };
+});
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -43,6 +93,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const controlledOpen = new Proxy(actual.open, {
     async apply(target, thisArgument, argumentsList) {
       const path = String(argumentsList[0]);
+      fileSystemBarrier.openFlags.push({
+        path,
+        flags: Number(argumentsList[1]),
+      });
       const handle = await Reflect.apply(target, thisArgument, argumentsList);
       return new Proxy(handle, {
         get(fileHandle, property) {
@@ -53,6 +107,29 @@ vi.mock("node:fs/promises", async (importOriginal) => {
               const afterClose = fileSystemBarrier.afterClose;
               fileSystemBarrier.afterClose = undefined;
               afterClose?.(path);
+            };
+          }
+          if (
+            property === "stat" &&
+            typeof value === "function" &&
+            fileSystemBarrier.mismatchedOwnerSuffix !== undefined &&
+            path.endsWith(fileSystemBarrier.mismatchedOwnerSuffix)
+          ) {
+            return async () => {
+              const stats = (await Reflect.apply(
+                value,
+                fileHandle,
+                [],
+              )) as Stats;
+              return new Proxy(stats, {
+                get(target, key) {
+                  if (key === "uid") return target.uid + 1;
+                  const field = Reflect.get(target, key, target);
+                  return typeof field === "function"
+                    ? field.bind(target)
+                    : field;
+                },
+              });
             };
           }
           return typeof value === "function" ? value.bind(fileHandle) : value;
@@ -177,6 +254,8 @@ function routes(): readonly LarkCliRoute[] {
       buildInvocation: (payload) => ({
         operationArgs: ["api", "POST", "/open-apis/im/v1/messages"] as const,
         jsonInputs: [{ flag: "--data", value: payload }] as const,
+        textInputs: [] as const,
+        fileInputs: [] as const,
       }),
     },
     {
@@ -187,6 +266,8 @@ function routes(): readonly LarkCliRoute[] {
       buildInvocation: () => ({
         operationArgs: ["minutes", "+search"] as const,
         jsonInputs: [] as const,
+        textInputs: [] as const,
+        fileInputs: [] as const,
       }),
     },
   ] as const;
@@ -206,10 +287,18 @@ function temporaryDirectories(fixture: Fixture): string[] {
     .map((name) => join(fixture.taskDirectory, name));
 }
 
+function sha256(value: Buffer | string): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
 afterEach(() => {
   fileSystemBarrier.afterClose = undefined;
   fileSystemBarrier.trackedSuffix = undefined;
   fileSystemBarrier.trackedLstatCalls = 0;
+  fileSystemBarrier.openFlags.length = 0;
+  fileSystemBarrier.mismatchedOwnerSuffix = undefined;
+  fileSystemBarrier.maskedHardLinkInode = undefined;
+  fileSystemBarrier.maskedHardLinkCtimeMs = undefined;
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -306,6 +395,571 @@ describe("fixed-identity lark-cli runner", () => {
     expect(JSON.stringify([command, args, options])).not.toContain(SECRET);
     expect(observedInput).toContain(SECRET);
     expect(existsSync(observedInputPath)).toBe(false);
+    expect(temporaryDirectories(fixture)).toEqual([]);
+  });
+
+  it("materializes fixed UTF-8 XML and a registered task file with private permissions and relative argv", async () => {
+    const fixture = createFixture();
+    const resourcesDirectory = join(fixture.taskDirectory, "resources");
+    mkdirSync(resourcesDirectory, { mode: 0o700 });
+    const source = Buffer.from("registered-image-bytes", "utf8");
+    const sourcePath = join(resourcesDirectory, "source.png");
+    writeFileSync(sourcePath, source, { mode: 0o600 });
+    chmodSync(sourcePath, 0o600);
+    const xml = "<doc><text>经营分析✓</text></doc>";
+    const child = new FakeChild();
+    const spawn = vi.fn((_command, args, options) => {
+      const argv = args as readonly string[];
+      const contentReference = argv[argv.indexOf("--content") + 1]!;
+      const imageReference = argv[argv.indexOf("--image") + 1]!;
+      expect(contentReference).toMatch(/^@\.lark-cli-[^/]+\/content\.xml$/);
+      expect(imageReference).toMatch(/^@\.lark-cli-[^/]+\/report-image\.png$/);
+      const contentPath = join(options.cwd, contentReference.slice(1));
+      const imagePath = join(options.cwd, imageReference.slice(1));
+      expect(readFileSync(contentPath, "utf8")).toBe(xml);
+      expect(readFileSync(imagePath)).toEqual(source);
+      expect(lstatSync(dirname(contentPath)).mode & 0o7777).toBe(0o700);
+      expect(lstatSync(contentPath).mode & 0o7777).toBe(0o600);
+      expect(lstatSync(imagePath).mode & 0o7777).toBe(0o600);
+      child.finish('{"ok":true}');
+      return child;
+    });
+    const route: LarkCliRoute = {
+      identity: "bot",
+      operation: "document.with-image",
+      effect: "write",
+      parsePayload: exactBody,
+      buildInvocation: () => ({
+        operationArgs: ["docx", "+create"] as const,
+        jsonInputs: [] as const,
+        textInputs: [
+          { flag: "--content", fileName: "content.xml", value: xml },
+        ] as const,
+        fileInputs: [
+          {
+            flag: "--image",
+            sourceRelativePath: "resources/source.png",
+            outputFileName: "report-image.png",
+            sizeBytes: source.length,
+            sha256: sha256(source),
+          },
+        ] as const,
+      }),
+    };
+    const runner = createLarkCliRunner({
+      executable: fixture.executable,
+      homeDirectory: fixture.homeDirectory,
+      taskDirectory: fixture.taskDirectory,
+      registry: createLarkCliRouteRegistry([route]),
+      verifyRelease: vi.fn(async () => releaseEvidence(fixture)),
+      spawn,
+    });
+
+    await expect(
+      runner.runBot(request("document.with-image")),
+    ).resolves.toEqual({
+      state: "SUCCEEDED",
+      value: { ok: true },
+    });
+    expect(spawn).toHaveBeenCalledOnce();
+    const sourceOpenFlags = fileSystemBarrier.openFlags.filter(({ path }) =>
+      path.includes("source.png"),
+    );
+    const privateOpenFlags = fileSystemBarrier.openFlags.filter(({ path }) =>
+      path.includes(".lark-cli-"),
+    );
+    expect(sourceOpenFlags.length).toBeGreaterThan(0);
+    expect(privateOpenFlags.length).toBeGreaterThan(0);
+    expect(
+      sourceOpenFlags.every(
+        ({ flags }) => (flags & fsConstants.O_NOFOLLOW) !== 0,
+      ),
+    ).toBe(true);
+    expect(
+      privateOpenFlags.every(
+        ({ flags }) => (flags & fsConstants.O_NOFOLLOW) !== 0,
+      ),
+    ).toBe(true);
+    expect(readFileSync(sourcePath)).toEqual(source);
+    expect(temporaryDirectories(fixture)).toEqual([]);
+  });
+
+  it.each([
+    [
+      "an extra plan key",
+      () => ({
+        operationArgs: ["fixture"],
+        jsonInputs: [],
+        textInputs: [],
+        fileInputs: [],
+        profile: "attacker",
+      }),
+    ],
+    [
+      "a plan accessor",
+      () =>
+        Object.defineProperty(
+          {
+            operationArgs: ["fixture"],
+            jsonInputs: [],
+            textInputs: [],
+          },
+          "fileInputs",
+          {
+            enumerable: true,
+            get: vi.fn(() => []),
+          },
+        ),
+    ],
+    [
+      "a plan Proxy",
+      () =>
+        new Proxy(
+          {
+            operationArgs: ["fixture"],
+            jsonInputs: [],
+            textInputs: [],
+            fileInputs: [],
+          },
+          { get: vi.fn(Reflect.get) },
+        ),
+    ],
+  ])("rejects %s before release verification or spawn", async (_name, plan) => {
+    const fixture = createFixture();
+    const verifyRelease = vi.fn(async () => releaseEvidence(fixture));
+    const spawn = vi.fn();
+    const unsafeRoute: LarkCliRoute = {
+      identity: "bot",
+      operation: "unsafe.plan",
+      effect: "write",
+      parsePayload: exactBody,
+      buildInvocation: plan as never,
+    };
+    const runner = createLarkCliRunner({
+      executable: fixture.executable,
+      homeDirectory: fixture.homeDirectory,
+      taskDirectory: fixture.taskDirectory,
+      registry: createLarkCliRouteRegistry([unsafeRoute]),
+      verifyRelease,
+      spawn,
+    });
+
+    await expect(runner.runBot(request("unsafe.plan"))).resolves.toEqual({
+      state: "FAILED",
+      code: "OUTPUT_INVALID",
+    });
+    expect(verifyRelease).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "an arbitrary text flag",
+      { flag: "--file", fileName: "content.xml", value: "<doc/>" },
+    ],
+    [
+      "an arbitrary text filename",
+      { flag: "--content", fileName: "other.xml", value: "<doc/>" },
+    ],
+    [
+      "an over-limit UTF-8 body",
+      {
+        flag: "--content",
+        fileName: "content.xml",
+        value: "界".repeat(Math.floor((8 * 1024 * 1024) / 3) + 1),
+      },
+    ],
+    [
+      "a lossy lone surrogate",
+      { flag: "--content", fileName: "content.xml", value: "\ud800" },
+    ],
+  ] as const)(
+    "rejects %s before release verification or spawn",
+    async (_name, textInput) => {
+      const fixture = createFixture();
+      const verifyRelease = vi.fn(async () => releaseEvidence(fixture));
+      const spawn = vi.fn();
+      const unsafeRoute: LarkCliRoute = {
+        identity: "bot",
+        operation: "unsafe.text",
+        effect: "write",
+        parsePayload: exactBody,
+        buildInvocation: () => ({
+          operationArgs: ["docx", "+create"],
+          jsonInputs: [],
+          textInputs: [textInput] as never,
+          fileInputs: [],
+        }),
+      };
+      const runner = createLarkCliRunner({
+        executable: fixture.executable,
+        homeDirectory: fixture.homeDirectory,
+        taskDirectory: fixture.taskDirectory,
+        registry: createLarkCliRouteRegistry([unsafeRoute]),
+        verifyRelease,
+        spawn,
+      });
+
+      await expect(runner.runBot(request("unsafe.text"))).resolves.toEqual({
+        state: "FAILED",
+        code: "OUTPUT_INVALID",
+      });
+      expect(verifyRelease).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["a zero declared size", 0, sha256("x")],
+    ["an over-limit declared size", 100 * 1024 * 1024 + 1, sha256("x")],
+    ["a malformed SHA-256", 1, `sha256:${"A".repeat(64)}`],
+  ] as const)(
+    "rejects %s before release verification or source access",
+    async (_name, sizeBytes, digest) => {
+      const fixture = createFixture();
+      const verifyRelease = vi.fn(async () => releaseEvidence(fixture));
+      const spawn = vi.fn();
+      const unsafeRoute: LarkCliRoute = {
+        identity: "bot",
+        operation: "unsafe.file-metadata",
+        effect: "write",
+        parsePayload: exactBody,
+        buildInvocation: () => ({
+          operationArgs: ["im", "+file-send"],
+          jsonInputs: [],
+          textInputs: [],
+          fileInputs: [
+            {
+              flag: "--file",
+              sourceRelativePath: "resources/source.bin",
+              outputFileName: "copy.bin",
+              sizeBytes,
+              sha256: digest,
+            },
+          ] as never,
+        }),
+      };
+      const runner = createLarkCliRunner({
+        executable: fixture.executable,
+        homeDirectory: fixture.homeDirectory,
+        taskDirectory: fixture.taskDirectory,
+        registry: createLarkCliRouteRegistry([unsafeRoute]),
+        verifyRelease,
+        spawn,
+      });
+
+      await expect(
+        runner.runBot(request("unsafe.file-metadata")),
+      ).resolves.toEqual({
+        state: "FAILED",
+        code: "OUTPUT_INVALID",
+      });
+      expect(verifyRelease).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["an arbitrary file flag", "--content", "resources/source.bin", "copy.bin"],
+    ["an absolute source", "--file", "/tmp/source.bin", "copy.bin"],
+    ["source traversal", "--file", "../source.bin", "copy.bin"],
+    [
+      "normalized source traversal",
+      "--file",
+      "resources/../source.bin",
+      "copy.bin",
+    ],
+    ["an absolute output", "--file", "resources/source.bin", "/tmp/copy.bin"],
+    ["output traversal", "--file", "resources/source.bin", "../copy.bin"],
+    [
+      "an output subdirectory",
+      "--file",
+      "resources/source.bin",
+      "nested/copy.bin",
+    ],
+    [
+      "a backslash output escape",
+      "--file",
+      "resources/source.bin",
+      String.raw`nested\copy.bin`,
+    ],
+  ] as const)(
+    "rejects %s before touching a source file",
+    async (_name, flag, sourceRelativePath, outputFileName) => {
+      const fixture = createFixture();
+      const verifyRelease = vi.fn(async () => releaseEvidence(fixture));
+      const spawn = vi.fn();
+      const unsafeRoute: LarkCliRoute = {
+        identity: "bot",
+        operation: "unsafe.file",
+        effect: "write",
+        parsePayload: exactBody,
+        buildInvocation: () => ({
+          operationArgs: ["im", "+file-send"],
+          jsonInputs: [],
+          textInputs: [],
+          fileInputs: [
+            {
+              flag,
+              sourceRelativePath,
+              outputFileName,
+              sizeBytes: 1,
+              sha256: sha256("x"),
+            },
+          ] as never,
+        }),
+      };
+      const runner = createLarkCliRunner({
+        executable: fixture.executable,
+        homeDirectory: fixture.homeDirectory,
+        taskDirectory: fixture.taskDirectory,
+        registry: createLarkCliRouteRegistry([unsafeRoute]),
+        verifyRelease,
+        spawn,
+      });
+
+      await expect(runner.runBot(request("unsafe.file"))).resolves.toEqual({
+        state: "FAILED",
+        code: "OUTPUT_INVALID",
+      });
+      expect(verifyRelease).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["a source symlink", "symlink"],
+    ["a source owner mismatch", "owner"],
+    ["a size mismatch", "size"],
+    ["a SHA-256 mismatch", "hash"],
+  ] as const)(
+    "rejects %s without spawning and cleans private inputs",
+    async (_name, invalidity) => {
+      const fixture = createFixture();
+      const resourcesDirectory = join(fixture.taskDirectory, "resources");
+      mkdirSync(resourcesDirectory, { mode: 0o700 });
+      const source = Buffer.from("registered-file", "utf8");
+      const realSourcePath = join(resourcesDirectory, "real.bin");
+      const selectedSourcePath = join(resourcesDirectory, "selected.bin");
+      writeFileSync(realSourcePath, source, { mode: 0o600 });
+      if (invalidity === "symlink") {
+        symlinkSync(realSourcePath, selectedSourcePath);
+      } else {
+        writeFileSync(selectedSourcePath, source, { mode: 0o600 });
+      }
+      if (invalidity === "owner") {
+        fileSystemBarrier.mismatchedOwnerSuffix = "/selected.bin";
+      }
+      const route: LarkCliRoute = {
+        identity: "bot",
+        operation: "invalid.registered-file",
+        effect: "write",
+        parsePayload: exactBody,
+        buildInvocation: () => ({
+          operationArgs: ["im", "+file-send"],
+          jsonInputs: [],
+          textInputs: [],
+          fileInputs: [
+            {
+              flag: "--file",
+              sourceRelativePath: "resources/selected.bin",
+              outputFileName: "selected.bin",
+              sizeBytes:
+                invalidity === "size" ? source.length + 1 : source.length,
+              sha256:
+                invalidity === "hash" ? sha256("other-bytes") : sha256(source),
+            },
+          ],
+        }),
+      };
+      const spawn = vi.fn();
+      const runner = createLarkCliRunner({
+        executable: fixture.executable,
+        homeDirectory: fixture.homeDirectory,
+        taskDirectory: fixture.taskDirectory,
+        registry: createLarkCliRouteRegistry([route]),
+        verifyRelease: vi.fn(async () => releaseEvidence(fixture)),
+        spawn,
+      });
+
+      await expect(
+        runner.runBot(request("invalid.registered-file")),
+      ).resolves.toEqual({
+        state: "FAILED",
+        code: "OUTPUT_INVALID",
+      });
+      expect(spawn).not.toHaveBeenCalled();
+      expect(temporaryDirectories(fixture)).toEqual([]);
+    },
+  );
+
+  it("rechecks a registered source before spawn and reports replacement as definite failure", async () => {
+    const fixture = createFixture();
+    const resourcesDirectory = join(fixture.taskDirectory, "resources");
+    mkdirSync(resourcesDirectory, { mode: 0o700 });
+    const source = Buffer.from("registered-file", "utf8");
+    const sourcePath = join(resourcesDirectory, "source.bin");
+    writeFileSync(sourcePath, source, { mode: 0o600 });
+    const route: LarkCliRoute = {
+      identity: "bot",
+      operation: "replace.source",
+      effect: "write",
+      parsePayload: exactBody,
+      buildInvocation: () => ({
+        operationArgs: ["im", "+file-send"],
+        jsonInputs: [],
+        textInputs: [],
+        fileInputs: [
+          {
+            flag: "--file",
+            sourceRelativePath: "resources/source.bin",
+            outputFileName: "source.bin",
+            sizeBytes: source.length,
+            sha256: sha256(source),
+          },
+        ],
+      }),
+    };
+    let verificationCount = 0;
+    const verifyRelease = vi.fn(async () => {
+      verificationCount += 1;
+      if (verificationCount === 2) {
+        unlinkSync(sourcePath);
+        writeFileSync(sourcePath, Buffer.from("replacement!!!", "utf8"), {
+          mode: 0o600,
+        });
+      }
+      return releaseEvidence(fixture);
+    });
+    const spawn = vi.fn();
+    const runner = createLarkCliRunner({
+      executable: fixture.executable,
+      homeDirectory: fixture.homeDirectory,
+      taskDirectory: fixture.taskDirectory,
+      registry: createLarkCliRouteRegistry([route]),
+      verifyRelease,
+      spawn,
+    });
+
+    await expect(runner.runBot(request("replace.source"))).resolves.toEqual({
+      state: "FAILED",
+      code: "OUTPUT_INVALID",
+    });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(temporaryDirectories(fixture)).toEqual([]);
+  });
+
+  it("rejects a task-local registered source that is a hard link to an external file", async () => {
+    const fixture = createFixture();
+    const resourcesDirectory = join(fixture.taskDirectory, "resources");
+    mkdirSync(resourcesDirectory, { mode: 0o700 });
+    const source = Buffer.from("external-registered-file", "utf8");
+    const externalPath = join(fixture.root, "external.bin");
+    const linkedSourcePath = join(resourcesDirectory, "linked.bin");
+    writeFileSync(externalPath, source, { mode: 0o600 });
+    linkSync(externalPath, linkedSourcePath);
+    expect(lstatSync(linkedSourcePath).nlink).toBe(2);
+    const route: LarkCliRoute = {
+      identity: "bot",
+      operation: "hard-link.source",
+      effect: "write",
+      parsePayload: exactBody,
+      buildInvocation: () => ({
+        operationArgs: ["im", "+file-send"],
+        jsonInputs: [],
+        textInputs: [],
+        fileInputs: [
+          {
+            flag: "--file",
+            sourceRelativePath: "resources/linked.bin",
+            outputFileName: "linked.bin",
+            sizeBytes: source.length,
+            sha256: sha256(source),
+          },
+        ],
+      }),
+    };
+    const spawn = vi.fn();
+    const runner = createLarkCliRunner({
+      executable: fixture.executable,
+      homeDirectory: fixture.homeDirectory,
+      taskDirectory: fixture.taskDirectory,
+      registry: createLarkCliRouteRegistry([route]),
+      verifyRelease: vi.fn(async () => releaseEvidence(fixture)),
+      spawn,
+    });
+
+    await expect(runner.runBot(request("hard-link.source"))).resolves.toEqual({
+      state: "FAILED",
+      code: "OUTPUT_INVALID",
+    });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(readFileSync(externalPath)).toEqual(source);
+    expect(temporaryDirectories(fixture)).toEqual([]);
+  });
+
+  it("rejects a materialized private file whose link count changes before spawn", async () => {
+    const fixture = createFixture();
+    const resourcesDirectory = join(fixture.taskDirectory, "resources");
+    mkdirSync(resourcesDirectory, { mode: 0o700 });
+    const source = Buffer.from("registered-file", "utf8");
+    const sourcePath = join(resourcesDirectory, "source.bin");
+    writeFileSync(sourcePath, source, { mode: 0o600 });
+    const route: LarkCliRoute = {
+      identity: "bot",
+      operation: "hard-link.materialized",
+      effect: "write",
+      parsePayload: exactBody,
+      buildInvocation: () => ({
+        operationArgs: ["im", "+file-send"],
+        jsonInputs: [],
+        textInputs: [],
+        fileInputs: [
+          {
+            flag: "--file",
+            sourceRelativePath: "resources/source.bin",
+            outputFileName: "copy.bin",
+            sizeBytes: source.length,
+            sha256: sha256(source),
+          },
+        ],
+      }),
+    };
+    const externalHardLink = join(fixture.root, "materialized-hard-link.bin");
+    let verificationCount = 0;
+    const verifyRelease = vi.fn(async () => {
+      verificationCount += 1;
+      if (verificationCount === 2) {
+        const [temporaryDirectory] = temporaryDirectories(fixture);
+        expect(temporaryDirectory).toBeDefined();
+        const privateCopy = join(temporaryDirectory!, "copy.bin");
+        const beforeLink = lstatSync(privateCopy);
+        linkSync(privateCopy, externalHardLink);
+        fileSystemBarrier.maskedHardLinkInode = beforeLink.ino;
+        fileSystemBarrier.maskedHardLinkCtimeMs = beforeLink.ctimeMs;
+        expect(lstatSync(privateCopy).nlink).toBe(2);
+      }
+      return releaseEvidence(fixture);
+    });
+    const spawn = vi.fn();
+    const runner = createLarkCliRunner({
+      executable: fixture.executable,
+      homeDirectory: fixture.homeDirectory,
+      taskDirectory: fixture.taskDirectory,
+      registry: createLarkCliRouteRegistry([route]),
+      verifyRelease,
+      spawn,
+    });
+
+    await expect(
+      runner.runBot(request("hard-link.materialized")),
+    ).resolves.toEqual({
+      state: "FAILED",
+      code: "OUTPUT_INVALID",
+    });
+    expect(verifyRelease).toHaveBeenCalledTimes(2);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(readFileSync(externalHardLink)).toEqual(source);
     expect(temporaryDirectories(fixture)).toEqual([]);
   });
 
@@ -740,14 +1394,14 @@ describe("fixed-identity lark-cli runner", () => {
 
   it.each([
     [
-      "a throwing spawn",
+      "a throwing spawn boundary",
       () => {
         throw new Error("spawn fixture failure");
       },
     ],
-    ["an invalid child", () => ({}) as never],
+    ["an invalid spawned child", () => ({}) as never],
   ])(
-    "best-effort cleans inputs after %s",
+    "keeps a write UNKNOWN and best-effort cleans inputs after %s",
     async (_name, spawnImplementation) => {
       const fixture = createFixture();
       const runner = createLarkCliRunner({
@@ -760,8 +1414,8 @@ describe("fixed-identity lark-cli runner", () => {
       });
 
       await expect(runner.runBot(request("message.send"))).resolves.toEqual({
-        state: "FAILED",
-        code: "SPAWN_FAILED",
+        state: "UNKNOWN",
+        code: "IO_AFTER_SPAWN",
       });
       expect(temporaryDirectories(fixture)).toEqual([]);
     },
@@ -851,6 +1505,8 @@ describe("fixed-identity lark-cli runner", () => {
         buildInvocation: (payload) => ({
           operationArgs: ["fixture", "cleanup"],
           jsonInputs: [{ flag: "--data", value: payload }],
+          textInputs: [],
+          fileInputs: [],
         }),
       };
       const runner = createLarkCliRunner({
@@ -884,6 +1540,12 @@ describe("fixed-identity lark-cli runner", () => {
     "--data=@attacker.json",
     "--params",
     "--params=@attacker.json",
+    "--content",
+    "--content=@attacker.xml",
+    "--image",
+    "--image=@attacker.png",
+    "--file",
+    "--file=@attacker.bin",
   ])(
     "rejects reserved builder token %s before release verification or spawn",
     async (reservedToken) => {
@@ -896,6 +1558,29 @@ describe("fixed-identity lark-cli runner", () => {
         buildInvocation: () => ({
           operationArgs: ["auth", "status", reservedToken, "attacker-value"],
           jsonInputs: [],
+          textInputs: [
+            {
+              flag: "--content",
+              fileName: "content.xml",
+              value: "<doc/>",
+            },
+          ],
+          fileInputs: [
+            {
+              flag: "--image",
+              sourceRelativePath: "resources/image.png",
+              outputFileName: "image.png",
+              sizeBytes: 1,
+              sha256: sha256("x"),
+            },
+            {
+              flag: "--file",
+              sourceRelativePath: "resources/file.bin",
+              outputFileName: "file.bin",
+              sizeBytes: 1,
+              sha256: sha256("x"),
+            },
+          ],
         }),
       };
       const verifyRelease = vi.fn(async () => releaseEvidence(fixture));

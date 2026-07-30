@@ -23,6 +23,9 @@ import {
 } from "./leases.js";
 import {
   RuntimeStateError,
+  type AuthorizedPresidentInstructionAction,
+  type AuthorizePresidentInstructionActionInput,
+  type ActionApprovalMode,
   type ActionRecord,
   type ActionRef,
   type ActionResult,
@@ -107,6 +110,7 @@ type ActionRow = Readonly<{
 
 type SourceIdentityRow = Readonly<{
   sourceId: unknown;
+  inboundEventId?: unknown;
   actorHash: unknown;
   chatHash: unknown;
 }>;
@@ -143,6 +147,16 @@ type ApprovalAuditRow = Readonly<{
   nonceHash: unknown;
   decision: unknown;
   decidedAt: unknown;
+}>;
+
+type InstructionAuthorizationAuditRow = Readonly<{
+  version: unknown;
+  taskId: unknown;
+  inboundEventId: unknown;
+  capability: unknown;
+  payloadHash: unknown;
+  itemKey: unknown;
+  createdAt: unknown;
 }>;
 
 type AttemptAuditRow = Readonly<{
@@ -440,13 +454,13 @@ function validatePersistedSourceBinding(
 function validateTaskActionLeaseBinding(
   database: Database.Database,
   taskId: string | null,
-  approvalMode: "president" | "system_policy",
+  approvalMode: ActionApprovalMode,
   state: ActionState,
   leaseOwner: string | null,
 ): void {
   if (
     taskId === null ||
-    approvalMode !== "president" ||
+    approvalMode === "system_policy" ||
     (state !== "CLAIMED" && state !== "DISPATCHING")
   ) {
     return;
@@ -482,6 +496,7 @@ function actionRecord(
     !safeText(row.capability, 128) ||
     (row.identity !== "bot" && row.identity !== "user") ||
     (row.approvalMode !== "president" &&
+      row.approvalMode !== "president_instruction" &&
       row.approvalMode !== "system_policy") ||
     typeof row.state !== "string" ||
     !ACTION_STATES.has(row.state as ActionState) ||
@@ -511,7 +526,10 @@ function actionRecord(
   if (
     (row.capability === "system_reply" &&
       (row.approvalMode !== "system_policy" || row.identity !== "bot")) ||
-    (row.capability !== "system_reply" && row.approvalMode !== "president") ||
+    (row.capability !== "system_reply" &&
+      row.approvalMode !== "president" &&
+      row.approvalMode !== "president_instruction") ||
+    (row.approvalMode === "president_instruction" && taskId === null) ||
     (controlEventId !== null && row.capability !== "system_reply")
   ) {
     throw new RuntimeStateError("action_persistence_failed");
@@ -530,7 +548,8 @@ function actionRecord(
   );
   if (
     updatedAt.milliseconds < createdAt.milliseconds ||
-    (row.approvalMode === "president" &&
+    ((row.approvalMode === "president" ||
+      row.approvalMode === "president_instruction") &&
       expiresAt.milliseconds - createdAt.milliseconds !== APPROVAL_TTL_MS) ||
     (row.approvalMode === "system_policy" &&
       expiresAt.milliseconds < createdAt.milliseconds)
@@ -727,15 +746,22 @@ function legalAuditTransition(
 }
 
 function validAuditReason(
-  approvalMode: "president" | "system_policy",
+  approvalMode: ActionApprovalMode,
   fromState: ActionState | null,
   toState: ActionState,
   reasonCode: string,
 ): boolean {
   if (fromState === null) {
-    return approvalMode === "system_policy"
-      ? toState === "APPROVED" && reasonCode === "system_policy_approved"
-      : toState === "PREPARED" && reasonCode === "prepared";
+    if (approvalMode === "system_policy") {
+      return toState === "APPROVED" && reasonCode === "system_policy_approved";
+    }
+    if (approvalMode === "president_instruction") {
+      return (
+        toState === "APPROVED" &&
+        reasonCode === "president_instruction_approved"
+      );
+    }
+    return toState === "PREPARED" && reasonCode === "prepared";
   }
   if (fromState === "PREPARED" && toState === "APPROVED") {
     return reasonCode === "approved";
@@ -843,7 +869,7 @@ function validateTransitionLedger(
     }
     if (currentState === null) {
       const expectedInitial =
-        action.approvalMode === "system_policy" ? "APPROVED" : "PREPARED";
+        action.approvalMode === "president" ? "PREPARED" : "APPROVED";
       if (toState !== expectedInitial) return auditFailure();
     } else if (!legalAuditTransition(currentState, toState)) {
       return auditFailure();
@@ -974,6 +1000,50 @@ function validateApprovalLedger(
   ) {
     return auditFailure();
   }
+}
+
+function validateInstructionAuthorizationLedger(
+  database: Database.Database,
+  action: ActionRecord,
+): void {
+  const rows = database
+    .prepare(
+      `SELECT action_version AS version, task_id AS taskId,
+              inbound_event_id AS inboundEventId, capability,
+              payload_hash AS payloadHash, item_key AS itemKey,
+              created_at AS createdAt
+         FROM instruction_authorizations
+        WHERE action_id = ? ORDER BY action_version`,
+    )
+    .all(action.actionId) as InstructionAuthorizationAuditRow[];
+  if (action.approvalMode !== "president_instruction") {
+    if (rows.length !== 0) return auditFailure();
+    return;
+  }
+  if (action.taskId === null || rows.length !== 1) return auditFailure();
+  const row = rows[0];
+  if (
+    row === undefined ||
+    row.version !== action.version ||
+    row.taskId !== action.taskId ||
+    !canonicalUuid(row.inboundEventId) ||
+    row.capability !== action.capability ||
+    !canonicalPrefixedSha256(row.payloadHash) ||
+    !samePrefixedHash(row.payloadHash, action.payloadHash) ||
+    !safeText(row.itemKey, 256)
+  ) {
+    return auditFailure();
+  }
+  const source = sourceIdentity(database, action.taskId);
+  if (row.inboundEventId !== source.inboundEventId) return auditFailure();
+  const createdAt = auditTimestamp(
+    row.createdAt,
+    canonicalPersistedTimestamp(action.createdAt, "action_persistence_failed")
+      .milliseconds,
+    canonicalPersistedTimestamp(action.updatedAt, "action_persistence_failed")
+      .milliseconds,
+  );
+  if (createdAt.iso !== action.createdAt) return auditFailure();
 }
 
 function validateAttemptRow(
@@ -1286,6 +1356,7 @@ function validateActionAuditLedger(
 ): void {
   const transitions = validateTransitionLedger(database, action);
   validateApprovalLedger(database, action, actionRow, transitions);
+  validateInstructionAuthorizationLedger(database, action);
   validateAttemptLedger(database, action, transitions);
   validateReconciliationLedger(database, action, transitions);
 }
@@ -1405,10 +1476,15 @@ function appendApproval(
 function sourceIdentity(
   database: Database.Database,
   taskId: string,
-): Readonly<{ actorHash: string; chatHash: string }> {
+): Readonly<{
+  inboundEventId: string;
+  actorHash: string;
+  chatHash: string;
+}> {
   const row = database
     .prepare(
       `SELECT tasks.id AS sourceId,
+              tasks.inbound_event_id AS inboundEventId,
               inbound_events.sender_open_id_hash AS actorHash,
               inbound_events.chat_id_hash AS chatHash
          FROM tasks
@@ -1419,12 +1495,17 @@ function sourceIdentity(
   if (
     row === undefined ||
     row.sourceId !== taskId ||
+    !canonicalUuid(row.inboundEventId) ||
     !canonicalRawSha256(row.actorHash) ||
     !canonicalRawSha256(row.chatHash)
   ) {
     throw new RuntimeStateError("action_source_identity_is_invalid");
   }
-  return Object.freeze({ actorHash: row.actorHash, chatHash: row.chatHash });
+  return Object.freeze({
+    inboundEventId: row.inboundEventId,
+    actorHash: row.actorHash,
+    chatHash: row.chatHash,
+  });
 }
 
 function taskIsExecutable(
@@ -1471,7 +1552,7 @@ function actionParentIsExecutable(
   now: ClockSnapshot,
 ): boolean {
   return (
-    action.approvalMode !== "president" ||
+    action.approvalMode === "system_policy" ||
     action.taskId === null ||
     taskIsExecutable(database, action.taskId, instanceId, now)
   );
@@ -1663,6 +1744,162 @@ export function prepareAction(
           nonce,
           expiresAt: approvalWindow.expiresAt.iso,
           state: "PREPARED",
+        });
+      })
+      .immediate();
+  } catch (cause) {
+    return persistenceFailure(cause);
+  }
+}
+
+export function authorizePresidentInstructionAction(
+  database: Database.Database,
+  instanceId: string,
+  inputValue: AuthorizePresidentInstructionActionInput,
+): AuthorizedPresidentInstructionAction {
+  const input = snapshotExactInput(
+    inputValue,
+    [
+      "taskId",
+      "capability",
+      "identity",
+      "itemKey",
+      "payload",
+      "preview",
+      "now",
+    ],
+    [],
+    "action_instruction_input_is_invalid",
+  );
+  if (
+    !canonicalUuid(input.taskId) ||
+    !safeText(input.capability, 128) ||
+    (input.identity !== "bot" && input.identity !== "user") ||
+    !safeText(input.itemKey, 256) ||
+    input.capability === "system_reply"
+  ) {
+    throw new RuntimeStateError("action_instruction_input_is_invalid");
+  }
+  const payload = snapshotStrictIJson(input.payload);
+  const preview = snapshotStrictIJson(
+    input.preview,
+    "action_preview_must_be_strict_i_json",
+  );
+  const authorizationWindow = snapshotLeaseWindow(
+    input.now as Date,
+    APPROVAL_TTL_MS,
+  );
+  const canonicalPayload = canonicalStrictIJson(payload);
+  const canonicalPreview = canonicalStrictIJson(preview);
+  const actionPayloadHash = payloadHash(payload);
+
+  try {
+    return database
+      .transaction(() => {
+        requireOwnLiveBridge(database, instanceId, authorizationWindow.now);
+        const source = sourceIdentity(database, input.taskId as string);
+        if (
+          !taskIsExecutable(
+            database,
+            input.taskId as string,
+            instanceId,
+            authorizationWindow.now,
+          )
+        ) {
+          throw new RuntimeStateError("action_parent_task_is_not_executable");
+        }
+        const replayRow = database
+          .prepare(
+            `SELECT action_id AS actionId, action_version AS version
+               FROM instruction_authorizations
+              WHERE task_id = ? AND capability = ? AND item_key = ?`,
+          )
+          .get(input.taskId, input.capability, input.itemKey) as
+          | Readonly<{ actionId: unknown; version: unknown }>
+          | undefined;
+        if (replayRow !== undefined) {
+          if (!canonicalUuid(replayRow.actionId) || replayRow.version !== 1) {
+            throw new RuntimeStateError("action_persistence_failed");
+          }
+          const existing = findAction(database, replayRow.actionId, 1);
+          if (existing === null) {
+            throw new RuntimeStateError("action_persistence_failed");
+          }
+          if (!samePrefixedHash(existing.payloadHash, actionPayloadHash)) {
+            throw new RuntimeStateError("action_instruction_replay_conflict");
+          }
+          return Object.freeze({
+            action: existing as ActionRecord &
+              Readonly<{ approvalMode: "president_instruction" }>,
+            created: false,
+          });
+        }
+
+        const actionId = randomUUID();
+        const nonce = randomBytes(32).toString("base64url");
+        database
+          .prepare(
+            `INSERT INTO actions(
+               id, task_id, version, capability, identity, approval_mode,
+               state, payload_json, payload_hash, preview_json,
+               actor_open_id_hash, chat_id_hash, nonce_hash, idempotency_key,
+               expires_at, created_at, updated_at
+             ) VALUES (?, ?, 1, ?, ?, 'president_instruction', 'APPROVED',
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            actionId,
+            input.taskId,
+            input.capability,
+            input.identity,
+            canonicalPayload,
+            actionPayloadHash,
+            canonicalPreview,
+            source.actorHash,
+            source.chatHash,
+            sha256Hex(nonce),
+            actionId,
+            authorizationWindow.expiresAt.iso,
+            authorizationWindow.now.iso,
+            authorizationWindow.now.iso,
+          );
+        database
+          .prepare(
+            `INSERT INTO instruction_authorizations(
+               action_id, action_version, task_id, inbound_event_id,
+               capability, payload_hash, item_key, created_at
+             ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            actionId,
+            input.taskId,
+            source.inboundEventId,
+            input.capability,
+            actionPayloadHash,
+            input.itemKey,
+            authorizationWindow.now.iso,
+          );
+        database
+          .prepare(
+            `INSERT INTO action_transitions(
+               action_id, from_state, to_state, reason_code, created_at
+             ) VALUES (
+               ?, NULL, 'APPROVED', 'president_instruction_approved', ?
+             )`,
+          )
+          .run(actionId, authorizationWindow.now.iso);
+        const action = findAction(database, actionId, 1);
+        if (
+          action === null ||
+          action.approvalMode !== "president_instruction" ||
+          action.state !== "APPROVED"
+        ) {
+          throw new RuntimeStateError("action_persistence_failed");
+        }
+        return Object.freeze({
+          action: action as ActionRecord &
+            Readonly<{ approvalMode: "president_instruction" }>,
+          created: true,
         });
       })
       .immediate();
@@ -1912,6 +2149,38 @@ export function claimApprovedAction(
   } catch (cause) {
     return persistenceFailure(cause);
   }
+}
+
+/**
+ * Trusted JobStore composition seam for ledgers that authorize one action but
+ * dispatch multiple independently-idempotent child parts. It performs the
+ * same live-runtime, parent-task, expiry, and ownership checks as an action
+ * claim without consuming the aggregate action state.
+ */
+export function getExecutableApprovedActionForNotification(
+  database: Database.Database,
+  instanceId: string,
+  actionId: string,
+  owner: string,
+  nowValue: Date,
+): ActionRecord | null {
+  if (!canonicalUuid(actionId) || owner !== instanceId) return null;
+  const now = snapshotDate(nowValue, "action_claim_input_is_invalid");
+  requireOwnLiveBridge(database, instanceId, now);
+  const action = findAction(database, actionId, 1);
+  if (
+    action === null ||
+    action.state !== "APPROVED" ||
+    !actionTimeAllows(action, now) ||
+    !actionParentIsExecutable(database, action, instanceId, now)
+  ) {
+    return null;
+  }
+  const expiry = canonicalPersistedTimestamp(
+    action.expiresAt,
+    "action_persistence_failed",
+  );
+  return expiry.milliseconds > now.milliseconds ? action : null;
 }
 
 export function markDispatching(

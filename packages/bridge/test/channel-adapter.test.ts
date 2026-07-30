@@ -13,7 +13,11 @@ import {
   type StartChannelDeps,
   type TrustedCardEvidence,
 } from "../src/bot/channel.js";
-import type { AssistantChannelDependencies } from "../src/runtime/assistant-channel.js";
+import {
+  ASSISTANT_CHANNEL_ERROR,
+  type AssistantChannelDependencies,
+  type RawEnvelope,
+} from "../src/runtime/assistant-channel.js";
 import { decideIngress } from "../src/security/ingress-guard.js";
 import type { AccessPolicy } from "../src/security/policy.js";
 
@@ -24,6 +28,10 @@ const PRESIDENT_CHAT_ID = "oc_dm";
 const CREATED_AT_MS = Date.parse("2026-07-21T00:00:00.000Z");
 const CARD_ACTION_HASH =
   "sha256:b2131b4cba33c3e696b4f6352fd928f7c7c68358ae291d069c18e5d68878ba63" as const;
+
+function quotedCandidate(raw: RawEnvelope): unknown {
+  return raw.readQuotedMessageCandidate();
+}
 
 const policy: AccessPolicy = {
   appId: APP_ID,
@@ -334,6 +342,311 @@ describe("narrow SDK channel adapter", () => {
 
     await bridge.disconnect();
     expect(harness.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("normalizes only current file/image descriptors and the original parent_id candidate", async () => {
+    const harness = sourceHarness();
+    const assistantRuntime = runtime();
+    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
+    let observedResources: unknown;
+    let observedCandidate: unknown;
+    assistantRuntime.normalizer = {
+      ...assistantRuntime.normalizer,
+      toInboundEvent(raw) {
+        observedResources = raw.readResources();
+        observedCandidate = quotedCandidate(raw);
+        return baseNormalizer(raw);
+      },
+    };
+    await startChannel(startDependencies(harness, assistantRuntime));
+    const event = messageEvent({
+      resources: [
+        {
+          type: "image",
+          fileKey: "img_v3_current_a",
+          fileName: "现场照片.png",
+        },
+        {
+          type: "file",
+          fileKey: "file_v3_current_b",
+          fileName: "经营报告.pdf",
+        },
+      ],
+    });
+    const rawMessage = (
+      event.raw as {
+        event: { message: Record<string, unknown> };
+      }
+    ).event.message;
+    rawMessage.parent_id = "om_parent_a";
+    rawMessage.root_id = "om_root_must_not_be_used";
+
+    await harness.message(event);
+
+    expect(observedResources).toEqual([
+      {
+        sourceKind: "current",
+        messageId: "msg_a",
+        kind: "image",
+        imageKey: "img_v3_current_a",
+        displayName: "现场照片.png",
+      },
+      {
+        sourceKind: "current",
+        messageId: "msg_a",
+        kind: "file",
+        fileKey: "file_v3_current_b",
+        displayName: "经营报告.pdf",
+      },
+    ]);
+    expect(observedCandidate).toEqual({ parentId: "om_parent_a" });
+    expect(Object.isFrozen(observedResources)).toBe(true);
+    expect(
+      (observedResources as readonly object[]).every(Object.isFrozen),
+    ).toBe(true);
+    expect(Object.getPrototypeOf(observedResources)).toBe(Array.prototype);
+    expect(
+      (observedResources as readonly object[]).every(
+        (resource) => Object.getPrototypeOf(resource) === Object.prototype,
+      ),
+    ).toBe(true);
+    expect(Object.isFrozen(observedCandidate)).toBe(true);
+    expect(Object.getPrototypeOf(observedCandidate)).toBe(Object.prototype);
+    expect(JSON.stringify(observedResources)).not.toMatch(
+      /url|absolutePath|model|om_root_must_not_be_used/,
+    );
+    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
+  });
+
+  it("reads parent_id lazily only after the ordinary-task guard allows normalization", async () => {
+    const harness = sourceHarness();
+    const event = messageEvent();
+    const rawMessage = (
+      event.raw as {
+        event: { message: Record<string, unknown> };
+      }
+    ).event.message;
+    const assistantRuntime = runtime();
+    assistantRuntime.ingressGuard = vi.fn(() => {
+      rawMessage.parent_id = "om_parent_added_after_guard";
+      return { kind: "allow_task" as const };
+    });
+    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
+    let observedCandidate: unknown = "unread";
+    assistantRuntime.normalizer = {
+      ...assistantRuntime.normalizer,
+      toInboundEvent(raw) {
+        observedCandidate = raw.readQuotedMessageCandidate();
+        return baseNormalizer(raw);
+      },
+    };
+    await startChannel(startDependencies(harness, assistantRuntime));
+
+    await harness.message(event);
+
+    expect(observedCandidate).toEqual({
+      parentId: "om_parent_added_after_guard",
+    });
+    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
+  });
+
+  it("does not promote quoted body attachments into the current resource path", async () => {
+    const harness = sourceHarness();
+    const assistantRuntime = runtime();
+    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
+    let observedResources: unknown;
+    let observedCandidate: unknown;
+    assistantRuntime.normalizer = {
+      ...assistantRuntime.normalizer,
+      toInboundEvent(raw) {
+        observedResources = raw.readResources();
+        observedCandidate = raw.readQuotedMessageCandidate();
+        return baseNormalizer(raw);
+      },
+    };
+    await startChannel(startDependencies(harness, assistantRuntime));
+    const event = messageEvent();
+    const rawMessage = (
+      event.raw as {
+        event: { message: Record<string, unknown> };
+      }
+    ).event.message;
+    rawMessage.parent_id = "om_parent_only_candidate";
+    rawMessage.content = JSON.stringify({
+      text: "quoted body",
+      attachments: [
+        {
+          file_key: "file_v3_forged_quoted",
+          url: "https://example.invalid/quoted",
+        },
+      ],
+    });
+
+    await harness.message(event);
+
+    expect(observedResources).toEqual([]);
+    expect(observedCandidate).toEqual({
+      parentId: "om_parent_only_candidate",
+    });
+    expect(JSON.stringify(observedResources)).not.toContain(
+      "file_v3_forged_quoted",
+    );
+    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
+  });
+
+  it("uses only an own-data parent_id and never promotes root_id", async () => {
+    const harness = sourceHarness();
+    const assistantRuntime = runtime();
+    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
+    let observedCandidate: unknown = "unread";
+    assistantRuntime.normalizer = {
+      ...assistantRuntime.normalizer,
+      toInboundEvent(raw) {
+        observedCandidate = quotedCandidate(raw);
+        return baseNormalizer(raw);
+      },
+    };
+    await startChannel(startDependencies(harness, assistantRuntime));
+    const event = messageEvent();
+    const rawMessage = (
+      event.raw as {
+        event: { message: Record<string, unknown> };
+      }
+    ).event.message;
+    rawMessage.root_id = "om_root_forbidden";
+    const parentGetter = vi.fn(() => "om_parent_accessor");
+    Object.defineProperty(rawMessage, "parent_id", {
+      enumerable: true,
+      get: parentGetter,
+    });
+
+    await harness.message(event);
+
+    expect(observedCandidate).toBeNull();
+    expect(parentGetter).not.toHaveBeenCalled();
+
+    const unsafeParent = messageEvent();
+    const unsafeRawMessage = (
+      unsafeParent.raw as {
+        event: { message: Record<string, unknown> };
+      }
+    ).event.message;
+    unsafeRawMessage.parent_id = "https://example.invalid/parent";
+    unsafeRawMessage.root_id = "om_root_still_forbidden";
+    observedCandidate = "unread";
+
+    await harness.message(unsafeParent);
+
+    expect(observedCandidate).toBeNull();
+
+    const proxyParent = messageEvent();
+    const proxyRawEvent = (
+      proxyParent.raw as {
+        event: { message: Record<string, unknown> };
+      }
+    ).event;
+    proxyRawEvent.message.parent_id = "om_parent_proxy";
+    proxyRawEvent.message = new Proxy(proxyRawEvent.message, {});
+    observedCandidate = "unread";
+
+    await harness.message(proxyParent);
+
+    expect(observedCandidate).toBeNull();
+    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips stickers without reading their resource fields", async () => {
+    const harness = sourceHarness();
+    const assistantRuntime = runtime();
+    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
+    let observedResources: unknown;
+    assistantRuntime.normalizer = {
+      ...assistantRuntime.normalizer,
+      toInboundEvent(raw) {
+        observedResources = raw.readResources();
+        return baseNormalizer(raw);
+      },
+    };
+    await startChannel(startDependencies(harness, assistantRuntime));
+    const fileKey = vi.fn(() => {
+      throw new Error("sticker key must stay unread");
+    });
+    const sticker = { type: "sticker" } as Record<string, unknown>;
+    Object.defineProperty(sticker, "fileKey", {
+      enumerable: true,
+      get: fileKey,
+    });
+    sticker.url = "https://example.invalid/sticker";
+
+    await harness.message(messageEvent({ resources: [sticker] }));
+
+    expect(observedResources).toEqual([]);
+    expect(fileKey).not.toHaveBeenCalled();
+    expect(assistantRuntime.taskSink.ingest).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed on unbounded, exotic, authority-bearing, or unsafe current resource descriptors", async () => {
+    const harness = sourceHarness();
+    const assistantRuntime = runtime();
+    const baseNormalizer = assistantRuntime.normalizer.toInboundEvent;
+    assistantRuntime.normalizer = {
+      ...assistantRuntime.normalizer,
+      toInboundEvent(raw) {
+        raw.readResources();
+        return baseNormalizer(raw);
+      },
+    };
+    await startChannel(startDependencies(harness, assistantRuntime));
+    const accessor = { type: "file", fileName: "报告.pdf" } as Record<
+      string,
+      unknown
+    >;
+    Object.defineProperty(accessor, "fileKey", {
+      enumerable: true,
+      get() {
+        throw new Error("resource accessor must stay unread");
+      },
+    });
+    const safe = {
+      type: "file",
+      fileKey: "file_v3_safe",
+      fileName: "报告.pdf",
+    };
+    const invalidResources: unknown[] = [
+      new Proxy([safe], {}),
+      [new Proxy(safe, {})],
+      [accessor],
+      [{ ...safe, url: "https://example.invalid/file" }],
+      [{ ...safe, absolutePath: "/tmp/report.pdf" }],
+      [{ ...safe, model: "forbidden" }],
+      [{ ...safe, fileKey: "https://example.invalid/file" }],
+      [{ ...safe, fileName: "/tmp/report.pdf" }],
+      Array.from({ length: 21 }, (_, index) => ({
+        type: "file",
+        fileKey: `file_v3_${index}`,
+        fileName: `报告-${index}.pdf`,
+      })),
+    ];
+
+    for (const resources of invalidResources) {
+      await expect(
+        harness.message(messageEvent({ resources })),
+      ).rejects.toThrow(ASSISTANT_CHANNEL_ERROR.TASK_NORMALIZATION_FAILED);
+    }
+    const unsafeMessageId = "https://example.invalid/message";
+    const unsafeMessage = messageEvent({
+      messageId: unsafeMessageId,
+      resources: [safe],
+    });
+    (
+      unsafeMessage.raw as {
+        event: { message: { message_id: string } };
+      }
+    ).event.message.message_id = unsafeMessageId;
+    await expect(harness.message(unsafeMessage)).rejects.toThrow(
+      ASSISTANT_CHANNEL_ERROR.TASK_NORMALIZATION_FAILED,
+    );
+    expect(assistantRuntime.taskSink.ingest).not.toHaveBeenCalled();
   });
 
   it("denies a group message without reading normalized content or resources", async () => {

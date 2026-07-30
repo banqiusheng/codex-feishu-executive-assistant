@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 
 import {
   approveAction,
+  authorizePresidentInstructionAction,
   claimApprovedAction,
   finishAction,
   getAction,
@@ -24,12 +25,31 @@ import {
   listTaskAcknowledgementRecoveryCandidates,
   reconcileTaskAcknowledgement,
 } from "./acknowledgements.js";
+import {
+  consumeClarificationForTask,
+  consumeClarificationsForTask,
+  consumeClarificationsForTaskValidated,
+  listPendingClarificationsForTask,
+  writeClarificationGroupForTask,
+} from "./clarifications.js";
 import { ingestEvent } from "./events.js";
 import { attachDatabaseFileLock, detachDatabaseFileLock } from "./file-lock.js";
 import { acquireRuntimeLease, releaseRuntimeLease } from "./leases.js";
 import { applyChecksumVerifiedMigrationsInOneTransaction } from "./migrate.js";
+import {
+  claimNextNotificationDelivery,
+  createNotificationBatch,
+  finishNotificationDelivery,
+  getNotificationBatchSummary,
+  markNotificationDeliveryDispatching,
+} from "./notification-batches.js";
 import { bindPrincipal } from "./principals.js";
 import { prepareSecureSqlitePath } from "./secure-path.js";
+import {
+  listTaskResourcesForTask,
+  registerTaskResourcesForTask,
+  resolveTaskResourceForTask,
+} from "./task-resources.js";
 import {
   claimNextTask,
   createReplacementTask,
@@ -269,6 +289,73 @@ export function openJobStoreWithMigrationDirectory(
         cancelActiveTask: (request) => cancelActiveTask(storeDatabase, request),
         prepareAction: (input) =>
           prepareAction(storeDatabase, instanceId, input),
+        authorizePresidentInstructionAction: (input) =>
+          authorizePresidentInstructionAction(storeDatabase, instanceId, input),
+        writeClarificationGroupForTask: (input) =>
+          writeClarificationGroupForTask(storeDatabase, instanceId, input),
+        registerTaskResourcesForTask: (taskId, descriptors, now) =>
+          registerTaskResourcesForTask(
+            storeDatabase,
+            instanceId,
+            taskId,
+            descriptors,
+            now,
+          ),
+        resolveTaskResourceForTask: (taskId, resourceRef, expectedKind) =>
+          resolveTaskResourceForTask(
+            storeDatabase,
+            taskId,
+            resourceRef,
+            expectedKind,
+          ),
+        listTaskResourcesForTask: (taskId) =>
+          listTaskResourcesForTask(storeDatabase, taskId),
+        createNotificationBatch: (input) =>
+          createNotificationBatch(storeDatabase, instanceId, input),
+        claimNextNotificationDelivery: (input) =>
+          claimNextNotificationDelivery(storeDatabase, instanceId, input),
+        markNotificationDeliveryDispatching: (input) =>
+          markNotificationDeliveryDispatching(storeDatabase, instanceId, input),
+        finishNotificationDelivery: (input) =>
+          finishNotificationDelivery(storeDatabase, instanceId, input),
+        getNotificationBatchSummary: (batchId) =>
+          getNotificationBatchSummary(storeDatabase, batchId),
+        listPendingClarificationsForTask: (taskId, now) =>
+          listPendingClarificationsForTask(storeDatabase, taskId, now),
+        consumeClarificationForTask: (taskId, optionRef, expectedKind, now) =>
+          consumeClarificationForTask(
+            storeDatabase,
+            instanceId,
+            taskId,
+            optionRef,
+            expectedKind,
+            now,
+          ),
+        consumeClarificationsForTask: (taskId, optionRefs, expectedKind, now) =>
+          consumeClarificationsForTask(
+            storeDatabase,
+            instanceId,
+            taskId,
+            optionRefs,
+            expectedKind,
+            now,
+          ),
+        consumeClarificationsForTaskValidated: (
+          taskId,
+          optionRefs,
+          expectedKind,
+          now,
+          assertValue,
+        ) =>
+          consumeClarificationsForTaskValidated(
+            storeDatabase,
+            instanceId,
+            taskId,
+            optionRefs,
+            expectedKind,
+            now,
+            assertValue,
+          ),
         approveAction: (input) =>
           approveAction(storeDatabase, instanceId, input),
         claimApprovedAction: (input) =>

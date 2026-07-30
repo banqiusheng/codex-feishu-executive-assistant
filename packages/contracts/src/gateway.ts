@@ -40,7 +40,7 @@ export const GatewayRequestSchema = z
   .object({
     version: z.literal(1),
     requestId: z.string().uuid(),
-    kind: z.enum(["read", "prepare", "system_reply"]),
+    kind: z.enum(["read", "prepare", "execute", "system_reply"]),
     capability: z.string().min(1),
     payload: z.record(z.string(), z.unknown()),
   })
@@ -49,6 +49,7 @@ export const GatewayRequestSchema = z
 export type GatewayRequest = z.infer<typeof GatewayRequestSchema>;
 export type ReadRequest = GatewayRequest & { kind: "read" };
 export type PrepareActionRequest = GatewayRequest & { kind: "prepare" };
+export type ExecuteActionRequest = GatewayRequest & { kind: "execute" };
 export type SystemReplyRequest = GatewayRequest & { kind: "system_reply" };
 export type PreparedAction = Readonly<{
   actionId: string;
@@ -64,6 +65,7 @@ export type GatewayResult = Readonly<{
 export interface RunGatewayClient {
   read<T>(request: ReadRequest): Promise<T>;
   prepare(request: PrepareActionRequest): Promise<PreparedAction>;
+  execute<T>(request: ExecuteActionRequest): Promise<T>;
   systemReply(request: SystemReplyRequest): Promise<GatewayResult>;
 }
 

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -680,7 +680,7 @@ describe("openJobStore", () => {
       verificationDb
         .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
         .get(),
-    ).toEqual({ count: 4 });
+    ).toEqual({ count: 5 });
     verificationDb.close();
   });
 
@@ -747,7 +747,7 @@ describe("openJobStore", () => {
       verification
         .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
         .get(),
-    ).toEqual({ count: 4 });
+    ).toEqual({ count: 5 });
     verification.close();
   });
 
@@ -812,6 +812,10 @@ describe("openJobStore", () => {
         version: 4,
         name: "004_single_inflight_task_acknowledgement.sql",
       },
+      {
+        version: 5,
+        name: "005_direct_actions_resources_and_batches.sql",
+      },
     ]);
     expect(
       verification
@@ -819,6 +823,631 @@ describe("openJobStore", () => {
         .all(),
     ).toEqual([{ seqno: 0, cid: 1, name: "state" }]);
     verification.close();
+  });
+
+  it("upgrades a real v4 ledger without losing action audit rows or foreign keys", async () => {
+    const runtimeDir = createRuntimeDirectory();
+    const filename = tempDb(runtimeDir);
+    const v4Migrations = join(runtimeDir, "v4-migrations");
+    const currentMigrations = migrationDirectoryForModuleUrl(import.meta.url);
+    mkdirSync(v4Migrations, { mode: 0o700 });
+    for (const migration of [
+      "001_initial.sql",
+      "002_task_leases_and_control_outcomes.sql",
+      "003_task_acknowledgements.sql",
+      "004_single_inflight_task_acknowledgement.sql",
+    ]) {
+      writeFileSync(
+        join(v4Migrations, migration),
+        readFileSync(join(currentMigrations, migration)),
+        { mode: 0o600 },
+      );
+    }
+
+    const inboundEventId = randomUUID();
+    const taskId = randomUUID();
+    const actionId = randomUUID();
+    const reconciliationActionId = randomUUID();
+    const attemptId = randomUUID();
+    const actorHash = createHash("sha256")
+      .update("ou_v4_fixture")
+      .digest("hex");
+    const chatHash = createHash("sha256").update("oc_v4_fixture").digest("hex");
+    const payloadJson = '{"body":"v4 fixture"}';
+    const payloadHash = `sha256:${createHash("sha256")
+      .update(payloadJson)
+      .digest("hex")}`;
+    const resultJson = '{"outcome":"SUCCEEDED","remoteId":"remote_v4_fixture"}';
+    const resultDigest = `sha256:${createHash("sha256")
+      .update(resultJson)
+      .digest("hex")}`;
+    const requestDigest = `sha256:${"b".repeat(64)}`;
+    const createdAt = "2026-07-29T08:00:10.000Z";
+    const approvedAt = "2026-07-29T08:00:11.000Z";
+    const claimedAt = "2026-07-29T08:00:12.000Z";
+    const dispatchingAt = "2026-07-29T08:00:13.000Z";
+    const finishedAt = "2026-07-29T08:00:14.000Z";
+    const expiresAt = "2026-07-29T08:30:10.000Z";
+
+    const v4 = new Database(filename);
+    v4.pragma("foreign_keys = ON");
+    applyChecksumVerifiedMigrationsInOneTransaction(v4, v4Migrations);
+    v4.prepare(
+      `INSERT INTO inbound_events(
+         id, app_id, tenant_key, event_id, message_id,
+         sender_open_id_hash, chat_id_hash, payload_ref, received_at
+       ) VALUES (?, 'app-v4', 'tenant-v4', 'event-v4', 'message-v4',
+                 ?, ?, ?, ?)`,
+    ).run(
+      inboundEventId,
+      actorHash,
+      chatHash,
+      `sha256:${"a".repeat(64)}`,
+      "2026-07-29T08:00:00.000Z",
+    );
+    v4.prepare(
+      `INSERT INTO tasks(
+         id, inbound_event_id, state, workspace_path, stage,
+         lease_owner, lease_expires_at, codex_session_id,
+         created_at, updated_at
+       ) VALUES (?, ?, 'RUNNING', '/fixture/v4', 'RUNNING_CODEX',
+                 'instance-a', '2026-07-29T09:00:00.000Z',
+                 'codex-v4-fixture', ?, ?)`,
+    ).run(taskId, inboundEventId, createdAt, finishedAt);
+    v4.prepare(
+      `INSERT INTO actions(
+         id, task_id, version, capability, identity, approval_mode, state,
+         payload_json, payload_hash, preview_json, actor_open_id_hash,
+         chat_id_hash, nonce_hash, idempotency_key, expires_at,
+         remote_id, result_json, created_at, updated_at
+       ) VALUES (?, ?, 1, 'message.send', 'bot', 'president', 'SUCCEEDED',
+                 ?, ?, ?, ?, ?, ?, ?, ?, 'remote_v4_fixture', ?, ?, ?)`,
+    ).run(
+      actionId,
+      taskId,
+      payloadJson,
+      payloadHash,
+      payloadJson,
+      actorHash,
+      chatHash,
+      createHash("sha256").update("nonce-v4-fixture").digest("hex"),
+      actionId,
+      expiresAt,
+      resultJson,
+      createdAt,
+      finishedAt,
+    );
+    v4.prepare(
+      `INSERT INTO actions(
+         id, task_id, version, capability, identity, approval_mode, state,
+         payload_json, payload_hash, preview_json, actor_open_id_hash,
+         chat_id_hash, nonce_hash, idempotency_key, expires_at,
+         remote_id, result_json, created_at, updated_at
+       ) VALUES (?, ?, 1, 'calendar.create', 'user', 'president', 'SUCCEEDED',
+                 ?, ?, ?, ?, ?, ?, ?, ?, 'remote_reconciliation_fixture', ?, ?, ?)`,
+    ).run(
+      reconciliationActionId,
+      taskId,
+      payloadJson,
+      payloadHash,
+      payloadJson,
+      actorHash,
+      chatHash,
+      createHash("sha256")
+        .update("nonce-v4-reconciliation-fixture")
+        .digest("hex"),
+      `${reconciliationActionId}-idempotency`,
+      expiresAt,
+      resultJson,
+      createdAt,
+      finishedAt,
+    );
+    for (const transition of [
+      [null, "PREPARED", "prepared", createdAt],
+      ["PREPARED", "APPROVED", "approved", approvedAt],
+      ["APPROVED", "CLAIMED", "claimed", claimedAt],
+      ["CLAIMED", "DISPATCHING", "dispatch_started", dispatchingAt],
+      ["DISPATCHING", "SUCCEEDED", "dispatch_finished", finishedAt],
+    ] as const) {
+      v4.prepare(
+        `INSERT INTO action_transitions(
+           action_id, from_state, to_state, reason_code, created_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run(actionId, ...transition);
+    }
+    v4.prepare(
+      `INSERT INTO approvals(
+         id, action_id, action_version, actor_open_id_hash, chat_id_hash,
+         payload_hash, nonce_hash, decision, decided_at
+       ) VALUES (?, ?, 1, ?, ?, ?, ?, 'APPROVED', ?)`,
+    ).run(
+      randomUUID(),
+      actionId,
+      actorHash,
+      chatHash,
+      payloadHash,
+      createHash("sha256").update("nonce-v4-fixture").digest("hex"),
+      approvedAt,
+    );
+    v4.prepare(
+      `INSERT INTO action_attempts(
+         id, action_id, attempt_id, phase, attempt_kind,
+         request_digest, created_at
+       ) VALUES (?, ?, ?, 'STARTED', 'DISPATCH', ?, ?)`,
+    ).run(randomUUID(), actionId, attemptId, requestDigest, dispatchingAt);
+    v4.prepare(
+      `INSERT INTO action_attempts(
+         id, action_id, attempt_id, phase, attempt_kind, outcome,
+         request_digest, result_digest, remote_id, created_at
+       ) VALUES (?, ?, ?, 'FINISHED', 'DISPATCH', 'SUCCEEDED',
+                 ?, ?, 'remote_v4_fixture', ?)`,
+    ).run(
+      randomUUID(),
+      actionId,
+      attemptId,
+      requestDigest,
+      resultDigest,
+      finishedAt,
+    );
+    v4.prepare(
+      `INSERT INTO reconciliations(
+         id, action_id, outcome, evidence_digest, operator_kind, created_at
+       ) VALUES (?, ?, 'SUCCEEDED', ?, 'manual', ?)`,
+    ).run(
+      randomUUID(),
+      reconciliationActionId,
+      `sha256:${"c".repeat(64)}`,
+      finishedAt,
+    );
+    expect(v4.pragma("foreign_key_check")).toEqual([]);
+    v4.close();
+    chmodSync(filename, 0o600);
+
+    const lock = await acquireLock(runtimeDir);
+    const upgraded = openJobStore({
+      filename,
+      instanceId: "instance-a",
+      lock,
+    });
+    openStores.push(upgraded);
+    expect(upgraded.getAction({ actionId, version: 1 })).toMatchObject({
+      actionId,
+      taskId,
+      approvalMode: "president",
+      state: "SUCCEEDED",
+      result: { outcome: "SUCCEEDED", remoteId: "remote_v4_fixture" },
+    });
+
+    const verification = new Database(filename, { readonly: true });
+    expect(verification.pragma("foreign_key_check")).toEqual([]);
+    expect(
+      verification
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM actions WHERE id = ?) AS actions,
+             (SELECT COUNT(*) FROM approvals WHERE action_id = ?) AS approvals,
+             (SELECT COUNT(*) FROM action_transitions WHERE action_id = ?) AS transitions,
+             (SELECT COUNT(*) FROM action_attempts WHERE action_id = ?) AS attempts,
+             (SELECT COUNT(*) FROM reconciliations WHERE action_id = ?) AS reconciliations`,
+        )
+        .get(actionId, actionId, actionId, actionId, reconciliationActionId),
+    ).toEqual({
+      actions: 1,
+      approvals: 1,
+      transitions: 5,
+      attempts: 2,
+      reconciliations: 1,
+    });
+    expect(
+      verification
+        .prepare(
+          "SELECT version, checksum FROM schema_migrations ORDER BY version",
+        )
+        .all(),
+    ).toEqual([
+      {
+        version: 1,
+        checksum:
+          "1364dcd0d3260154fc43f17c698de8d724f5b2389ee1893597ddc50826356e91",
+      },
+      {
+        version: 2,
+        checksum:
+          "5cb217a310e80619cc98ea8f60913a1df909528742ac42f9e70fed2c464797c1",
+      },
+      {
+        version: 3,
+        checksum:
+          "75b43d38bb30ea4cfe31047a90637c1945170f2e781c18163f569250f36991db",
+      },
+      {
+        version: 4,
+        checksum:
+          "7c7eaaa3fff6716df24b03039ab30d86dcda65c6c7b0aa6ab08e02cfc21c0712",
+      },
+      { version: 5, checksum: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    ]);
+    expect(
+      verification
+        .prepare(
+          `SELECT name FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN (
+                'instruction_authorizations',
+                'clarification_options',
+                'clarification_selections',
+                'task_resources',
+                'notification_batches',
+                'notification_parts'
+              )
+            ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "clarification_options" },
+      { name: "clarification_selections" },
+      { name: "instruction_authorizations" },
+      { name: "notification_batches" },
+      { name: "notification_parts" },
+      { name: "task_resources" },
+    ]);
+    expect(
+      verification
+        .prepare(
+          `SELECT name FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name IN ('actions_frozen_payload', 'actions_legal_state_transition')
+            ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "actions_frozen_payload" },
+      { name: "actions_legal_state_transition" },
+    ]);
+    expect(
+      verification
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'one_president_pending_action_per_task'",
+        )
+        .get(),
+    ).toMatchObject({
+      sql: expect.stringMatching(/approval_mode='president'/),
+    });
+    verification.close();
+  });
+
+  it("preserves confirmation semantics while adding direct-action and append-only ledger constraints", () => {
+    const database = new Database(":memory:");
+    database.pragma("foreign_keys = ON");
+    applyChecksumVerifiedMigrationsInOneTransaction(
+      database,
+      migrationDirectoryForModuleUrl(import.meta.url),
+    );
+    const inboundEventId = randomUUID();
+    const taskId = randomUUID();
+    const actorHash = createHash("sha256").update("actor").digest("hex");
+    const chatHash = createHash("sha256").update("chat").digest("hex");
+    const now = "2026-07-29T08:00:00.000Z";
+    database
+      .prepare(
+        `INSERT INTO inbound_events(
+           id, app_id, tenant_key, event_id, message_id,
+           sender_open_id_hash, chat_id_hash, payload_ref, received_at
+         ) VALUES (?, 'app', 'tenant', 'event', 'message', ?, ?, ?, ?)`,
+      )
+      .run(
+        inboundEventId,
+        actorHash,
+        chatHash,
+        `sha256:${"a".repeat(64)}`,
+        now,
+      );
+    database
+      .prepare(
+        `INSERT INTO tasks(
+           id, inbound_event_id, state, workspace_path, stage, created_at, updated_at
+         ) VALUES (?, ?, 'RUNNING', '/fixture', 'RUNNING_CODEX', ?, ?)`,
+      )
+      .run(taskId, inboundEventId, now, now);
+
+    const insertAction = (
+      id: string,
+      capability: string,
+      approvalMode: string,
+      identity = "bot",
+      actionTaskId = taskId,
+    ): void => {
+      database
+        .prepare(
+          `INSERT INTO actions(
+             id, task_id, version, capability, identity, approval_mode, state,
+             payload_json, payload_hash, preview_json, actor_open_id_hash,
+             chat_id_hash, nonce_hash, idempotency_key, expires_at,
+             created_at, updated_at
+           ) VALUES (?, ?, 1, ?, ?, ?, 'PREPARED',
+                     '{}', ?, '{}', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          actionTaskId,
+          capability,
+          identity,
+          approvalMode,
+          `sha256:${"b".repeat(64)}`,
+          actorHash,
+          chatHash,
+          `nonce-${id}`,
+          `idempotency-${id}`,
+          "2026-07-29T08:30:00.000Z",
+          now,
+          now,
+        );
+    };
+
+    const presidentActionId = randomUUID();
+    insertAction(presidentActionId, "message.send", "president");
+    expect(() =>
+      insertAction(randomUUID(), "calendar.create", "president"),
+    ).toThrow(/UNIQUE constraint failed: actions.task_id/);
+
+    const instructionActionId = randomUUID();
+    expect(() =>
+      insertAction(
+        instructionActionId,
+        "calendar.create.direct",
+        "president_instruction",
+        "user",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      insertAction(randomUUID(), "calendar.create.direct", "unknown_mode"),
+    ).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      insertAction(randomUUID(), "system_reply", "president_instruction"),
+    ).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      insertAction(randomUUID(), "system_reply", "system_policy"),
+    ).not.toThrow();
+
+    const otherInboundEventId = randomUUID();
+    const otherTaskId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO inbound_events(
+           id, app_id, tenant_key, event_id, message_id,
+           sender_open_id_hash, chat_id_hash, payload_ref, received_at
+         ) VALUES (?, 'app', 'tenant', 'event-other', 'message-other', ?, ?, ?, ?)`,
+      )
+      .run(
+        otherInboundEventId,
+        actorHash,
+        chatHash,
+        `sha256:${"g".repeat(64)}`,
+        now,
+      );
+    database
+      .prepare(
+        `INSERT INTO tasks(
+           id, inbound_event_id, state, workspace_path, stage, created_at, updated_at
+         ) VALUES (?, ?, 'RUNNING', '/fixture-other', 'RUNNING_CODEX', ?, ?)`,
+      )
+      .run(otherTaskId, otherInboundEventId, now, now);
+    const otherInstructionActionId = randomUUID();
+    insertAction(
+      otherInstructionActionId,
+      "calendar.create.direct",
+      "president_instruction",
+      "user",
+      otherTaskId,
+    );
+
+    const insertAuthorization = (
+      actionId: string,
+      actionVersion: number,
+      authorizationTaskId: string,
+      authorizationInboundEventId: string,
+      capability: string,
+      payloadHash: string,
+      itemKey: string,
+    ): void => {
+      database
+        .prepare(
+          `INSERT INTO instruction_authorizations(
+             action_id, action_version, task_id, inbound_event_id,
+             capability, payload_hash, item_key, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          actionId,
+          actionVersion,
+          authorizationTaskId,
+          authorizationInboundEventId,
+          capability,
+          payloadHash,
+          itemKey,
+          now,
+        );
+    };
+
+    insertAuthorization(
+      instructionActionId,
+      1,
+      taskId,
+      inboundEventId,
+      "calendar.create.direct",
+      `sha256:${"b".repeat(64)}`,
+      "calendar-primary",
+    );
+    for (const invalidAuthorization of [
+      {
+        actionId: presidentActionId,
+        actionVersion: 1,
+        taskId,
+        inboundEventId,
+        capability: "message.send",
+        payloadHash: `sha256:${"b".repeat(64)}`,
+        itemKey: "president-is-not-direct",
+      },
+      {
+        actionId: otherInstructionActionId,
+        actionVersion: 1,
+        taskId,
+        inboundEventId,
+        capability: "calendar.create.direct",
+        payloadHash: `sha256:${"b".repeat(64)}`,
+        itemKey: "action-task-mismatch",
+      },
+      {
+        actionId: instructionActionId,
+        actionVersion: 1,
+        taskId,
+        inboundEventId: otherInboundEventId,
+        capability: "calendar.create.direct",
+        payloadHash: `sha256:${"b".repeat(64)}`,
+        itemKey: "inbound-event-mismatch",
+      },
+      {
+        actionId: instructionActionId,
+        actionVersion: 1,
+        taskId,
+        inboundEventId,
+        capability: "calendar.update.direct",
+        payloadHash: `sha256:${"b".repeat(64)}`,
+        itemKey: "capability-mismatch",
+      },
+      {
+        actionId: instructionActionId,
+        actionVersion: 1,
+        taskId,
+        inboundEventId,
+        capability: "calendar.create.direct",
+        payloadHash: `sha256:${"h".repeat(64)}`,
+        itemKey: "payload-mismatch",
+      },
+      {
+        actionId: instructionActionId,
+        actionVersion: 2,
+        taskId,
+        inboundEventId,
+        capability: "calendar.create.direct",
+        payloadHash: `sha256:${"b".repeat(64)}`,
+        itemKey: "version-mismatch",
+      },
+    ]) {
+      expect(() =>
+        insertAuthorization(
+          invalidAuthorization.actionId,
+          invalidAuthorization.actionVersion,
+          invalidAuthorization.taskId,
+          invalidAuthorization.inboundEventId,
+          invalidAuthorization.capability,
+          invalidAuthorization.payloadHash,
+          invalidAuthorization.itemKey,
+        ),
+      ).toThrow(/action_instruction_authorization_mismatch/);
+    }
+    expect(() =>
+      database
+        .prepare("UPDATE instruction_authorizations SET item_key = 'changed'")
+        .run(),
+    ).toThrow(/append only/);
+
+    const groupId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO clarification_options(
+           group_id, group_label, option_ordinal, option_ref, kind,
+           source_task_id, principal_hash, chat_hash, value_json,
+           display_label, expires_at, payload_hash, created_at
+         ) VALUES (?, 'choices', 1, ?, 'contact', ?, ?, ?, '{}', 'choice', ?, ?, ?)`,
+      )
+      .run(
+        groupId,
+        randomUUID(),
+        taskId,
+        actorHash,
+        chatHash,
+        "2026-07-29T08:30:00.000Z",
+        `sha256:${"c".repeat(64)}`,
+        now,
+      );
+    expect(() =>
+      database.prepare("DELETE FROM clarification_options").run(),
+    ).toThrow(/append only/);
+    database
+      .prepare(
+        `INSERT INTO task_resources(
+           id, task_id, resource_ref, source_kind, source_message_hash,
+           kind, display_name, relative_path, size_bytes, sha256, created_at
+         ) VALUES (?, ?, ?, 'current', ?, 'file', 'fixture.pdf',
+                   'resources/fixture.pdf', 7, ?, ?)`,
+      )
+      .run(
+        randomUUID(),
+        taskId,
+        randomUUID(),
+        `sha256:${"d".repeat(64)}`,
+        `sha256:${"e".repeat(64)}`,
+        now,
+      );
+    const batchId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO notification_batches(
+           id, task_id, batch_key_hash, recipient_count, state, created_at, updated_at
+         ) VALUES (?, ?, ?, 1, 'PREPARED', ?, ?)`,
+      )
+      .run(batchId, taskId, `sha256:${"f".repeat(64)}`, now, now);
+    database
+      .prepare(
+        `INSERT INTO notification_parts(
+           id, batch_id, recipient_ordinal, action_id, part_ordinal,
+           part_kind, idempotency_key, state, attempt_count, created_at, updated_at
+         ) VALUES (?, ?, 1, ?, 1, 'content', ?, 'PENDING', 0, ?, ?)`,
+      )
+      .run(randomUUID(), batchId, instructionActionId, randomUUID(), now, now);
+    expect(() =>
+      database
+        .prepare(
+          `INSERT INTO notification_parts(
+             id, batch_id, recipient_ordinal, action_id, part_ordinal,
+             part_kind, idempotency_key, state, attempt_count, created_at, updated_at
+           ) VALUES (?, ?, 2, ?, 2, 'content', ?, 'PENDING', 0, ?, ?)`,
+        )
+        .run(
+          randomUUID(),
+          batchId,
+          instructionActionId,
+          randomUUID(),
+          now,
+          now,
+        ),
+    ).toThrow(/notification_recipient_ordinal_out_of_range/);
+    expect(() =>
+      database
+        .prepare(
+          `INSERT INTO notification_parts(
+             id, batch_id, recipient_ordinal, action_id, part_ordinal,
+             part_kind, idempotency_key, state, attempt_count, created_at, updated_at
+           ) VALUES (?, ?, 1, ?, 1, 'content', ?, 'PENDING', 0, ?, ?)`,
+        )
+        .run(randomUUID(), batchId, presidentActionId, randomUUID(), now, now),
+    ).toThrow(/notification_recipient_action_mismatch/);
+    expect(() =>
+      database
+        .prepare("UPDATE notification_parts SET state = 'SUCCEEDED'")
+        .run(),
+    ).toThrow(/illegal notification part state transition/);
+    expect(database.pragma("foreign_key_check")).toEqual([]);
+    expect(database.pragma("integrity_check")).toEqual([
+      { integrity_check: "ok" },
+    ]);
+    database.close();
+  });
+
+  it("wires president-instruction authorization on the public store", async () => {
+    const store = await openStore();
+    expect(store.authorizePresidentInstructionAction).toBeTypeOf("function");
   });
 
   it("rejects migration checksum drift without overwriting the database", async () => {

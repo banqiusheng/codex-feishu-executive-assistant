@@ -32,7 +32,12 @@ function envelope(text = "整理文件"): RawEnvelope {
     readText: () => text,
     readBody: () => ({ text }),
     readResources: () => [],
-  };
+    readQuotedMessageCandidate: () => null,
+  } as RawEnvelope;
+}
+
+function quotedCandidate(raw: RawEnvelope): unknown {
+  return raw.readQuotedMessageCandidate();
 }
 
 function dependencies(
@@ -145,7 +150,15 @@ describe("assistant channel", () => {
     const readResources = vi.fn(() => {
       throw new Error("secret resources");
     });
-    const guardedRaw: RawEnvelope = { ...raw, readBody, readResources };
+    const readQuotedMessageCandidate = vi.fn(() => {
+      throw new Error("secret quote candidate");
+    });
+    const guardedRaw: RawEnvelope = {
+      ...raw,
+      readBody,
+      readResources,
+      readQuotedMessageCandidate,
+    };
     const ingressGuard = vi.fn((metadata) => {
       expect(Object.keys(metadata).sort()).toEqual(
         [
@@ -168,6 +181,7 @@ describe("assistant channel", () => {
     expect(ingressGuard).toHaveBeenCalledWith(guardedRaw.metadata);
     expect(readBody).not.toHaveBeenCalled();
     expect(readResources).not.toHaveBeenCalled();
+    expect(readQuotedMessageCandidate).not.toHaveBeenCalled();
     expect(deps.taskSink.ingest).not.toHaveBeenCalled();
     expect(deps.gateway.sendSystemReply).not.toHaveBeenCalled();
     expect(deps.scheduler.wake).not.toHaveBeenCalled();
@@ -297,6 +311,54 @@ describe("assistant channel", () => {
       expect(readText).not.toHaveBeenCalled();
       expect(readBody).not.toHaveBeenCalled();
       expect(readResources).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["pairing", { kind: "allow_pairing" } as const],
+    [
+      "card",
+      {
+        kind: "allow_card",
+        nonce: "nonce-a",
+        payloadHash: `sha256:${"c".repeat(64)}` as const,
+      },
+    ],
+  ] as const)(
+    "gives the %s route an empty task-resource view even when the raw envelope is forged",
+    async (route, decision) => {
+      const readResources = vi.fn(() => {
+        throw new Error("forged resources must stay unread");
+      });
+      const readQuotedMessageCandidate = vi.fn(() => {
+        throw new Error("forged quote must stay unread");
+      });
+      const raw = {
+        ...envelope(),
+        readResources,
+        readQuotedMessageCandidate,
+      } as RawEnvelope;
+      const inspect = vi.fn(async (stableRaw: RawEnvelope) => {
+        expect(stableRaw.readResources()).toEqual([]);
+        expect(quotedCandidate(stableRaw)).toBeNull();
+      });
+      const deps = dependencies({
+        ingressGuard: () => decision,
+        pairingSink: { consume: route === "pairing" ? inspect : vi.fn() },
+        confirmationSink: {
+          consume:
+            route === "card"
+              ? vi.fn(async (stableRaw) => inspect(stableRaw))
+              : vi.fn(),
+        },
+      });
+
+      await createAssistantChannel(deps).handle(raw);
+
+      expect(inspect).toHaveBeenCalledOnce();
+      expect(readResources).not.toHaveBeenCalled();
+      expect(readQuotedMessageCandidate).not.toHaveBeenCalled();
+      expect(deps.taskSink.ingest).not.toHaveBeenCalled();
     },
   );
 
@@ -460,6 +522,37 @@ describe("assistant channel", () => {
       expect(deps.scheduler.wake).not.toHaveBeenCalled();
     },
   );
+
+  it("gives cancellation normalization an empty task-resource view", async () => {
+    const readResources = vi.fn(() => {
+      throw new Error("cancel must not read task resources");
+    });
+    const readQuotedMessageCandidate = vi.fn(() => {
+      throw new Error("cancel must not read quote candidate");
+    });
+    const raw = {
+      ...envelope("停一下"),
+      readResources,
+      readQuotedMessageCandidate,
+    } as RawEnvelope;
+    const baseNormalizer = dependencies().normalizer;
+    const deps = dependencies({
+      normalizer: {
+        ...baseNormalizer,
+        toCancelActiveTaskRequest: vi.fn((stableRaw) => {
+          expect(stableRaw.readResources()).toEqual([]);
+          expect(quotedCandidate(stableRaw)).toBeNull();
+          return baseNormalizer.toCancelActiveTaskRequest(stableRaw);
+        }),
+      },
+    });
+
+    await createAssistantChannel(deps).handle(raw);
+
+    expect(readResources).not.toHaveBeenCalled();
+    expect(readQuotedMessageCandidate).not.toHaveBeenCalled();
+    expect(deps.taskSink.ingest).not.toHaveBeenCalled();
+  });
 
   it.each(["请停一下", "停一下！", "停止 当前任务", "取消这个任务。"])(
     "does not fuzzy-match cancellation text %s",
@@ -797,7 +890,20 @@ describe("assistant channel", () => {
       .mockImplementation(() => {
         throw new Error("secret second resources read");
       });
-    const raw = { ...envelope(), readText, readBody, readResources };
+    const candidate = Object.freeze({ parentId: "om_parent" });
+    const readQuotedMessageCandidate = vi
+      .fn<() => unknown>()
+      .mockReturnValueOnce(candidate)
+      .mockImplementation(() => {
+        throw new Error("secret second quote read");
+      });
+    const raw = {
+      ...envelope(),
+      readText,
+      readBody,
+      readResources,
+      readQuotedMessageCandidate,
+    } as RawEnvelope;
     Object.defineProperty(raw.metadata, "text", {
       enumerable: true,
       get: readText,
@@ -815,6 +921,8 @@ describe("assistant channel", () => {
           expect(stableRaw.readBody()).toBe(body);
           expect(stableRaw.readResources()).toBe(resources);
           expect(stableRaw.readResources()).toBe(resources);
+          expect(quotedCandidate(stableRaw)).toBe(candidate);
+          expect(quotedCandidate(stableRaw)).toBe(candidate);
           return dependencies().normalizer.toInboundEvent(stableRaw);
         }),
       },
@@ -825,6 +933,59 @@ describe("assistant channel", () => {
     expect(readText).toHaveBeenCalledOnce();
     expect(readBody).toHaveBeenCalledOnce();
     expect(readResources).toHaveBeenCalledOnce();
+    expect(readQuotedMessageCandidate).toHaveBeenCalledOnce();
+  });
+
+  it("keeps identical normalized resource descriptors on duplicate inbound without a second acknowledgement or wake", async () => {
+    const descriptors = Object.freeze([
+      Object.freeze({
+        sourceKind: "current",
+        messageId: "msg_a",
+        kind: "file",
+        fileKey: "file_v3_a",
+        displayName: "经营报告.pdf",
+      }),
+    ]);
+    const candidate = Object.freeze({ parentId: "om_parent" });
+    const raw = {
+      ...envelope(),
+      readResources: vi.fn(() => descriptors),
+      readQuotedMessageCandidate: vi.fn(() => candidate),
+    } as RawEnvelope;
+    const observed: unknown[] = [];
+    const baseNormalizer = dependencies().normalizer;
+    const firstTaskId = randomUUID();
+    const deps = dependencies({
+      normalizer: {
+        ...baseNormalizer,
+        toInboundEvent: vi.fn((stableRaw) => {
+          observed.push(
+            Object.freeze({
+              resources: stableRaw.readResources(),
+              candidate: quotedCandidate(stableRaw),
+            }),
+          );
+          return baseNormalizer.toInboundEvent(stableRaw);
+        }),
+      },
+      taskSink: {
+        ingest: vi
+          .fn()
+          .mockResolvedValueOnce({ taskId: firstTaskId, duplicate: false })
+          .mockResolvedValueOnce({ taskId: firstTaskId, duplicate: true }),
+      },
+    });
+
+    await createAssistantChannel(deps).handle(raw);
+    await createAssistantChannel(deps).handle(raw);
+
+    expect(observed).toEqual([
+      { resources: descriptors, candidate },
+      { resources: descriptors, candidate },
+    ]);
+    expect(deps.taskSink.ingest).toHaveBeenCalledTimes(2);
+    expect(deps.gateway.sendSystemReply).toHaveBeenCalledOnce();
+    expect(deps.scheduler.wake).toHaveBeenCalledOnce();
   });
 
   it("uses the same cached text for guard and exact cancellation", async () => {

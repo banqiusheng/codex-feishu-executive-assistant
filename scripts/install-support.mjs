@@ -246,6 +246,7 @@ function refreshRuntimeExecutables([
   expectedRuntimeRoot,
   expectedLarkHome,
   expectedLarkCli,
+  expectedUserAuthHelper,
   expectedPresentationsVersion,
   nodeExecutable,
   codexExecutable,
@@ -255,6 +256,7 @@ function refreshRuntimeExecutables([
     [expectedRuntimeRoot, "invalid_expected_runtime_root"],
     [expectedLarkHome, "invalid_expected_lark_home"],
     [expectedLarkCli, "invalid_expected_lark_cli"],
+    [expectedUserAuthHelper, "invalid_expected_user_auth_helper"],
   ]) {
     assertAbsolutePath(value, code);
   }
@@ -271,8 +273,15 @@ function refreshRuntimeExecutables([
     expectedPresentationsVersion,
   });
   if (
+    config.executables.userAuthHelper !== undefined &&
+    config.executables.userAuthHelper !== expectedUserAuthHelper
+  ) {
+    fail("runtime_config_identity_mismatch");
+  }
+  if (
     config.executables.node === nodeExecutable &&
-    config.executables.codex === codexExecutable
+    config.executables.codex === codexExecutable &&
+    config.executables.userAuthHelper === expectedUserAuthHelper
   ) {
     return { action: "unchanged" };
   }
@@ -281,6 +290,7 @@ function refreshRuntimeExecutables([
     ...config.executables,
     node: nodeExecutable,
     codex: codexExecutable,
+    userAuthHelper: expectedUserAuthHelper,
   };
   writeAtomicJson(configPath, config);
   assertSafeConfigFile(configPath);
@@ -291,6 +301,7 @@ function refreshRuntimeExecutables([
   if (
     verified?.executables?.node !== nodeExecutable ||
     verified?.executables?.codex !== codexExecutable ||
+    verified?.executables?.userAuthHelper !== expectedUserAuthHelper ||
     verified?.appId !== expectedAppId
   ) {
     fail("runtime_executable_refresh_verification_failed");
@@ -990,7 +1001,7 @@ async function main() {
       return;
     }
     case "refresh-runtime-executables": {
-      assertArgumentCount(args, 8);
+      assertArgumentCount(args, 9);
       process.stdout.write(
         `${JSON.stringify(refreshRuntimeExecutables(args))}\n`,
       );

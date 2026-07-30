@@ -30,6 +30,7 @@ import {
   parseAuthorizationComplete,
   parseNoWaitResponse,
   runFeishuUserAuth,
+  runFeishuUserAuthMain,
   validateRegularExecutable,
 } from "../../scripts/feishu-user-auth.mjs";
 
@@ -236,6 +237,184 @@ afterEach(() => {
 });
 
 describe("validated Feishu user authorization", () => {
+  it("presents exactly one validated URL event and one terminal event in stdout-json mode without opening a browser", async () => {
+    const verificationUrl = new URL(AUTHORIZATION_ORIGIN);
+    verificationUrl.pathname = `/${generatedOpaqueValue()}`;
+    verificationUrl.searchParams.set("state", generatedOpaqueValue());
+    const fixture = successfulFixture({
+      gui: false,
+      verificationUrl: verificationUrl.href,
+    });
+
+    const result = await runFeishuUserAuth(
+      {
+        larkCliPath: fixture.larkCliPath,
+        larkHome: fixture.larkHome,
+        missingScopes,
+        presenter: "stdout-json",
+      },
+      fixture.dependencies,
+    );
+
+    expect(result).toBe(USER_AUTH_COMPLETE);
+    expect(fixture.calls).toHaveLength(2);
+    expect(
+      fixture.calls.some((call) => call.executable === "/usr/bin/open"),
+    ).toBe(false);
+    expect(fixture.messages).toEqual([
+      JSON.stringify({
+        event: "authorization_url",
+        url: verificationUrl.href,
+      }),
+      JSON.stringify({
+        event: "authorization_result",
+        status: "complete",
+      }),
+    ]);
+    const publicSurface = fixture.messages.join("\n");
+    expect(publicSurface).not.toContain(fixture.deviceCode);
+    expect(publicSurface).not.toContain(
+      authorizationCachePath(fixture.larkHome, fixture.deviceCode),
+    );
+  });
+
+  it("emits one blocked terminal event and no browser call when stdout-json polling fails", async () => {
+    const fixture = successfulFixture({
+      gui: false,
+      pollStatus: 1,
+    });
+
+    const result = await runFeishuUserAuth(
+      {
+        larkCliPath: fixture.larkCliPath,
+        larkHome: fixture.larkHome,
+        missingScopes,
+        presenter: "stdout-json",
+      },
+      fixture.dependencies,
+    );
+
+    expect(result).toBe(BLOCKED_USER_AUTH);
+    expect(fixture.calls).toHaveLength(2);
+    expect(
+      fixture.calls.some((call) => call.executable === "/usr/bin/open"),
+    ).toBe(false);
+    expect(fixture.messages).toHaveLength(2);
+    expect(JSON.parse(fixture.messages[0]!)).toMatchObject({
+      event: "authorization_url",
+    });
+    expect(fixture.messages[1]).toBe(
+      JSON.stringify({
+        event: "authorization_result",
+        status: "blocked",
+      }),
+    );
+    const publicSurface = fixture.messages.join("\n");
+    expect(publicSurface).not.toContain(fixture.deviceCode);
+    expect(publicSurface).not.toContain(
+      authorizationCachePath(fixture.larkHome, fixture.deviceCode),
+    );
+  });
+
+  it("loads the ordered scope allowlist before invoking stdout-json authorization", async () => {
+    const runtime = new EventEmitter() as EventEmitter & {
+      exitCode?: number;
+      stdout: { write: (value: string) => boolean };
+      stderr: { write: (value: string) => boolean };
+    };
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    runtime.stdout = {
+      write: (value) => {
+        stdout.push(value);
+        return true;
+      },
+    };
+    runtime.stderr = {
+      write: (value) => {
+        stderr.push(value);
+        return true;
+      },
+    };
+    let observedInput: unknown;
+
+    await runFeishuUserAuthMain({
+      argv: [
+        "--presenter",
+        "stdout-json",
+        "--scope-contract",
+        join(process.cwd(), "config", "feishu-scopes.json"),
+        "--scope-contract-sha256",
+        "40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e",
+        "/fixed/lark-cli",
+        "/fixed/lark-home",
+        ...missingScopes,
+      ],
+      processLike: runtime,
+      authorize: async (input: unknown) => {
+        observedInput = input;
+        return USER_AUTH_COMPLETE;
+      },
+    });
+
+    expect(observedInput).toEqual({
+      larkCliPath: "/fixed/lark-cli",
+      larkHome: "/fixed/lark-home",
+      missingScopes,
+      presenter: "stdout-json",
+    });
+    expect(stdout).toEqual([]);
+    expect(stderr).toEqual([]);
+    expect(runtime.exitCode).toBeUndefined();
+  });
+
+  it("fails closed before authorization when a requested scope is outside the shared contract", async () => {
+    const runtime = new EventEmitter() as EventEmitter & {
+      exitCode?: number;
+      stdout: { write: (value: string) => boolean };
+      stderr: { write: (value: string) => boolean };
+    };
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    runtime.stdout = {
+      write: (value) => {
+        stdout.push(value);
+        return true;
+      },
+    };
+    runtime.stderr = {
+      write: (value) => {
+        stderr.push(value);
+        return true;
+      },
+    };
+    let authorizeCalls = 0;
+
+    await runFeishuUserAuthMain({
+      argv: [
+        "--presenter",
+        "stdout-json",
+        "--scope-contract",
+        join(process.cwd(), "config", "feishu-scopes.json"),
+        "--scope-contract-sha256",
+        "40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e",
+        "/fixed/lark-cli",
+        "/fixed/lark-home",
+        "calendar:calendar.event:delete",
+      ],
+      processLike: runtime,
+      authorize: async () => {
+        authorizeCalls += 1;
+        return USER_AUTH_COMPLETE;
+      },
+    });
+
+    expect(authorizeCalls).toBe(0);
+    expect(stdout).toEqual([]);
+    expect(stderr).toEqual([`${BLOCKED_USER_AUTH}\n`]);
+    expect(runtime.exitCode).toBe(1);
+  });
+
   it("owns no-wait, validated browser launch, and device polling without returning temporary values to zsh", async () => {
     const verificationUrl = new URL(AUTHORIZATION_ORIGIN);
     verificationUrl.pathname = `/${generatedOpaqueValue()}`;
@@ -1037,7 +1216,17 @@ describe("validated Feishu user authorization", () => {
     });
     const pending = Reflect.apply(main, undefined, [
       {
-        argv: ["/fixed/lark-cli", "/fixed/lark-home", ...missingScopes],
+        argv: [
+          "--presenter",
+          "browser",
+          "--scope-contract",
+          join(process.cwd(), "config", "feishu-scopes.json"),
+          "--scope-contract-sha256",
+          "40f77b8df33af965544046313016116fd2a249afaed2d96044649863568db93e",
+          "/fixed/lark-cli",
+          "/fixed/lark-home",
+          ...missingScopes,
+        ],
         processLike: runtime,
         authorize: async (
           input: unknown,
@@ -1058,6 +1247,7 @@ describe("validated Feishu user authorization", () => {
       larkCliPath: "/fixed/lark-cli",
       larkHome: "/fixed/lark-home",
       missingScopes,
+      presenter: "browser",
     });
     runtime.emit("SIGHUP");
     runtime.emit("SIGINT");
